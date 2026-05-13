@@ -23,6 +23,7 @@
     "newChat": "새 채팅",
     "recent": "최근 대화",
     "refreshSessions": "세션 새로고침",
+    "knowledgeBase": "지식 베이스",
     "language": {
       "label": "언어",
       "ariaLabel": "언어 변경"
@@ -79,5 +80,18 @@
     "copyAria": "코드 복사",
     "copy": "복사",
     "copied": "복사됨"
+  },
+  "kb": {
+    "title": "지식 베이스",
+    "dropHint": "PDF 파일을 여기에 드롭",
+    "dropSubHint": "또는 클릭하여 찾아보기 — PDF만 가능, 파일당 최대 50MB",
+    "uploadResults": "업로드 결과",
+    "stats": "지식 베이스 통계",
+    "papers": "논문 수",
+    "chunks": "청크",
+    "recent": "최근 논문",
+    "refresh": "통계 새로고침",
+    "uploading": "업로드 중 {fileName}{extra}…",
+    "clearHistory": "기록 지우기"
   }
 }

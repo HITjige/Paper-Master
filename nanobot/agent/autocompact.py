@@ -19,9 +19,9 @@ class AutoCompact:
     def __init__(self, sessions: SessionManager, consolidator: Consolidator,
                  session_ttl_minutes: int = 0):
         self.sessions = sessions
-        self.consolidator = consolidator
-        self._ttl = session_ttl_minutes
-        self._archiving: set[str] = set()
+        self.consolidator = consolidator  # 借用 Consolidator 的大模型浓缩能力
+        self._ttl = session_ttl_minutes  # 闲置过期时间，小于等于 0 表示永不主动过期（即关闭此特性）
+        self._archiving: set[str] = set()  # 记录有哪些 session key 正在后台被压缩，防止重复提交压缩任务
         self._summaries: dict[str, tuple[str, datetime]] = {}
 
     def _is_expired(self, ts: datetime | str | None,
@@ -53,6 +53,9 @@ class AutoCompact:
             metadata={},
             last_consolidated=0,
         )
+        # 只保留最后的 8 条消息，返回前面的历史。
+        # 如果倒数第8条是在模型说话一半，它会自动往前扩，直到停在 'user' 发言位
+        # 最后，如果是在孤儿工具调用的中途，它会往后找到一个合法的位置
         probe.retain_recent_legal_suffix(self._RECENT_SUFFIX_MESSAGES)
         kept = probe.messages
         cut = len(tail) - len(kept)
@@ -89,6 +92,7 @@ class AutoCompact:
             if summary and summary != "(nothing)":
                 self._summaries[key] = (summary, last_active)
                 session.metadata["_last_summary"] = {"text": summary, "last_active": last_active.isoformat()}
+            # # 将该 session 瘦身：原本的几十个旧消息被物理抛弃，只留下 kept_msgs（后缀 8 条）
             session.messages = kept_msgs
             session.last_consolidated = 0
             session.updated_at = datetime.now()
@@ -112,10 +116,12 @@ class AutoCompact:
             session = self.sessions.get_or_create(key)
         # Hot path: summary from in-memory dict (process hasn't restarted).
         # Also clean metadata copy so stale _last_summary never leaks to disk.
+        # 高速热路径读取
         entry = self._summaries.pop(key, None)
         if entry:
             session.metadata.pop("_last_summary", None)
             return session, self._format_summary(entry[0], entry[1])
+        # 如果当前进程重启过，热路径没数据，从元数据里取出上次压缩的摘要（如果有的话）
         if "_last_summary" in session.metadata:
             meta = session.metadata.pop("_last_summary")
             self.sessions.save(session)

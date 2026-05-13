@@ -1,5 +1,18 @@
 import { useState } from "react";
-import { ChevronRight, Wrench } from "lucide-react";
+import {
+  ChevronRight,
+  Wrench,
+  Compass,
+  BookOpen,
+  Search,
+  Download,
+  Pen,
+  CheckCircle,
+  ClipboardList,
+  Pencil,
+  RefreshCw,
+  AlertCircle,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { MarkdownText } from "@/components/MarkdownText";
@@ -108,16 +121,54 @@ interface TraceGroupProps {
   animClass: string;
 }
 
+/** Map leading emoji to a lucide icon component. Falls back to Wrench. */
+const STEP_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
+  "🧭": Compass,
+  "📋": ClipboardList,
+  "📚": BookOpen,
+  "✏️": Pencil,
+  "🔍": Search,
+  "📥": Download,
+  "📝": Pen,
+  "✍️": Pen,
+  "✅": CheckCircle,
+  "🔄": RefreshCw,
+  "⚠️": AlertCircle,
+};
+
+/** Color classes keyed by emoji prefix: in-progress blue, success green, warning amber. */
+function stepColorClass(line: string): string {
+  const emoji = line.trim().slice(0, 2);
+  if (["✅", "📋"].includes(emoji)) return "text-emerald-600 dark:text-emerald-400";
+  if (["⚠️"].includes(emoji)) return "text-amber-600 dark:text-amber-400";
+  if (["📚", "🔍", "📥"].includes(emoji)) return "text-blue-600 dark:text-blue-400";
+  return "text-muted-foreground";
+}
+
+function stepIcon(line: string): React.ComponentType<{ className?: string }> {
+  const emoji = line.trim().slice(0, 2);
+  return STEP_ICONS[emoji] ?? Wrench;
+}
+
 /**
- * Collapsible group of tool-call / progress breadcrumbs. Defaults to
- * expanded for discoverability; a single click on the header folds the
- * group down to a one-line summary so it never dominates the thread.
+ * Collapsible group of tool-call / progress breadcrumbs. Each line is
+ * prefixed by an emoji that maps to a lucide icon so the user can
+ * visually track the agent workflow (🧭 router → 📚 retrieval →
+ * 🔍 research → ✍️ synthesis → ✅ critic).
+ *
+ * Defaults to expanded for discoverability; a single click folds the
+ * group to a one-line summary.
  */
 function TraceGroup({ message, animClass }: TraceGroupProps) {
   const { t } = useTranslation();
   const lines = message.traces ?? [message.content];
   const count = lines.length;
   const [open, setOpen] = useState(true);
+
+  // Use the latest emoji's icon as the header icon
+  const lastLine = lines[lines.length - 1] ?? "";
+  const HeaderIcon = stepIcon(lastLine);
+
   return (
     <div className={cn("w-full", animClass)}>
       <button
@@ -125,12 +176,13 @@ function TraceGroup({ message, animClass }: TraceGroupProps) {
         onClick={() => setOpen((v) => !v)}
         className={cn(
           "group flex w-full items-center gap-2 rounded-md px-2 py-1.5",
-          "text-xs text-muted-foreground transition-colors hover:bg-muted/45",
+          "text-xs transition-colors hover:bg-muted/45",
+          stepColorClass(lastLine),
         )}
         aria-expanded={open}
       >
-        <Wrench className="h-3.5 w-3.5" aria-hidden />
-        <span className="font-medium">
+        <HeaderIcon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        <span className="font-medium truncate">
           {count === 1
             ? t("message.toolSingle")
             : t("message.toolMany", { count })}
@@ -138,7 +190,7 @@ function TraceGroup({ message, animClass }: TraceGroupProps) {
         <ChevronRight
           aria-hidden
           className={cn(
-            "ml-auto h-3.5 w-3.5 transition-transform duration-200",
+            "ml-auto h-3.5 w-3.5 shrink-0 transition-transform duration-200",
             open && "rotate-90",
           )}
         />
@@ -150,14 +202,21 @@ function TraceGroup({ message, animClass }: TraceGroupProps) {
             "animate-in fade-in-0 slide-in-from-top-1 duration-200",
           )}
         >
-          {lines.map((line, i) => (
-            <li
-              key={i}
-              className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-muted-foreground/90"
-            >
-              {line}
-            </li>
-          ))}
+          {lines.map((line, i) => {
+            const LineIcon = stepIcon(line);
+            return (
+              <li
+                key={i}
+                className={cn(
+                  "flex items-start gap-1.5 whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed",
+                  stepColorClass(line),
+                )}
+              >
+                <LineIcon className="mt-[2px] h-3 w-3 shrink-0" />
+                <span>{line}</span>
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

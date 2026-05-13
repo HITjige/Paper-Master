@@ -323,6 +323,63 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_multi_agent(ctx: CommandContext) -> OutboundMessage | None:
+    """Process the current query using multi-agent workflow.
+    
+    Usage:
+        /multi-agent <query> — Run query through multi-agent system
+        /multi-agent — Toggle multi-agent mode for next message
+    """
+    loop = ctx.loop
+    msg = ctx.msg
+    args = ctx.args.strip()
+    
+    # If no args, just toggle mode or show status
+    if not args:
+        has_graph = loop._multi_agent_graph is not None
+        if has_graph:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "✅ Multi-agent system is available.\n\n"
+                    "Use `/multi-agent <your question>` to process a query, "
+                    "or just ask a paper-related question and I'll use it automatically."
+                ),
+                metadata=dict(msg.metadata or {}),
+            )
+        else:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "❌ Multi-agent system is not available.\n\n"
+                    "Make sure LangGraph is installed (`pip install langgraph`) "
+                    "and paper tools are enabled in config."
+                ),
+                metadata=dict(msg.metadata or {}),
+            )
+    
+    # Process the query with multi-agent
+    if not loop._multi_agent_graph:
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="Multi-agent system is not available. Please check your configuration.",
+            metadata=dict(msg.metadata or {}),
+        )
+    
+    # Run multi-agent workflow
+    result = await loop.process_with_multi_agent(
+        content=args,
+        session_key=msg.session_key,
+        channel=msg.channel,
+        chat_id=msg.chat_id,
+    )
+    
+    return result
+
+
 def build_help_text() -> str:
     """Build canonical help text shared across channels."""
     lines = [
@@ -334,6 +391,7 @@ def build_help_text() -> str:
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
+        "/multi-agent — Use multi-agent workflow for paper queries",
         "/help — Show available commands",
     ]
     return "\n".join(lines)
@@ -351,4 +409,6 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/dream-log ", cmd_dream_log)
     router.exact("/dream-restore", cmd_dream_restore)
     router.prefix("/dream-restore ", cmd_dream_restore)
+    router.exact("/multi-agent", cmd_multi_agent)
+    router.prefix("/multi-agent ", cmd_multi_agent)
     router.exact("/help", cmd_help)

@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { PanelLeftOpen } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { DeleteConfirm } from "@/components/DeleteConfirm";
+import { KnowledgeBase } from "@/components/KnowledgeBase";
 import { Sidebar } from "@/components/Sidebar";
 import { ThreadShell } from "@/components/thread/ThreadShell";
+import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { preloadMarkdownText } from "@/components/MarkdownText";
+import { useKnowledgeBase } from "@/hooks/useKnowledgeBase";
 import { useSessions } from "@/hooks/useSessions";
 import { useTheme } from "@/hooks/useTheme";
 import { cn } from "@/lib/utils";
@@ -47,6 +51,12 @@ export default function App() {
       try {
         const boot = await fetchBootstrap();
         if (cancelled) return;
+
+        // Expose API server URL for KB upload endpoints (production mode).
+        if (boot.api_url) {
+          (window as unknown as Record<string, unknown>).__NANOBOT_API_URL__ = boot.api_url;
+        }
+
         const url = deriveWsUrl(boot.ws_path, boot.token);
         const client = new NanobotClient({
           url,
@@ -151,7 +161,9 @@ function Shell() {
   const { t, i18n } = useTranslation();
   const { theme, toggle } = useTheme();
   const { sessions, loading, refresh, createChat, deleteChat } = useSessions();
+  const { uploadState, stats, doUpload, clearResults, refreshStats } = useKnowledgeBase();
   const [activeKey, setActiveKey] = useState<string | null>(null);
+  const [showKB, setShowKB] = useState(false);
   const [desktopSidebarOpen, setDesktopSidebarOpen] =
     useState<boolean>(readSidebarOpen);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -205,6 +217,7 @@ function Shell() {
   }, []);
 
   const onNewChat = useCallback(async () => {
+    setShowKB(false);
     try {
       const chatId = await createChat();
       setActiveKey(`websocket:${chatId}`);
@@ -218,11 +231,19 @@ function Shell() {
 
   const onSelectChat = useCallback(
     (key: string) => {
+      setShowKB(false);
       setActiveKey(key);
       setMobileSidebarOpen(false);
     },
     [],
   );
+
+  const onNavigateKB = useCallback(() => {
+    setActiveKey(null);
+    setShowKB(true);
+    setMobileSidebarOpen(false);
+    refreshStats();
+  }, [refreshStats]);
 
   const onConfirmDelete = useCallback(async () => {
     if (!pendingDelete) return;
@@ -245,7 +266,9 @@ function Shell() {
   const headerTitle = activeSession
     ? activeSession.preview ||
       t("chat.fallbackTitle", { id: activeSession.chatId.slice(0, 6) })
-    : t("app.brand");
+    : showKB
+      ? t("kb.title", "Knowledge Base")
+      : t("app.brand");
 
   useEffect(() => {
     document.title = activeSession
@@ -258,6 +281,7 @@ function Shell() {
     activeKey,
     loading,
     theme,
+    showKB,
     onToggleTheme: toggle,
     onNewChat: () => {
       void onNewChat();
@@ -266,6 +290,7 @@ function Shell() {
     onRefresh: () => void refresh(),
     onRequestDelete: (key: string, label: string) =>
       setPendingDelete({ key, label }),
+    onNavigateKB,
   };
 
   return (
@@ -303,14 +328,36 @@ function Shell() {
       </Sheet>
 
       <main className="flex h-full min-w-0 flex-1 flex-col">
-        <ThreadShell
-          session={activeSession}
-          title={headerTitle}
-          onToggleSidebar={toggleSidebar}
-          onGoHome={() => setActiveKey(null)}
-          onNewChat={onNewChat}
-          hideSidebarToggleOnDesktop={desktopSidebarOpen}
-        />
+        {/* Floating sidebar toggle when collapsed and in KB mode */}
+        {!desktopSidebarOpen && showKB && (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={toggleSidebar}
+            className="fixed left-2 top-2 z-40 h-7 w-7 rounded-md text-muted-foreground hover:bg-accent/35 hover:text-foreground"
+            aria-label={t("thread.header.toggleSidebar")}
+          >
+            <PanelLeftOpen className="h-3.5 w-3.5" />
+          </Button>
+        )}
+        {showKB ? (
+          <KnowledgeBase
+            onUpload={doUpload}
+            uploadState={uploadState}
+            stats={stats}
+            onRefresh={refreshStats}
+            onClearResults={clearResults}
+          />
+        ) : (
+          <ThreadShell
+            session={activeSession}
+            title={headerTitle}
+            onToggleSidebar={toggleSidebar}
+            onGoHome={() => { setActiveKey(null); setShowKB(false); }}
+            onNewChat={onNewChat}
+            hideSidebarToggleOnDesktop={desktopSidebarOpen}
+          />
+        )}
       </main>
 
       <DeleteConfirm

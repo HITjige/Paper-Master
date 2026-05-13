@@ -23,6 +23,7 @@
     "newChat": "Obrolan baru",
     "recent": "Terbaru",
     "refreshSessions": "Segarkan sesi",
+    "knowledgeBase": "Basis Pengetahuan",
     "language": {
       "label": "Bahasa",
       "ariaLabel": "Ganti bahasa"
@@ -79,5 +80,18 @@
     "copyAria": "Salin kode",
     "copy": "Salin",
     "copied": "Tersalin"
+  },
+  "kb": {
+    "title": "Basis Pengetahuan",
+    "dropHint": "Letakkan file PDF di sini",
+    "dropSubHint": "atau klik untuk memilih — PDF saja, maksimal 50 MB per file",
+    "uploadResults": "Hasil Unggahan",
+    "stats": "Statistik",
+    "papers": "Makalah",
+    "chunks": "Potongan",
+    "recent": "Makalah Terbaru",
+    "refresh": "Segarkan statistik",
+    "uploading": "Mengunggah {fileName}{extra}…",
+    "clearHistory": "Hapus riwayat"
   }
 }

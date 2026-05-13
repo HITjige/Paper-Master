@@ -31,7 +31,8 @@ if TYPE_CHECKING:
 class MemoryStore:
     """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
 
-    _DEFAULT_MAX_HISTORY = 1000
+    _DEFAULT_MAX_HISTORY = 1000  # 定义了 history.jsonl 中最多保留 1000 条流水账历史。超过的旧记录会被丢弃。
+    # 为了兼容老版本的 HISTORY.md 文件而预先编译的正则。用于匹配诸如 [2023-10-01 12:00] USER: 这样的旧式纯文本日志。
     _LEGACY_ENTRY_START_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}[^\]]*)\]\s*")
     _LEGACY_TIMESTAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]\s*")
     _LEGACY_RAW_MESSAGE_RE = re.compile(
@@ -47,8 +48,10 @@ class MemoryStore:
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
         self.soul_file = workspace / "SOUL.md"
         self.user_file = workspace / "USER.md"
+        # 游标文件（用于标记处理到哪一条了）
         self._cursor_file = self.memory_dir / ".cursor"
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
+        # 把 MEMORY.md 和 USER.md 交给内置的微型 Git 客户端托管，防止这些重要文件被意外改乱。
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md",
         ])
@@ -276,7 +279,9 @@ class MemoryStore:
         return entries
 
     def _read_last_entry(self) -> dict[str, Any] | None:
-        """Read the last entry from the JSONL file efficiently."""
+        """Read the last entry from the JSONL file efficiently.
+
+        如果文件行数超过最大设定值（1000条），扔掉最旧的记录"""
         try:
             with open(self.history_file, "rb") as f:
                 f.seek(0, 2)
@@ -316,6 +321,10 @@ class MemoryStore:
 
     @staticmethod
     def _format_messages(messages: list[dict]) -> str:
+        """格式化消息列表为纯文本，供 LLM 总结用。每条消息一行，格式如下：\n
+        [2023-10-01 12:00] USER: Hello\n
+        [2023-10-01 12:01] ASSISTANT [tools: web_search]: I found this information...
+        """
         lines = []
         for message in messages:
             if not message.get("content"):
@@ -346,9 +355,12 @@ class MemoryStore:
 class Consolidator:
     """Lightweight consolidation: summarizes evicted messages into history.jsonl."""
 
+    # 最大连续压缩的轮数。如果一次压不完，最多连压5次，防止陷入死循环。
     _MAX_CONSOLIDATION_ROUNDS = 5
+    # 每一次“打包压缩”时，最多提取 60 条消息丢给模型去总结。如果是极度废话连篇的消息，不设置上限会被撑爆
     _MAX_CHUNK_MESSAGES = 60  # hard cap per consolidation round
 
+    # 非常关键的安全冗余量：预授权 1024 Token 空闲给“测算误差”。由于本地的分词器和线上闭源模型的的分词算法不可能完全一致，要留出余地防报错
     _SAFETY_BUFFER = 1024  # extra headroom for tokenizer estimation drift
 
     def __init__(
@@ -370,12 +382,15 @@ class Consolidator:
         self.max_completion_tokens = max_completion_tokens
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        # 并发锁 (弱引用字典)。为了防止同一会话 (session_key) 正在压条目的同时，又来了一条新消息触发又一次并发压缩导致乱套
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
-        """Return the shared consolidation lock for one session."""
+        """Return the shared consolidation lock for one session.
+        
+        为指定的那个 Session 获取专属压缩锁。"""
         return self._locks.setdefault(session_key, asyncio.Lock())
 
     def pick_consolidation_boundary(
@@ -384,7 +399,9 @@ class Consolidator:
         tokens_to_remove: int,
     ) -> tuple[int, int] | None:
         """Pick a user-turn boundary that removes enough old prompt tokens."""
+        # 上一次压缩的位置
         start = session.last_consolidated
+        # 如果起点已经等于全部消息数（全被压过了），或者根本不需要移除Token，直接返回
         if start >= len(session.messages) or tokens_to_remove <= 0:
             return None
 
@@ -392,6 +409,8 @@ class Consolidator:
         last_boundary: tuple[int, int] | None = None
         for idx in range(start, len(session.messages)):
             message = session.messages[idx]
+            # 注意这个判断：必须要求当前这条是被 `user` (用户) 发送的消息。
+            # 这是因为把工具输出或半个思考切给大模型很不讲理。在User说话前切一刀，是一轮对话的天然起点。
             if idx > start and message.get("role") == "user":
                 last_boundary = (idx, removed_tokens)
                 if removed_tokens >= tokens_to_remove:
@@ -405,12 +424,17 @@ class Consolidator:
         session: Session,
         end_idx: int,
     ) -> int | None:
-        """Clamp the chunk size without breaking the user-turn boundary."""
+        """Clamp the chunk size without breaking the user-turn boundary.
+        
+        保证一次性切割出让大模型总结的条目不超过 _MAX_CHUNK_MESSAGES 条，否则大模型总结会 OOM。"""
         start = session.last_consolidated
+        # 如果切出来的范围 <= 60 条，很安全，返回
         if end_idx - start <= self._MAX_CHUNK_MESSAGES:
             return end_idx
 
+        # 否则强行把终点收缩到起点 + 60
         capped_end = start + self._MAX_CHUNK_MESSAGES
+        # 但是，强行收缩也要从这个60的死线往前倒退，一定要退到一个 "role" == "user" 的安全边界上再切
         for idx in range(capped_end, start, -1):
             if session.messages[idx].get("role") == "user":
                 return idx
@@ -422,7 +446,9 @@ class Consolidator:
         *,
         session_summary: str | None = None,
     ) -> tuple[int, str]:
-        """Estimate current prompt size for the normal session history view."""
+        """Estimate current prompt size for the normal session history view.
+        
+        利用分词器或者 API 测试当前会话到底花了多少 Token"""
         history = session.get_history(max_messages=0)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
         probe_messages = self._build_messages(
@@ -432,6 +458,7 @@ class Consolidator:
             chat_id=chat_id,
             session_summary=session_summary,
         )
+        # 抛给大模型底层的 Tokenizer 计算最终开销
         return estimate_prompt_tokens_chain(
             self.provider,
             self.model,
@@ -443,11 +470,14 @@ class Consolidator:
         """Summarize messages via LLM and append to history.jsonl.
 
         Returns the summary text on success, None if nothing to archive.
+
+        调用大模型把历史消息总结成一段话，然后追加到 history.jsonl 里，作为长期记忆的一部分
         """
         if not messages:
             return None
         try:
             formatted = MemoryStore._format_messages(messages)
+            # 使用针对性的 system prompt ("agent/consolidator_archive.md" 模板)，让大模型提炼核心信息
             response = await self.provider.chat_with_retry(
                 model=self.model,
                 messages=[
@@ -461,7 +491,7 @@ class Consolidator:
                     {"role": "user", "content": formatted},
                 ],
                 tools=None,
-                tool_choice=None,
+                tool_choice=None,  # 不允许它在总结记忆时又跑去调工具
             )
             if response.finish_reason == "error":
                 raise RuntimeError(f"LLM returned error: {response.content}")
@@ -469,6 +499,7 @@ class Consolidator:
             self.store.append_history(summary)
             return summary
         except Exception:
+            # 如果大模型 API 此时宕机/超时，作为灾备，直接原样写入流水账，不丢数据
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
             self.store.raw_archive(messages)
             return None
@@ -487,8 +518,11 @@ class Consolidator:
         if not session.messages or self.context_window_tokens <= 0:
             return
 
+        # 锁住当前会话，防止脏写
         lock = self.get_lock(session.key)
         async with lock:
+            # 算出我们真正的 "剩余 Token 预算"
+            # 模型能吃的极限 - 模型生成回答所需的预留 - 我们的估算安全垫
             budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
             target = budget // 2
             try:
@@ -518,6 +552,7 @@ class Consolidator:
                 if estimated <= target:
                     break
 
+                # 找到一个切点，切掉足够的消息让模型总结后能回到安全范围。原则上这个切点必须是一个用户消息的边界
                 boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
                 if boundary is None:
                     logger.debug(
@@ -528,6 +563,7 @@ class Consolidator:
                     break
 
                 end_idx = boundary[0]
+                # 但是如果这个切点距离上次压缩的位置太远了（超过 _MAX_CHUNK_MESSAGES 条），就收缩到一个更近的安全边界，防止一次性丢给模型太多消息压不动
                 end_idx = self._cap_consolidation_boundary(session, end_idx)
                 if end_idx is None:
                     logger.debug(
@@ -598,6 +634,8 @@ class Dream:
     Phase 1 produces an analysis summary (plain LLM call).
     Phase 2 delegates to AgentRunner with read_file / edit_file tools so the
     LLM can make targeted, incremental edits instead of replacing entire files.
+    
+    将用户的历史对话流水账转化为结构化的长期知识、技能或用户画像，整个过程分为两个阶段：分析（Phase 1）与编辑落盘（Phase 2）
     """
 
     def __init__(
@@ -626,7 +664,13 @@ class Dream:
     # -- tool registry -------------------------------------------------------
 
     def _build_tools(self) -> ToolRegistry:
-        """Build a minimal tool registry for the Dream agent."""
+        """Build a minimal tool registry for the Dream agent.
+        
+        赋予了 Dream 代理操作文件系统的能力：
+
+        读文件工具 (ReadFileTool): 允许读取工作区和内置技能目录的文件。
+        编辑文件工具 (EditFileTool): 允许修改现有文件（利用这个对长期记忆文件进行增删改查）。
+        写文件工具 (WriteFileTool): 专门限制了只能在 skills 目录下创建新文件（为了让大模型在发现重复性工作流时，能够自我总结并生成新的 SKILL.md）。"""
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
         from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
 
@@ -690,6 +734,7 @@ class Dream:
         """
         file_path = "memory/MEMORY.md"
         try:
+            # 调取底层包装的 Git 命令 `git blame -p memory/MEMORY.md` 算出了每一行上次被 commit 的时间并算出相对目前的天数
             ages = self.store.git.line_ages(file_path)
         except Exception:
             logger.debug("line_ages failed for {}", file_path)
@@ -714,6 +759,9 @@ class Dream:
             if not line.strip():
                 annotated.append(line)
                 continue
+
+            # 当某行记忆超过了这 14 天的判定阈值，就硬编码地在这行字符串后面加一行后缀！
+            # 比如 "User likes coffee.   ← 30d"
             if age.age_days > _STALE_THRESHOLD_DAYS:
                 annotated.append(f"{line}  \u2190 {age.age_days}d")
             else:
@@ -754,6 +802,7 @@ class Dream:
         current_soul = self.store.read_soul() or "(empty)"
         current_user = self.store.read_user() or "(empty)"
 
+        # 将当前的时间、打好老化标签的 MEMORY.md、自我认知 SOUL.md 以及用户画像 USER.md 整合成上下文
         file_context = (
             f"## Current Date\n{current_date}\n\n"
             f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
@@ -766,6 +815,9 @@ class Dream:
             f"## Conversation History\n{history_text}\n\n{file_context}"
         )
 
+        # Phase 1 不调用任何文件工具，单纯让大模型（结合 agent/dream_phase1.md 的系统提示词）做阅读理解。
+        # 大模型会对比“短期流水账”和“现有长期记忆”，给出一份文本分析报告
+        # 如“我发现用户的偏好发生了 X 改变，需要修改 USER.md；有一条 30 天前的记忆已经失效，需要删除……”
         try:
             phase1_response = await self.provider.chat_with_retry(
                 model=self.model,
@@ -790,6 +842,8 @@ class Dream:
             return False
 
         # Phase 2: Delegate to AgentRunner with read_file / edit_file
+        # 把 Phase 1 生成的纯文本分析报告 analysis，加上当前文件上下文和已有技能列表 skills_section，一起送入 Phase 2。
+        # 根据前一步的分析报告，实际调用 edit_file / write_file 工具来落实对底层文件的修改。
         existing_skills = self._list_existing_skills()
         skills_section = ""
         if existing_skills:

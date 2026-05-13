@@ -23,6 +23,7 @@
     "newChat": "New chat",
     "recent": "Recent",
     "refreshSessions": "Refresh sessions",
+    "knowledgeBase": "Knowledge Base",
     "language": {
       "label": "Language",
       "ariaLabel": "Change language"
@@ -79,5 +80,18 @@
     "copyAria": "Copy code",
     "copy": "Copy",
     "copied": "Copied"
+  },
+  "kb": {
+    "title": "Knowledge Base",
+    "dropHint": "Drop PDF files here",
+    "dropSubHint": "or click to browse — PDF only, up to 50 MB per file",
+    "uploadResults": "Upload Results",
+    "stats": "Knowledge Base Stats",
+    "papers": "Papers",
+    "chunks": "Chunks",
+    "recent": "Recent Papers",
+    "refresh": "Refresh stats",
+    "uploading": "Uploading {fileName}{extra}...",
+    "clearHistory": "Clear history"
   }
 }

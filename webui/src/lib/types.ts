@@ -32,6 +32,8 @@ export interface BootstrapResponse {
   ws_path: string;
   expires_in: number;
   model_name?: string | null;
+  /** The aiohttp API server base URL (for KB uploads, etc.). */
+  api_url?: string;
 }
 
 export type ConnectionStatus =
@@ -72,3 +74,31 @@ export type Outbound =
   | { type: "new_chat" }
   | { type: "attach"; chat_id: string }
   | { type: "message"; chat_id: string; content: string };
+
+// ---------------------------------------------------------------------------
+// Knowledge Base types
+// ---------------------------------------------------------------------------
+
+export interface KBPaper {
+  paper_id: string;
+  title: string;
+  source: string;
+  year: number | null;
+  chunk_count: number;
+  updated_at: string;
+}
+
+export interface UploadResult {
+  filename: string;
+  paper_id?: string;
+  title?: string;
+  status: "ok" | "error" | "pending";
+  chunk_count?: number;
+  error?: string;
+}
+
+export interface KBStats {
+  paper_count: number;
+  chunk_count: number;
+  recent_papers: KBPaper[];
+}

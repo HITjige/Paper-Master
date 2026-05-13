@@ -212,12 +212,35 @@ class MyToolConfig(Base):
     allow_set: bool = False  # let `my` modify loop state (read-only if False)
 
 
+class PaperToolsConfig(Base):
+    """Paper expert tools and KB configuration."""
+
+    enable: bool = True
+    multi_agent_memory_mode: Literal["strict", "strict_with_citations", "debug_trace"] = "strict"
+    multi_agent_orchestrator_enabled: bool = False
+    multi_agent_orchestrator_confidence_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
+    multi_agent_retrieval_judge_margin: float = Field(default=0.02, ge=0.0, le=0.3)
+    multi_agent_node_history_chars: int = Field(default=60000, ge=256, le=60000)
+    router_short_history_turns: int = Field(default=4, ge=1, le=12)
+    router_short_memory_chars: int = Field(default=2000, ge=256, le=16000)
+    router_long_memory_chars: int = Field(default=2000, ge=256, le=16000)
+    auto_context_retrieve: bool = False  # Auto-inject retrieved papers into runtime context for each user turn
+    auto_context_top_k: int = Field(default=5, ge=1, le=10)
+    retrieval_top_k: int = Field(default=5, ge=1, le=30)
+    embedding_model: str = "text-embedding-3-small"
+    embedding_api_key: str = ""
+    embedding_api_base: str = "https://api.openai.com/v1"
+    max_chunk_chars: int = Field(default=4096, ge=200, le=10000)
+    min_chunk_chars: int = Field(default=300, ge=50, le=5000)
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     my: MyToolConfig = Field(default_factory=MyToolConfig)
+    paper: PaperToolsConfig = Field(default_factory=PaperToolsConfig)
     restrict_to_workspace: bool = False  # restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)

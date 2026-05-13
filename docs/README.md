@@ -31,4 +31,5 @@ Use these when you want deeper customization, integration, or extension details.
 | Channel plugin guide | [`channel-plugin-guide.md`](./channel-plugin-guide.md) | Build and test custom chat channel plugins |
 | WebSocket channel | [`websocket.md`](./websocket.md) | Real-time WebSocket access and protocol details |
 | Custom tools | [`my-tool.md`](./my-tool.md) | Inspect and tune runtime state with the `my` tool |
+| Paper expert evaluation | [`paper-expert-eval.md`](./paper-expert-eval.md) | Retrieval/rerank baseline evaluation loop and metrics |
 

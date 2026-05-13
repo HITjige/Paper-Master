@@ -305,11 +305,13 @@ class WebSocketChannel(BaseChannel):
         *,
         session_manager: "SessionManager | None" = None,
         static_dist_path: Path | None = None,
+        api_server_url: str | None = None,
     ):
         if isinstance(config, dict):
             config = WebSocketConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: WebSocketConfig = config
+        self._api_server_url = api_server_url or ""
         # chat_id -> connections subscribed to it (fan-out target).
         self._subs: dict[str, set[Any]] = {}
         # connection -> chat_ids it is subscribed to (O(1) cleanup on disconnect).
@@ -527,6 +529,7 @@ class WebSocketChannel(BaseChannel):
                 "ws_path": self._expected_path(),
                 "expires_in": self.config.token_ttl_s,
                 "model_name": _read_webui_model_name(),
+                "api_url": self._api_server_url,
             }
         )
 

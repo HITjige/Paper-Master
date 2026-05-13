@@ -1,0 +1,16 @@
+{
+  "items": [
+    {
+      "query": "latest diffusion models for EEG generation",
+      "relevant_paper_ids": [],
+      "top_k": 5,
+      "max_results": 25
+    },
+    {
+      "query": "retrieval augmented generation for scientific QA",
+      "relevant_paper_ids": [],
+      "top_k": 5,
+      "max_results": 25
+    }
+  ]
+}

@@ -767,6 +767,13 @@ def _run_gateway(
     # can serve the embedded webui's REST surface).
     channels = ChannelManager(config, bus, session_manager=session_manager)
 
+    # Point the WebSocket channel's API URL to the gateway's own aiohttp
+    # endpoints (KB upload / health), not an external `nanobot serve`.
+    ws_channel = channels.channels.get("websocket")
+    if ws_channel is not None:
+        gateway_host = config.gateway.host or "127.0.0.1"
+        ws_channel._api_server_url = f"http://{gateway_host}:{port}"
+
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
@@ -839,47 +846,53 @@ def _run_gateway(
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def _health_server(host: str, health_port: int):
-        """Lightweight HTTP health endpoint on the gateway port."""
-        import json as _json
+        """Simple aiohttp: health + KB endpoints with CORS for cross-origin SPA."""
+        from aiohttp import web as _web
+        from typing import Any as _Any
 
-        async def handle(reader, writer):
-            try:
-                data = await asyncio.wait_for(reader.read(4096), timeout=5)
-            except (asyncio.TimeoutError, ConnectionError):
-                writer.close()
-                return
-
-            request_line = data.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
-            method, path = "", ""
-            parts = request_line.split(" ")
-            if len(parts) >= 2:
-                method, path = parts[0], parts[1]
-
-            if method == "GET" and path == "/health":
-                body = _json.dumps({"status": "ok"})
-                resp = (
-                    f"HTTP/1.0 200 OK\r\n"
-                    f"Content-Type: application/json\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    f"\r\n{body}"
-                )
+        @_web.middleware
+        async def _cors(
+            request: _web.Request, handler: _Any
+        ) -> _web.StreamResponse:
+            if request.method == "OPTIONS":
+                resp = _web.Response(status=204)
             else:
-                body = "Not Found"
-                resp = (
-                    f"HTTP/1.0 404 Not Found\r\n"
-                    f"Content-Type: text/plain\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    f"\r\n{body}"
-                )
+                resp = await handler(request)
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            resp.headers["Access-Control-Allow-Methods"] = (
+                "GET, POST, OPTIONS"
+            )
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            resp.headers["Access-Control-Max-Age"] = "3600"
+            return resp
 
-            writer.write(resp.encode())
-            await writer.drain()
-            writer.close()
+        app = _web.Application(middlewares=[_cors])
+        app["agent_loop"] = agent
 
-        server = await asyncio.start_server(handle, host, health_port)
-        console.print(f"[green]✓[/green] Health endpoint: http://{host}:{health_port}/health")
-        async with server:
-            await server.serve_forever()
+        async def _health_handler(
+            _request: _web.Request,
+        ) -> _web.Response:
+            return _web.json_response({"status": "ok"})
+
+        app.router.add_get("/health", _health_handler)
+
+        from nanobot.api.server import handle_kb_stats, handle_papers_upload
+
+        app.router.add_post("/api/papers/upload", handle_papers_upload)
+        app.router.add_get("/api/kb/stats", handle_kb_stats)
+
+        runner = _web.AppRunner(app)
+        await runner.setup()
+        site = _web.TCPSite(runner, host, health_port)
+        await site.start()
+        console.print(
+            f"[green]✓[/green] KB + health endpoint:"
+            f" http://{host}:{health_port}"
+        )
+        try:
+            await asyncio.Event().wait()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            await runner.cleanup()
     # Register Dream system job (always-on, idempotent on restart)
     dream_cfg = config.agents.defaults.dream
     if dream_cfg.model_override:

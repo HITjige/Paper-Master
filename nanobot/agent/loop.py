@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import time
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
@@ -24,6 +25,13 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
+from nanobot.agent.tools.paper import (
+    KBRetrieveTool,
+    PaperIngestTool,
+    PaperRerankTool,
+    PaperSearchTool,
+    PaperSimilarityTool,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
@@ -40,6 +48,14 @@ from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+from nanobot.agent.paper_kb import PaperKbConfig, PaperKnowledgeBase
+
+# Multi-agent system imports
+try:
+    from nanobot.agent.multi_agent import build_multi_agent_graph
+    MULTI_AGENT_AVAILABLE = True
+except ImportError:
+    MULTI_AGENT_AVAILABLE = False
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, ToolsConfig, WebToolsConfig
@@ -190,11 +206,16 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.tools_config = _tc
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
@@ -247,6 +268,22 @@ class AgentLoop:
             provider=provider,
             model=self.model,
         )
+
+        if self.tools_config.paper.enable:
+            paper_cfg = self.tools_config.paper
+            self.kb = PaperKnowledgeBase(
+                workspace=self.workspace,
+                config=PaperKbConfig(
+                    enabled=paper_cfg.enable,
+                    embedding_api_key=paper_cfg.embedding_api_key,
+                    embedding_api_base=paper_cfg.embedding_api_base,
+                    embedding_model=paper_cfg.embedding_model,
+                    retrieval_top_k=paper_cfg.retrieval_top_k,
+                    max_chunk_chars=paper_cfg.max_chunk_chars,
+                    min_chunk_chars=paper_cfg.min_chunk_chars,
+                ),
+            )
+
         self._register_default_tools()
         if _tc.my.enable:
             self.tools.register(MyTool(loop=self, modify_allowed=_tc.my.allow_set))
@@ -254,6 +291,33 @@ class AgentLoop:
         self._current_iteration: int = 0
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+        
+        # Initialize multi-agent graph if paper tools are enabled
+        self._multi_agent_graph = None
+        if MULTI_AGENT_AVAILABLE and self.tools_config.paper.enable:
+            try:
+                paper_tools = {
+                    "paper_search": self.tools.get("paper_search"),
+                    "paper_similarity": self.tools.get("paper_similarity"),
+                    "paper_rerank": self.tools.get("paper_rerank"),
+                    "paper_ingest": self.tools.get("paper_ingest"),
+                    "kb_retrieve": self.tools.get("kb_retrieve"),
+                }
+                if self.tools_config.paper.enable:
+                    self._multi_agent_graph = build_multi_agent_graph(
+                        provider=self.provider,
+                        kb=self.kb,
+                        tools=paper_tools,
+                        max_iterations=3,
+                        similarity_threshold=0.2,
+                        top_k=self.tools_config.paper.auto_context_top_k or 5,
+                        ingest_limit=3,
+                        memory_store=self.context.memory,
+                    )
+                    logger.info("Multi-agent graph initialized successfully")
+            except Exception as e:
+                logger.warning("Failed to initialize multi-agent graph: {}", e)
+                self._multi_agent_graph = None
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -293,6 +357,19 @@ class AgentLoop:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
+        if self.tools_config.paper.enable:
+            self.tools.register(PaperSearchTool(workspace=self.workspace, kb=self.kb))
+            self.tools.register(PaperSimilarityTool(workspace=self.workspace, kb=self.kb))
+            self.tools.register(PaperRerankTool(workspace=self.workspace, kb=self.kb))
+            self.tools.register(
+                PaperIngestTool(
+                    workspace=self.workspace,
+                    kb=self.kb,
+                    provider=self.provider,
+                    model=self.model,
+                )
+            )
+            self.tools.register(KBRetrieveTool(workspace=self.workspace, kb=self.kb))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -618,6 +695,14 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
+    def _append_turn_history(self, user_text: str, assistant_text: str) -> None:
+        if not (user_text or assistant_text):
+            return
+        user_snippet = truncate_text_fn(user_text or "", 2000)
+        assistant_snippet = truncate_text_fn(assistant_text or "", 2000)
+        entry = f"[TURN] USER: {user_snippet}\nASSISTANT: {assistant_snippet}"
+        self.context.memory.append_history(entry)
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -682,6 +767,7 @@ class AgentLoop:
             self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
             self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+            # self._schedule_background(self.dream.run())
             return OutboundMessage(
                 channel=channel,
                 chat_id=chat_id,
@@ -712,6 +798,33 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
+        # --- Define _bus_progress BEFORE the multi-agent check so
+        # process_with_multi_agent can relay progress to the bus. ---
+        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            meta = dict(msg.metadata or {})
+            meta["_progress"] = True
+            meta["_tool_hint"] = tool_hint
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=content,
+                    metadata=meta,
+                )
+            )
+
+        # Check if we should use multi-agent workflow
+        if self.should_use_multi_agent(msg.content):
+            logger.info("Using multi-agent workflow for query: {}", preview)
+            return await self.process_with_multi_agent(
+                content=msg.content,
+                session_key=key,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                on_progress=on_progress or _bus_progress,
+                session_summary=pending,
+            )
+
         await self.consolidator.maybe_consolidate_by_tokens(
             session,
             session_summary=pending,
@@ -732,19 +845,6 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
-
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=content,
-                    metadata=meta,
-                )
-            )
 
         async def _on_retry_wait(content: str) -> None:
             meta = dict(msg.metadata or {})
@@ -793,7 +893,9 @@ class AgentLoop:
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
+        # self._append_turn_history(msg.content, final_content or "")
         self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+        # self._schedule_background(self.dream.run())
 
         # When follow-up messages were injected mid-turn, a later natural
         # language reply may address those follow-ups and should not be
@@ -1052,3 +1154,548 @@ class AgentLoop:
             on_stream=on_stream,
             on_stream_end=on_stream_end,
         )
+
+    @staticmethod
+    def _extract_savable_state(state: dict[str, Any]) -> dict[str, Any]:
+        """Extract JSON-serializable state fields for session persistence.
+
+        Only preserves the minimal subset needed to resume workflow execution,
+        discarding ephemeral fields (callbacks, temp references, etc.).
+        """
+        SAVABLE_KEYS = {
+            "research_phase", "papers_for_selection", "search_completed",
+            "external_papers", "ingested_papers",
+            "routing_decision", "routing_reasoning",
+            "retrieval_results", "retrieval_quality",
+            "rewritten_queries", "rewrite_reasoning",
+            "sub_queries_detail", "extracted_entities",
+            "referenced_papers", "requires_clarification",
+            "iteration_count", "max_iterations",
+            "user_query", "session_id",
+            "recent_dialog_context",
+            "long_term_memory_context",
+            "user_profile_context",
+            "soul_context",
+            "session_summary_context",
+            "draft_answer",
+            "rewrite_fallback_used",
+        }
+        return {k: v for k, v in state.items() if k in SAVABLE_KEYS and v is not None}
+
+    async def process_with_multi_agent(
+        self,
+        content: str,
+        session_key: str = "cli:direct",
+        channel: str = "cli",
+        chat_id: str = "direct",
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        session_summary: str | None = None,
+    ) -> OutboundMessage | None:
+        """Process a message using the multi-agent workflow.
+
+        Supports pause/resume:
+        1. If the session contains a paused state (from a previous "select" phase),
+           the user's response is treated as paper selection input and the workflow
+           resumes via :meth:`MultiAgentGraph.resume`.
+        2. Otherwise, starts a fresh workflow.  If after execution the workflow is
+           paused at "select" phase (waiting for user to choose papers), the state
+           is saved to session metadata for the next turn.
+
+        Args:
+            content: User query content
+            session_key: Session identifier
+            channel: Channel name
+            chat_id: Chat identifier
+            on_progress: Optional progress callback
+
+        Returns:
+            OutboundMessage with the final answer or paper selection UI
+        """
+        if not self._multi_agent_graph:
+            logger.warning("Multi-agent graph not available, falling back to standard processing")
+            return await self.process_direct(
+                content=content,
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                on_progress=on_progress,
+            )
+
+        session = self.sessions.get_or_create(session_key)
+
+        # ------------------------------------------------------------------
+        # Check for paused state — resume mode
+        # ------------------------------------------------------------------
+        paused_state = session.metadata.pop("multi_agent_paused_state", None)
+        if paused_state is not None:
+            logger.info(
+                "process_with_multi_agent: found paused state, resuming workflow"
+            )
+            if on_progress:
+                await on_progress("🔄 收到选择，继续处理论文...")
+
+            # Persist the user's selection message so the conversation
+            # history stays coherent across turns.
+            if content.strip():
+                session.add_message("user", content)
+                self._mark_pending_user_turn(session)
+
+            # Save the session metadata change (cleared paused state) right away
+            self.sessions.save(session)
+
+            result = await self._multi_agent_graph.resume(
+                saved_state=paused_state,
+                user_input=content,
+            )
+
+            final_answer = result.get("final_answer", "")
+            routing_decision = result.get("routing_decision", "unknown")
+            iteration_count = result.get("iteration_count", 0)
+
+            metadata: dict[str, Any] = {
+                "multi_agent": True,
+                "resumed": True,
+                "routing_decision": routing_decision,
+                "iterations": iteration_count,
+                "sources_used": [],
+            }
+            if result.get("retrieval_results"):
+                metadata["sources_used"].append("internal_kb")
+            if result.get("external_papers"):
+                metadata["sources_used"].append("external_search")
+
+            # Build response parts
+            response_parts = []
+            if iteration_count > 0:
+                response_parts.append(
+                    f"*[Multi-Agent Workflow: {routing_decision} mode, "
+                    f"{iteration_count} iteration(s)]*\n\n"
+                )
+            response_parts.append(final_answer)
+
+            citations = result.get("citations", [])
+            if citations:
+                response_parts.append("\n\n**References:**")
+                for i, citation in enumerate(citations[:10], 1):
+                    response_parts.append(f"\n{i}. {citation}")
+
+            full_response = "".join(response_parts)
+
+            # Persist assistant response into session history
+            if final_answer.strip():
+                session.add_message("assistant", final_answer)
+                self._clear_pending_user_turn(session)
+                self.sessions.save(session)
+                self._schedule_background(
+                    self.consolidator.maybe_consolidate_by_tokens(session)
+                )
+
+            return OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=full_response,
+                metadata=metadata,
+            )
+
+        # ------------------------------------------------------------------
+        # Normal (non-resume) mode — fresh workflow execution
+        # ------------------------------------------------------------------
+        try:
+            if on_progress:
+                await on_progress("🔄 Starting multi-agent workflow...")
+
+            # Persist user message before running the workflow.
+            # This ensures the user's input is durable even if the process
+            # crashes mid-workflow.
+            if content.strip():
+                session.add_message("user", content)
+                self._mark_pending_user_turn(session)
+                self.sessions.save(session)
+
+            history = session.get_history(max_messages=0)
+
+            recent_dialog = self._format_recent_dialog(history, max_turns=500)
+            node_history_chars = int(self.tools_config.paper.multi_agent_node_history_chars or 0)
+            recent_dialog = self._truncate_context(recent_dialog, node_history_chars)
+
+            long_term_memory = self.context.memory.read_memory()
+            user_profile = self.context.memory.read_user()
+            soul_context = self.context.memory.read_soul()
+            session_summary_context = session_summary or ""
+            long_term_memory = self._truncate_context(long_term_memory, node_history_chars)
+            user_profile = self._truncate_context(user_profile, node_history_chars)
+            soul_context = self._truncate_context(soul_context, node_history_chars)
+            session_summary_context = self._truncate_context(session_summary_context, node_history_chars)
+
+            result = await self._multi_agent_graph.run(
+                user_query=content,
+                session_id=session_key,
+                progress_callback=on_progress,
+                recent_dialog_context=recent_dialog or "(empty)",
+                long_term_memory_context=long_term_memory or "(empty)",
+                user_profile_context=user_profile or "(empty)",
+                soul_context=soul_context or "(empty)",
+                session_summary_context=session_summary_context or "(empty)",
+            )
+
+            # ------------------------------------------------------------------
+            # Pause check: if workflow stopped at "select" phase for user input
+            # ------------------------------------------------------------------
+            if (
+                result.get("research_phase") == "select"
+                and result.get("papers_for_selection")
+            ):
+                # Save minimal state so the next turn can resume
+                savable = self._extract_savable_state(result)
+                session.metadata["multi_agent_paused_state"] = savable
+                self.sessions.save(session)
+
+                logger.info(
+                    "process_with_multi_agent: paused at select phase, "
+                    "saved state with {} papers for selection",
+                    len(result["papers_for_selection"]),
+                )
+
+                if on_progress:
+                    await on_progress("⏸️ 工作流暂停，等待用户选择论文")
+
+                # The draft_answer from the workflow IS the selection UI
+                selection_ui = result.get("final_answer", "") or result.get("draft_answer", "")
+                if not selection_ui:
+                    selection_ui = (
+                        "📚 Paper search completed. Please choose which papers "
+                        "to ingest (reply with paper IDs, `skip`, or `all`)."
+                    )
+
+                # Persist the selection UI as an assistant message so the
+                # conversation history stays coherent and the pending user
+                # turn is properly closed — avoids the "Task interrupted
+                # before a response was generated" error on the next turn.
+                if selection_ui.strip():
+                    session.add_message("assistant", selection_ui)
+                    self._clear_pending_user_turn(session)
+                    self.sessions.save(session)
+
+                return OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=selection_ui,
+                    metadata={
+                        "multi_agent": True,
+                        "awaiting_selection": True,
+                        "routing_decision": result.get("routing_decision", "unknown"),
+                    },
+                )
+
+            # ------------------------------------------------------------------
+            # Normal completion — format and return final answer
+            # ------------------------------------------------------------------
+            final_answer = result.get("final_answer", "")
+            routing_decision = result.get("routing_decision", "unknown")
+            iteration_count = result.get("iteration_count", 0)
+
+            metadata = {
+                "multi_agent": True,
+                "routing_decision": routing_decision,
+                "iterations": iteration_count,
+                "sources_used": [],
+            }
+
+            if result.get("retrieval_results"):
+                metadata["sources_used"].append("internal_kb")
+            if result.get("external_papers"):
+                metadata["sources_used"].append("external_search")
+
+            response_parts = []
+
+            if iteration_count > 0:
+                response_parts.append(
+                    f"*[Multi-Agent Workflow: {routing_decision} mode, "
+                    f"{iteration_count} iteration(s)]*\n\n"
+                )
+
+            response_parts.append(final_answer)
+
+            citations = result.get("citations", [])
+            if citations:
+                response_parts.append("\n\n**References:**")
+                for i, citation in enumerate(citations[:10], 1):
+                    response_parts.append(f"\n{i}. {citation}")
+
+            full_response = "".join(response_parts)
+
+            # Persist assistant response into session history
+            if final_answer.strip():
+                session.add_message("assistant", final_answer)
+                self._clear_pending_user_turn(session)
+                self.sessions.save(session)
+                self._schedule_background(
+                    self.consolidator.maybe_consolidate_by_tokens(session)
+                )
+            # self._append_turn_history(content, final_answer)
+            # self._schedule_background(self.dream.run())
+            # self._schedule_skill_extraction(result, content)
+
+            return OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=full_response,
+                metadata=metadata,
+            )
+
+        except Exception as e:
+            logger.error("Multi-agent workflow failed: {}", e)
+            # Fallback to standard processing
+            return await self.process_direct(
+                content=content,
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                on_progress=on_progress,
+            )
+    
+    async def kb_ingest_local(
+        self,
+        doc: dict[str, Any],
+        local_pdf_path: str,
+    ) -> dict[str, Any]:
+        """Ingest a local PDF file into the knowledge base.
+
+        Parses with MinerULoader (PDF → markdown, matching PaperIngestTool),
+        saves .md alongside the PDF for inspection, extracts the paper title
+        from the first ``# `` heading, then runs the full HyDE pipeline
+        (semantic chunking → LLM metadata → Chroma upsert).
+
+        Args:
+            doc: Paper metadata dict with keys paper_id, title, source, url, year.
+            local_pdf_path: Absolute path to the saved PDF file.
+
+        Returns:
+            Dict with status, paper_id, chunk_count, question_count, local_md.
+        """
+        if not self.tools_config.paper.enable or not hasattr(self, "kb"):
+            return {"status": "error", "error": "Knowledge base not enabled"}
+
+        from nanobot.agent.tools.paper import (
+            MINERU_TOKEN,
+            _extract_assets_and_strip,
+            _extract_figure_table_blocks,
+            _extract_front_matter,
+            _generate_chunk_metadata,
+            _merge_split_paragraphs,
+            _normalize_blank_lines,
+            _remove_noisy_blocks,
+            _save_asset_kv,
+            _split_markdown_semantic,
+            _strip_front_matter,
+        )
+
+        pdf_path = Path(local_pdf_path)
+        text_content: str = ""
+
+        # 1. Parse PDF using MinerULoader (precise markdown output).
+        try:
+            from langchain_mineru import MinerULoader
+
+            loader = MinerULoader(
+                source=str(pdf_path),
+                language="en",
+                mode="precision",
+                token=MINERU_TOKEN,
+            )
+            parsed = loader.load()
+            text_content = parsed[0].page_content if parsed else ""
+        except Exception:
+            logger.warning(
+                "MinerULoader failed for {}, falling back to extract_text",
+                pdf_path,
+            )
+
+        if not text_content:
+            from nanobot.utils.document import extract_text
+
+            text_content = extract_text(pdf_path)
+            text_content = text_content if isinstance(text_content, str) else ""
+
+        assets_path = self.workspace / "kb" / "figures.jsonl"
+        paper_id = str(doc.get("paper_id", "paper"))
+
+        text_content = _remove_noisy_blocks(text_content) if text_content else ""
+        # Extract and remove figure/table blocks (images + caption → KV),
+        # then merge paragraphs broken across pages.
+        text_content, assets_by_key = _extract_figure_table_blocks(
+            text_content, paper_id=paper_id,
+        )
+        text_content = _merge_split_paragraphs(text_content)
+        if assets_by_key:
+            _save_asset_kv(assets_path, assets_by_key, paper_id=paper_id)
+        if not text_content or not text_content.strip():
+            return {"status": "error", "error": "failed_to_parse_content"}
+
+        # Save front matter before stripping (for metadata extraction)
+        raw_front_matter = _extract_front_matter(text_content)
+        # Strip front matter (title/authors/abstract before Introduction)
+        body_text = _strip_front_matter(text_content)
+        # Final cleanup: discard any remaining image links / HTML tables
+        body_text, _ = _extract_assets_and_strip(body_text, paper_id=paper_id)
+        body_text = _normalize_blank_lines(body_text)
+
+        # Extract title from front matter's first ``# `` heading
+        if raw_front_matter:
+            m = re.search(r"^#\s+(.+)$", raw_front_matter, re.MULTILINE)
+            if m:
+                doc["title"] = m.group(1).strip()[:200]
+
+        # Enrich metadata from front matter when arXiv data is missing
+        if (not doc.get("authors") or not doc.get("abstract")) and raw_front_matter:
+            from nanobot.agent.tools.paper import _parse_front_matter_metadata
+            fm_meta = await _parse_front_matter_metadata(
+                raw_front_matter, self.provider, self.model,
+            )
+            if fm_meta.get("title"):
+                doc["title"] = fm_meta["title"]
+            if fm_meta.get("authors"):
+                doc["authors"] = fm_meta["authors"]
+            if fm_meta.get("abstract"):
+                doc["abstract"] = fm_meta["abstract"]
+            if fm_meta.get("year"):
+                doc["year"] = fm_meta["year"]
+
+        # 2. Save .md (body only, without front matter) for inspection.
+        md_path = pdf_path.with_suffix(".md")
+        md_path.write_text(body_text, encoding="utf-8")
+        pdf_path.unlink(missing_ok=True)
+
+        # 3. Semantic chunking on body text.
+        semantic_chunks = _split_markdown_semantic(
+            body_text,
+            max_chunk_chars=self.kb.config.max_chunk_chars,
+            min_chunk_chars=self.kb.config.min_chunk_chars,
+        )
+        if not semantic_chunks:
+            return {"status": "error", "error": "no_chunks_generated"}
+
+        # 4. Generate HyDE metadata for each chunk.
+        chunk_metadata: list[dict[str, Any]] = []
+        for chunk in semantic_chunks:
+            meta = await _generate_chunk_metadata(
+                text=chunk.get("text", ""),
+                section=chunk.get("section", "content"),
+                provider=self.provider,
+                model=self.model,
+                num_questions=self.kb.config.num_hypothetical_questions,
+                summarize=True,
+                title=doc.get("title", ""),
+                abstract=doc.get("abstract", ""),
+                paper_id=paper_id,
+                assets_by_key=assets_by_key,
+            )
+            chunk_metadata.append(meta)
+
+        # 6. Upsert to Chroma.
+        result = await self.kb.upsert_semantic_chunks(
+            doc=doc,
+            semantic_chunks=semantic_chunks,
+            chunk_metadata=chunk_metadata,
+        )
+        result["status"] = "ok"
+        result["local_md"] = str(md_path)
+        return result
+
+    def _schedule_skill_extraction(self, result: dict[str, Any], user_query: str) -> None:
+        """Fire-and-forget background task: extract reusable skills from paper Q&A.
+        
+        Runs Phase 1 (LLM analysis) + Phase 2 (AgentRunner with file tools)
+        to determine if this multi-agent discussion produced domain expertise
+        worth preserving as a Skill. If so, creates or updates SKILL.md files
+        under workspace/skills/.
+        """
+        if not self.tools_config.paper.enable:
+            return
+        try:
+            from nanobot.agent.skill_extractor import SkillExtractor
+
+            result["user_query"] = user_query
+            extractor = SkillExtractor(
+                store=self.context.memory,
+                provider=self.provider,
+                model=self.model,
+                workspace=self.workspace,
+            )
+            self._schedule_background(extractor.extract(result))
+        except Exception:
+            logger.exception("Failed to schedule skill extraction")
+
+    def should_use_multi_agent(self, content: str) -> bool:
+        """Determine if a query should use the multi-agent workflow.
+        
+        Heuristics:
+        - Query mentions papers, research, arXiv, or academic topics
+        - Query is complex (multiple questions or comparisons)
+        - Query asks for latest/recent papers
+        
+        Args:
+            content: User query
+            
+        Returns:
+            True if multi-agent should be used
+        """
+        if not self._multi_agent_graph:
+            return False
+
+        return True
+        
+        content_lower = content.lower()
+        
+        # Keywords indicating paper-related queries
+        paper_keywords = [
+            "paper", "论文", "文献", "研究", "research",
+            "arxiv", "publication", "survey", "review",
+            "method", "algorithm", "model", "architecture",
+            "transformer", "mamba", "llm", "gpt", "bert",
+            "neural", "deep learning", "machine learning",
+        ]
+        
+        # Check for paper-related keywords
+        has_paper_keyword = any(kw in content_lower for kw in paper_keywords)
+        
+        # Check for complex queries (comparison, analysis, summary)
+        complex_indicators = [
+            "compare", "对比", "比较", "vs", "versus",
+            "summarize", "总结", "综述", "分析",
+            "latest", "最新", "recent", "最近",
+            "difference", "区别", "差异",
+        ]
+        has_complex_indicator = any(ind in content_lower for ind in complex_indicators)
+        
+        # Use multi-agent if it's paper-related or complex
+        return has_paper_keyword or has_complex_indicator
+
+    @staticmethod
+    def _truncate_context(text: str, max_chars: int) -> str:
+        if not text or max_chars <= 0:
+            return text
+        return text[:max_chars]
+
+    @staticmethod
+    def _format_recent_dialog(history: list[dict[str, Any]], max_turns: int = 500) -> str:
+        if max_turns <= 0:
+            return ""
+        collected: list[str] = []
+        user_turns = 0
+        for message in reversed(history):
+            role = message.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            content = message.get("content", "")
+            if not content:
+                continue
+            collected.append(f"{role.upper()}: {content}")
+            if role == "user":
+                user_turns += 1
+                if user_turns >= max_turns:
+                    break
+        if not collected:
+            return ""
+        collected.reverse()
+        return "\n".join(collected)

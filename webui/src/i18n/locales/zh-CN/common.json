@@ -23,6 +23,7 @@
     "newChat": "新建对话",
     "recent": "最近对话",
     "refreshSessions": "刷新会话",
+    "knowledgeBase": "知识库",
     "language": {
       "label": "语言",
       "ariaLabel": "切换语言"
@@ -79,5 +80,18 @@
     "copyAria": "复制代码",
     "copy": "复制",
     "copied": "已复制"
+  },
+  "kb": {
+    "title": "知识库",
+    "dropHint": "拖放 PDF 文件到这里",
+    "dropSubHint": "或点击浏览 — 仅支持 PDF，每文件最大 50 MB",
+    "uploadResults": "上传结果",
+    "stats": "知识库统计",
+    "papers": "论文数",
+    "chunks": "文档块",
+    "recent": "最近论文",
+    "refresh": "刷新统计",
+    "uploading": "正在上传 {fileName}{extra}…",
+    "clearHistory": "清除历史"
   }
 }

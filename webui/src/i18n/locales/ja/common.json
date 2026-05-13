@@ -23,6 +23,7 @@
     "newChat": "新しいチャット",
     "recent": "最近のチャット",
     "refreshSessions": "セッションを更新",
+    "knowledgeBase": "知識ベース",
     "language": {
       "label": "言語",
       "ariaLabel": "言語を変更"
@@ -79,5 +80,18 @@
     "copyAria": "コードをコピー",
     "copy": "コピー",
     "copied": "コピーしました"
+  },
+  "kb": {
+    "title": "知識ベース",
+    "dropHint": "PDFファイルをここにドロップ",
+    "dropSubHint": "またはクリックして選択 — PDFのみ、1ファイル最大50MB",
+    "uploadResults": "アップロード結果",
+    "stats": "知識ベース統計",
+    "papers": "論文数",
+    "chunks": "チャンク",
+    "recent": "最近の論文",
+    "refresh": "統計を更新",
+    "uploading": "アップロード中 {fileName}{extra}…",
+    "clearHistory": "履歴をクリア"
   }
 }

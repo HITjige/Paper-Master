@@ -23,6 +23,7 @@
     "newChat": "Nouvelle discussion",
     "recent": "Récentes",
     "refreshSessions": "Actualiser les sessions",
+    "knowledgeBase": "Base de connaissances",
     "language": {
       "label": "Langue",
       "ariaLabel": "Changer de langue"
@@ -79,5 +80,18 @@
     "copyAria": "Copier le code",
     "copy": "Copier",
     "copied": "Copié"
+  },
+  "kb": {
+    "title": "Base de connaissances",
+    "dropHint": "Déposez les fichiers PDF ici",
+    "dropSubHint": "ou cliquez pour parcourir — PDF uniquement, jusqu'à 50 Mo par fichier",
+    "uploadResults": "Résultats d'upload",
+    "stats": "Statistiques",
+    "papers": "Articles",
+    "chunks": "Fragments",
+    "recent": "Articles récents",
+    "refresh": "Actualiser",
+    "uploading": "Téléchargement {fileName}{extra}…",
+    "clearHistory": "Effacer l'historique"
   }
 }

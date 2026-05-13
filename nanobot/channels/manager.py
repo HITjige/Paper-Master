@@ -84,6 +84,10 @@ class ChannelManager:
                     static_path = _default_webui_dist()
                     if static_path is not None:
                         kwargs["static_dist_path"] = static_path
+                    # Expose the aiohttp API server URL for KB upload endpoints
+                    api_host = getattr(self.config.api, "host", "127.0.0.1")
+                    api_port = getattr(self.config.api, "port", 8900)
+                    kwargs["api_server_url"] = f"http://{api_host}:{api_port}"
                 channel = cls(section, self.bus, **kwargs)
                 channel.transcription_provider = transcription_provider
                 channel.transcription_api_key = transcription_key

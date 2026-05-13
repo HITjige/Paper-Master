@@ -62,7 +62,9 @@ class Session:
         return out
 
     def clear(self) -> None:
-        """Clear all messages and reset session to initial state."""
+        """Clear all messages and reset session to initial state.
+        
+        清理多余的历史消息，但和 get_history 一样，要保证截断后的开头是合乎 API 规范的对话"""
         self.messages = []
         self.last_consolidated = 0
         self.updated_at = datetime.now()

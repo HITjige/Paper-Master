@@ -101,7 +101,9 @@ def truncate_text(text: str, max_chars: int) -> str:
 
 
 def find_legal_message_start(messages: list[dict[str, Any]]) -> int:
-    """Find the first index whose tool results have matching assistant calls."""
+    """Find the first index whose tool results have matching assistant calls.
+    
+    清理那些没有被声明调用的、凭空出现的“孤儿”工具执行结果"""
     declared: set[str] = set()
     start = 0
     for i, msg in enumerate(messages):
@@ -109,10 +111,17 @@ def find_legal_message_start(messages: list[dict[str, Any]]) -> int:
         if role == "assistant":
             for tc in msg.get("tool_calls") or []:
                 if isinstance(tc, dict) and tc.get("id"):
+                    # 如果有工具调用，就把这个唯一的调用 ID 记录到白名单集合 declared 中
                     declared.add(str(tc["id"]))
         elif role == "tool":
             tid = msg.get("tool_call_id")
+            # 如果这段消息声明它是某个工具的回调，但这个 ID 不在我们前面收集的 declared 白名单内！
+            # 这就意味着前置调用动作（A分支）被之前的倒数切片操作 `[-max_messages:]` 裁掉了。
+            # 这就是一个非法的“孤儿工具结果”。
             if tid and str(tid) not in declared:
+                # 如果遇到孤儿结果，我们前面的所有消息加这个孤儿消息都不能要了。
+                # 强行把合法的起步游标 `start` 移动到这条孤儿消息的下一个位置 (i + 1)。
+                # 之前积累的白名单也彻底清空。
                 start = i + 1
                 declared.clear()
                 for prev in messages[start : i + 1]:

@@ -6,6 +6,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const target = env.NANOBOT_API_URL ?? "http://127.0.0.1:8765";
   const wsTarget = target.replace(/^http/, "ws");
+  const kbTarget = env.NANOBOT_KB_URL ?? "http://127.0.0.1:18790";
 
   return {
     plugins: [react()],
@@ -40,6 +41,8 @@ export default defineConfig(({ mode }) => {
       },
       proxy: {
         "/webui": { target, changeOrigin: true },
+        "/api/papers": { target: kbTarget, changeOrigin: true },
+        "/api/kb": { target: kbTarget, changeOrigin: true },
         "/api": { target, changeOrigin: true },
         "/auth": { target, changeOrigin: true },
         // Forward only WebSocket upgrades on ``/`` to the nanobot gateway;

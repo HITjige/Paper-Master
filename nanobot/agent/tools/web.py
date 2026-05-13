@@ -299,6 +299,7 @@ class WebFetchTool(Tool):
         "Fetch a URL and extract readable content (HTML → markdown/text). "
         "Output is capped at maxChars (default 50 000). "
         "Works for most web pages and docs; may fail on login-walled or JS-heavy sites."
+        "For paper deep-read/internalization (arXiv/PDF), choose paper_ingest instead of web_fetch."
     )
 
     def __init__(self, max_chars: int = 50000, proxy: str | None = None):

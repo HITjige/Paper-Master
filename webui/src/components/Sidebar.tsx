@@ -1,4 +1,4 @@
-import { Moon, PanelLeftClose, Plus, RefreshCcw, Sun } from "lucide-react";
+import { BookOpen, Moon, PanelLeftClose, Plus, RefreshCcw, Sun } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ChatList } from "@/components/ChatList";
@@ -13,12 +13,14 @@ interface SidebarProps {
   activeKey: string | null;
   loading: boolean;
   theme: "light" | "dark";
+  showKB: boolean;
   onToggleTheme: () => void;
   onNewChat: () => void;
   onSelect: (key: string) => void;
   onRefresh: () => void;
   onRequestDelete: (key: string, label: string) => void;
   onCollapse: () => void;
+  onNavigateKB: () => void;
 }
 
 export function Sidebar(props: SidebarProps) {
@@ -49,7 +51,7 @@ export function Sidebar(props: SidebarProps) {
           )}
         </Button>
       </div>
-      <div className="px-2 pb-2.5">
+      <div className="space-y-1 px-2 pb-2.5">
         <Button
           onClick={props.onNewChat}
           className="h-8.5 w-full justify-start gap-2 rounded-lg border border-sidebar-border/80 bg-card/25 px-3 text-[13px] font-medium text-sidebar-foreground shadow-none hover:bg-sidebar-accent/80"
@@ -57,6 +59,19 @@ export function Sidebar(props: SidebarProps) {
         >
           <Plus className="h-3.5 w-3.5" />
           {t("sidebar.newChat")}
+        </Button>
+        <Button
+          onClick={props.onNavigateKB}
+          className={[
+            "h-8.5 w-full justify-start gap-2 rounded-lg border px-3 text-[13px] font-medium shadow-none",
+            props.showKB
+              ? "border-sidebar-border/80 bg-sidebar-accent/60 text-sidebar-foreground"
+              : "border-sidebar-border/80 bg-card/25 text-sidebar-foreground hover:bg-sidebar-accent/80",
+          ].join(" ")}
+          variant="outline"
+        >
+          <BookOpen className="h-3.5 w-3.5" />
+          {t("sidebar.knowledgeBase", "Knowledge Base")}
         </Button>
       </div>
       <Separator className="bg-sidebar-border/70" />

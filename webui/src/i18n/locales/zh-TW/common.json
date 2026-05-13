@@ -23,6 +23,7 @@
     "newChat": "新增對話",
     "recent": "最近對話",
     "refreshSessions": "重新整理會話",
+    "knowledgeBase": "知識庫",
     "language": {
       "label": "語言",
       "ariaLabel": "切換語言"
@@ -79,5 +80,18 @@
     "copyAria": "複製程式碼",
     "copy": "複製",
     "copied": "已複製"
+  },
+  "kb": {
+    "title": "知識庫",
+    "dropHint": "將 PDF 檔案拖放到這裡",
+    "dropSubHint": "或點擊瀏覽 — 僅限 PDF，每文件最大 50 MB",
+    "uploadResults": "上傳結果",
+    "stats": "知識庫統計",
+    "papers": "論文數",
+    "chunks": "文件塊",
+    "recent": "最近論文",
+    "refresh": "重新整理統計",
+    "uploading": "正在上傳 {fileName}{extra}…",
+    "clearHistory": "清除歷史"
   }
 }

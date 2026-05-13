@@ -23,6 +23,7 @@
     "newChat": "Nuevo chat",
     "recent": "Recientes",
     "refreshSessions": "Actualizar sesiones",
+    "knowledgeBase": "Base de conocimiento",
     "language": {
       "label": "Idioma",
       "ariaLabel": "Cambiar idioma"
@@ -79,5 +80,18 @@
     "copyAria": "Copiar código",
     "copy": "Copiar",
     "copied": "Copiado"
+  },
+  "kb": {
+    "title": "Base de conocimiento",
+    "dropHint": "Arrastra los archivos PDF aquí",
+    "dropSubHint": "o haz clic para explorar — solo PDF, hasta 50 MB por archivo",
+    "uploadResults": "Resultados de subida",
+    "stats": "Estadísticas",
+    "papers": "Artículos",
+    "chunks": "Fragmentos",
+    "recent": "Artículos recientes",
+    "refresh": "Actualizar estadísticas",
+    "uploading": "Subiendo {fileName}{extra}…",
+    "clearHistory": "Limpiar historial"
   }
 }

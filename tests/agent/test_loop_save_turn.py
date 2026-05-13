@@ -576,3 +576,131 @@ def test_subagent_followup_skips_empty_content() -> None:
 
     assert loop._persist_subagent_followup(session, msg) is False
     assert session.messages == []
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_persists_only_user_and_final_answer_in_strict_mode(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    graph = MagicMock()
+    graph.run = AsyncMock(return_value={
+        "final_answer": "final synthesis answer",
+        "routing_decision": "hybrid",
+        "routing_reasoning": "need both internal and external",
+        "iteration_count": 1,
+        "citations": ["arxiv:1111.1111"],
+        "retrieval_results": [{"id": "kb-1"}],
+        "external_papers": [{"id": "arxiv:1111.1111"}],
+        "critic_verdict": "passed",
+    })
+    loop._multi_agent_graph = graph
+
+    result = await loop._process_message(
+        InboundMessage(channel="feishu", sender_id="u1", chat_id="ma1", content="Please summarize this paper")
+    )
+
+    assert result is not None
+    assert "final synthesis answer" in result.content
+
+    session = loop.sessions.get_or_create("feishu:ma1")
+    assert [
+        {k: v for k, v in m.items() if k in {"role", "content"}}
+        for m in session.messages
+    ] == [
+        {"role": "user", "content": "Please summarize this paper"},
+        {"role": "assistant", "content": "final synthesis answer"},
+    ]
+    assert session.metadata.get(AgentLoop._MULTI_AGENT_LAST_ROUTING_KEY) == "hybrid"
+    assert session.metadata.get(AgentLoop._MULTI_AGENT_LAST_SOURCES_KEY) == [
+        "internal_kb",
+        "external_search",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_router_receives_last_routing_and_memory_context(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop.tools_config.paper.multi_agent_memory_mode = "strict_with_citations"
+
+    graph = MagicMock()
+    graph.run = AsyncMock(side_effect=[
+        {
+            "final_answer": "first answer",
+            "routing_decision": "external",
+            "routing_reasoning": "latest papers requested",
+            "iteration_count": 1,
+            "citations": ["arxiv:2001.00001"],
+            "retrieval_results": [],
+            "external_papers": [{"id": "arxiv:2001.00001"}],
+            "critic_verdict": "passed",
+        },
+        {
+            "final_answer": "second answer",
+            "routing_decision": "internal",
+            "routing_reasoning": "follow-up asks details of previous paper",
+            "iteration_count": 1,
+            "citations": [],
+            "retrieval_results": [{"id": "kb-2"}],
+            "external_papers": [],
+            "critic_verdict": "passed",
+        },
+    ])
+    loop._multi_agent_graph = graph
+
+    await loop._process_message(
+        InboundMessage(channel="feishu", sender_id="u1", chat_id="ma2", content="Find latest EEG paper")
+    )
+    await loop._process_message(
+        InboundMessage(channel="feishu", sender_id="u1", chat_id="ma2", content="Compare it with previous one")
+    )
+
+    first_call = graph.run.call_args_list[0].kwargs
+    second_call = graph.run.call_args_list[1].kwargs
+    assert first_call["last_routing_decision"] == "none"
+    assert second_call["last_routing_decision"] == "external"
+    assert "Find latest EEG paper" in second_call["router_memory_short"]
+
+    session = loop.sessions.get_or_create("feishu:ma2")
+    assert "References:" in session.messages[1]["content"]
+    assert "arxiv:2001.00001" in session.messages[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_can_force_single_agent_path(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    loop._decide_multi_agent_with_orchestrator = AsyncMock(return_value=(
+        False,
+        {
+            "orchestrator_decision": "single",
+            "orchestrator_reasoning": "simple question",
+            "orchestrator_confidence": 0.92,
+        },
+    ))  # type: ignore[method-assign]
+
+    graph = MagicMock()
+    graph.run = AsyncMock(return_value={"final_answer": "should not run"})
+    loop._multi_agent_graph = graph
+
+    loop._run_agent_loop = AsyncMock(return_value=(
+        "single-agent answer",
+        None,
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "single-agent answer"},
+        ],
+        "stop",
+        False,
+    ))  # type: ignore[method-assign]
+
+    result = await loop._process_message(
+        InboundMessage(channel="feishu", sender_id="u1", chat_id="orchestrator1", content="hello")
+    )
+
+    assert result is not None
+    assert result.content == "single-agent answer"
+    graph.run.assert_not_called()

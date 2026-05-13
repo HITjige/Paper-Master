@@ -26,6 +26,15 @@ Output is rendered in a terminal. Avoid markdown headings and tables. Use plain 
 
 - Prefer built-in `grep` / `glob` over `exec` for workspace search.
 - On broad searches, use `grep(output_mode="count")` to scope before requesting full content.
+
+## Paper Workflow Guardrails
+
+- For paper survey and literature tasks, do not treat `paper_search` as the final ranking step.
+	Use `paper_similarity` and `paper_rerank` before drawing conclusions.
+- If the user asks to internalize papers or requests deep evidence-grounded analysis, call `paper_ingest`
+	on top-ranked papers, then use `kb_retrieve` when answering.
+- If paper tools return non-empty candidates, never conclude "no research exists".
+	Use uncertainty wording (e.g., "insufficient confidence" / "limited evidence") and cite the closest papers.
 {% include 'agent/_snippets/untrusted_content.md' %}
 
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.
