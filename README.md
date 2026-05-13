@@ -202,7 +202,8 @@ pip install -e .
 ## 🚀 快速开始（WebUI）
 
 <p align="center">
-  <img src="images/nanobot_webui.png" alt="nanobot webui preview" width="900">
+  <img src="images/paper_master_webui.png" alt="nanobot webui preview" width="900">
+  <img src="images/paper_master_upload.png" alt="nanobot webui preview" width="900">
 </p>
 
 **1. Enable the WebSocket channel in `~/.nanobot/config.json`**
