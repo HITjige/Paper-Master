@@ -9,7 +9,7 @@ Use `eval/paper_eval_dataset.json` with records:
 - `query`: question or retrieval intent
 - `relevant_paper_ids`: expected paper ids (from arXiv id or your canonical id)
 - `top_k`: cutoff for recall@k
-- `max_results`: candidate pool size used by `paper_search`
+- `search_topk`: candidate pool size used by `paper_search` (`max_results` remains a legacy alias)
 
 ## Run
 
@@ -29,6 +29,10 @@ python scripts/eval_paper_agent.py --dataset eval/paper_eval_dataset.json --work
 
 - `avg_recall_at_k`: relevant hits / total relevant papers.
 - `avg_mrr`: mean reciprocal rank of first relevant paper.
+
+Records without a non-empty `relevant_paper_ids` label are reported as
+`skipped` and are excluded from aggregate metrics; they are not counted as
+zero-recall examples.
 
 ## Observability
 

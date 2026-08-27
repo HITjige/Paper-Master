@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
+import os
 import re
+import sqlite3
+import tempfile
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,100 +20,331 @@ from typing import Any
 import httpx
 from loguru import logger
 
-
 # ---------------------------------------------------------------------------
-# BM25 sparse retrieval (lightweight, no external deps)
+# Persistent BM25 sparse retrieval
 # ---------------------------------------------------------------------------
 
-class _BM25Index:
-    """A minimal BM25 index over a corpus of documents."""
+class _SQLiteBM25Index:
+    """Persistent multi-field BM25 index backed by SQLite FTS5.
 
-    def __init__(self, k1: float = 1.5, b: float = 0.75) -> None:
-        self.k1 = k1
-        self.b = b
-        self._corpus: list[tuple[str, list[str]]] = []  # (doc_id, tokens)
-        self._doc_len: list[int] = []
-        self._avgdl: float = 0.0
-        self._df: dict[str, int] = defaultdict(int)
-        self._idf: dict[str, float] = {}
-        self._built = False
+    One FTS row represents one parent chunk.  Generated summaries and
+    hypothetical questions are fields of that row rather than independent
+    pseudo-documents, so they can be weighted without inflating document
+    frequency or allowing one chunk to occupy several result slots.
+    """
 
-    def _tokenize(self, text: str) -> list[str]:
-        return _split_tokens(text)
+    SCHEMA_VERSION = "1"
+    TOKENIZER_VERSION = "mixed-cjk-unigram-bigram-v1"
+    FIELD_WEIGHTS = (5.0, 3.0, 1.5, 2.0, 1.0)
+    SEARCH_FIELDS = frozenset({"title", "keywords", "summary", "questions", "body"})
+    MAX_QUERY_TERMS = 64
 
-    def index(self, doc_id: str, text: str) -> None:
-        tokens = self._tokenize(text)
-        self._corpus.append((doc_id, tokens))
-        self._doc_len.append(len(tokens))
-        self._built = False
+    def __init__(
+        self,
+        path: Path,
+        *,
+        field_weights: tuple[float, float, float, float, float] | None = None,
+    ) -> None:
+        self.path = path
+        self.field_weights = tuple(
+            max(0.0, float(weight))
+            for weight in (field_weights or self.FIELD_WEIGHTS)
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._connection = sqlite3.connect(
+            str(path),
+            timeout=30.0,
+            check_same_thread=False,
+        )
+        self._connection.row_factory = sqlite3.Row
+        with self._lock:
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA synchronous=NORMAL")
+            self._initialize_schema()
 
-    def remove(self, doc_id: str) -> None:
-        self._corpus = [(did, toks) for did, toks in self._corpus if did != doc_id]
-        self._doc_len = [len(toks) for _, toks in self._corpus]
-        self._built = False
+    def _initialize_schema(self) -> None:
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS lexical_meta ("
+            "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        existing_version = self._get_meta("schema_version")
+        existing_tokenizer = self._get_meta("tokenizer_version")
+        if (
+            existing_version not in {None, self.SCHEMA_VERSION}
+            or existing_tokenizer not in {None, self.TOKENIZER_VERSION}
+        ):
+            self._drop_index_schema()
 
-    def remove_by_prefix(self, prefix: str) -> None:
-        self._corpus = [(did, toks) for did, toks in self._corpus if not did.startswith(prefix)]
-        self._doc_len = [len(toks) for _, toks in self._corpus]
-        self._built = False
+        self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS lexical_documents (
+                rowid INTEGER PRIMARY KEY,
+                chunk_id TEXT NOT NULL UNIQUE,
+                paper_id TEXT NOT NULL,
+                title_raw TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                keywords TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                questions TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_lexical_documents_paper_id
+                ON lexical_documents(paper_id);
+            CREATE INDEX IF NOT EXISTS idx_lexical_documents_title_raw
+                ON lexical_documents(title_raw);
 
-    def _build(self) -> None:
-        if self._built:
-            return
-        n = len(self._corpus)
-        self._avgdl = sum(self._doc_len) / max(1, n)
-        self._df.clear()
-        for _, toks in self._corpus:
-            seen: set[str] = set()
-            for t in toks:
-                if t not in seen:
-                    self._df[t] += 1
-                    seen.add(t)
-        self._idf.clear()
-        for term, df in self._df.items():
-            self._idf[term] = math.log((n - df + 0.5) / (df + 0.5) + 1.0)
-        self._built = True
+            CREATE VIRTUAL TABLE IF NOT EXISTS paper_fts USING fts5(
+                title,
+                keywords,
+                summary,
+                questions,
+                body,
+                content='lexical_documents',
+                content_rowid='rowid',
+                tokenize='unicode61'
+            );
 
-    def search(self, query: str, top_n: int = 20) -> list[tuple[str, float]]:
-        self._build()
-        q_tokens = self._tokenize(query)
-        if not q_tokens or not self._corpus:
+            CREATE TRIGGER IF NOT EXISTS lexical_documents_ai
+            AFTER INSERT ON lexical_documents BEGIN
+                INSERT INTO paper_fts(rowid, title, keywords, summary, questions, body)
+                VALUES (new.rowid, new.title, new.keywords, new.summary, new.questions, new.body);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS lexical_documents_ad
+            AFTER DELETE ON lexical_documents BEGIN
+                INSERT INTO paper_fts(
+                    paper_fts, rowid, title, keywords, summary, questions, body
+                ) VALUES (
+                    'delete', old.rowid, old.title, old.keywords,
+                    old.summary, old.questions, old.body
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS lexical_documents_au
+            AFTER UPDATE ON lexical_documents BEGIN
+                INSERT INTO paper_fts(
+                    paper_fts, rowid, title, keywords, summary, questions, body
+                ) VALUES (
+                    'delete', old.rowid, old.title, old.keywords,
+                    old.summary, old.questions, old.body
+                );
+                INSERT INTO paper_fts(rowid, title, keywords, summary, questions, body)
+                VALUES (new.rowid, new.title, new.keywords, new.summary, new.questions, new.body);
+            END;
+            """
+        )
+        weights = ", ".join(str(weight) for weight in self.field_weights)
+        self._connection.execute(
+            "INSERT INTO paper_fts(paper_fts, rank) VALUES('rank', ?)",
+            (f"bm25({weights})",),
+        )
+        self._set_meta("schema_version", self.SCHEMA_VERSION)
+        self._set_meta("tokenizer_version", self.TOKENIZER_VERSION)
+        self._connection.commit()
+
+    def _drop_index_schema(self) -> None:
+        self._connection.executescript(
+            """
+            DROP TRIGGER IF EXISTS lexical_documents_ai;
+            DROP TRIGGER IF EXISTS lexical_documents_ad;
+            DROP TRIGGER IF EXISTS lexical_documents_au;
+            DROP TABLE IF EXISTS paper_fts;
+            DROP TABLE IF EXISTS lexical_documents;
+            DELETE FROM lexical_meta;
+            """
+        )
+
+    def _get_meta(self, key: str) -> str | None:
+        row = self._connection.execute(
+            "SELECT value FROM lexical_meta WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def _set_meta(self, key: str, value: str) -> None:
+        self._connection.execute(
+            "INSERT INTO lexical_meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+    @staticmethod
+    def _as_text(value: Any) -> str:
+        if isinstance(value, (list, tuple, set)):
+            return " ".join(str(item) for item in value if item)
+        return str(value or "")
+
+    @classmethod
+    def _indexed_text(cls, value: Any) -> str:
+        return " ".join(tokenize_text(cls._as_text(value)))
+
+    @classmethod
+    def _prepare_row(cls, row: dict[str, Any]) -> tuple[str, ...]:
+        title_raw = cls._as_text(row.get("title", ""))
+        return (
+            str(row.get("chunk_id", "")),
+            str(row.get("paper_id", "")),
+            title_raw,
+            cls._indexed_text(title_raw),
+            cls._indexed_text(row.get("keywords", "")),
+            cls._indexed_text(row.get("summary", "")),
+            cls._indexed_text(row.get("questions", "")),
+            cls._indexed_text(row.get("body", "")),
+        )
+
+    def replace_paper(
+        self,
+        paper_id: str,
+        rows: list[dict[str, Any]],
+        *,
+        source_mtime_ns: int | None = None,
+    ) -> None:
+        prepared = [self._prepare_row(row) for row in rows if row.get("chunk_id")]
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM lexical_documents WHERE paper_id = ?",
+                (paper_id,),
+            )
+            self._connection.executemany(
+                "INSERT INTO lexical_documents("
+                "chunk_id, paper_id, title_raw, title, keywords, summary, questions, body"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                prepared,
+            )
+            if source_mtime_ns is not None:
+                self._set_meta("source_mtime_ns", str(source_mtime_ns))
+
+    def rebuild(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        source_mtime_ns: int,
+    ) -> None:
+        prepared = [self._prepare_row(row) for row in rows if row.get("chunk_id")]
+        with self._lock, self._connection:
+            self._connection.execute("DELETE FROM lexical_documents")
+            self._connection.executemany(
+                "INSERT INTO lexical_documents("
+                "chunk_id, paper_id, title_raw, title, keywords, summary, questions, body"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                prepared,
+            )
+            self._set_meta("source_mtime_ns", str(source_mtime_ns))
+
+    def needs_sync(self, source_mtime_ns: int) -> bool:
+        with self._lock:
+            return self._get_meta("source_mtime_ns") != str(source_mtime_ns)
+
+    @classmethod
+    def _match_query(cls, query: str, fields: tuple[str, ...] | None) -> str:
+        tokens = list(dict.fromkeys(tokenize_text(query)))
+        if not tokens:
+            return ""
+        if len(tokens) > cls.MAX_QUERY_TERMS:
+            multi_character = [token for token in tokens if len(token) > 1]
+            single_character = [token for token in tokens if len(token) == 1]
+            tokens = (multi_character + single_character)[:cls.MAX_QUERY_TERMS]
+        terms = " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+        if fields:
+            valid_fields = [field for field in fields if field in cls.SEARCH_FIELDS]
+            if valid_fields:
+                return "{" + " ".join(valid_fields) + "} : (" + terms + ")"
+        return "(" + terms + ")"
+
+    def search(
+        self,
+        query: str,
+        *,
+        top_n: int = 20,
+        fields: tuple[str, ...] | None = None,
+        paper_id: str = "",
+        title_contains: str = "",
+    ) -> list[tuple[str, float]]:
+        match_query = self._match_query(query, fields)
+        if not match_query:
             return []
-        scores: list[tuple[str, float]] = []
-        for (doc_id, toks), dl in zip(self._corpus, self._doc_len):
-            score = 0.0
-            for qt in q_tokens:
-                idf = self._idf.get(qt, 0.0)
-                if idf == 0.0:
-                    continue
-                tf = toks.count(qt)
-                score += idf * (tf * (self.k1 + 1)) / (tf + self.k1 * (1 - self.b + self.b * dl / self._avgdl))
-            if score > 0:
-                scores.append((doc_id, score))
-        if scores:
-            normalized_scores = {}
-            for doc_id, score in scores:
-                if doc_id.count(":") == 2:
-                    prefix = doc_id.rsplit(":", 1)[0]
-                    normalized_scores[prefix] = max(normalized_scores.get(prefix, 0.0), score)
-            scores = list(normalized_scores.items())
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return scores[:top_n]
+
+        filters: list[str] = []
+        params: list[Any] = [match_query]
+        if paper_id:
+            filters.append("d.paper_id = ?")
+            params.append(paper_id)
+        if title_contains:
+            filters.append("LOWER(d.title_raw) LIKE ?")
+            params.append(f"%{title_contains.lower()}%")
+        params.append(max(1, top_n))
+        filter_sql = "" if not filters else " AND " + " AND ".join(filters)
+        sql = (
+            "SELECT d.chunk_id, -rank AS score "
+            "FROM paper_fts "
+            "JOIN lexical_documents d ON d.rowid = paper_fts.rowid "
+            "WHERE paper_fts MATCH ?"
+            f"{filter_sql} ORDER BY rank LIMIT ?"
+        )
+        with self._lock:
+            rows = self._connection.execute(sql, params).fetchall()
+        return [(str(row["chunk_id"]), float(row["score"])) for row in rows]
+
+    def count(self) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM lexical_documents"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def get_status(self) -> dict[str, Any]:
+        with self._lock:
+            source_mtime_ns = self._get_meta("source_mtime_ns")
+        return {
+            "backend": "sqlite_fts5",
+            "path": str(self.path),
+            "document_count": self.count(),
+            "schema_version": self.SCHEMA_VERSION,
+            "tokenizer_version": self.TOKENIZER_VERSION,
+            "field_weights": {
+                field: weight
+                for field, weight in zip(
+                    ("title", "keywords", "summary", "questions", "body"),
+                    self.field_weights,
+                )
+            },
+            "source_mtime_ns": int(source_mtime_ns) if source_mtime_ns else None,
+        }
+
+    def close(self) -> None:
+        with self._lock:
+            self._connection.close()
 
 
-def _rrf_fuse(
-    rankings: list[list[tuple[str, float]]],
+def _weighted_rrf_fuse(
+    families: list[tuple[list[list[tuple[str, float]]], float]],
+    *,
     k: int = 60,
 ) -> dict[str, float]:
-    """Reciprocal Rank Fusion (RRF) across multiple ranked lists.
+    """Fuse ranked-list families without giving larger families more weight."""
+    available = [
+        ([ranking for ranking in rankings if ranking], max(0.0, weight))
+        for rankings, weight in families
+        if any(rankings)
+    ]
+    active = [(rankings, weight) for rankings, weight in available if weight > 0]
+    if not active and available:
+        active = [(rankings, 1.0) for rankings, _weight in available]
+    total_weight = sum(weight for _, weight in active)
+    if total_weight <= 0:
+        return {}
 
-    Each list is a list of (id, score_or_distance) sorted by relevance
-    (best first).  Returns a dict of id → fused_score.
-    """
     fused: dict[str, float] = defaultdict(float)
-    for ranked in rankings:
-        for rank, (doc_id, _score) in enumerate(ranked):
-            fused[doc_id] += 1.0 / (k + rank + 1)
+    for rankings, family_weight in active:
+        per_ranking_weight = family_weight / total_weight / len(rankings)
+        for ranking in rankings:
+            seen: set[str] = set()
+            for rank, (doc_id, _score) in enumerate(ranking, start=1):
+                if not doc_id or doc_id in seen:
+                    continue
+                fused[doc_id] += per_ranking_weight / (k + rank)
+                seen.add(doc_id)
     return dict(fused)
 
 
@@ -121,8 +357,37 @@ def _normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+_MIXED_TOKEN_PATTERN = re.compile(
+    r"[A-Za-z0-9]+|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+"
+)
+
+
+def tokenize_text(text: str) -> list[str]:
+    """Tokenize mixed Chinese/English text without requiring a segmenter.
+
+    English and numeric spans are lower-cased.  Contiguous CJK spans produce
+    both unigrams and overlapping bigrams: unigrams preserve recall for short
+    queries while bigrams add enough phrase precision for BM25 and the lexical
+    hash fallback.
+    """
+    tokens: list[str] = []
+    for segment in _MIXED_TOKEN_PATTERN.findall((text or "").lower()):
+        if segment.isascii():
+            if len(segment) > 1:
+                tokens.append(segment)
+            continue
+
+        characters = list(segment)
+        tokens.extend(characters)
+        tokens.extend(
+            "".join(characters[index:index + 2])
+            for index in range(len(characters) - 1)
+        )
+    return tokens
+
+
 def _split_tokens(text: str) -> list[str]:
-    return [tok for tok in re.split(r"[^a-zA-Z0-9]+", text.lower()) if tok and len(tok) > 1]
+    return tokenize_text(text)
 
 
 def _tokenize(text: str) -> set[str]:
@@ -331,14 +596,19 @@ def _select_diverse(
     lam = max(0.0, min(1.0, mmr_lambda))
     
     while len(selected) < k and remaining:
-        best_idx = 0
-        best_mmr = float("-inf")
-        
+        eligible: list[tuple[int, dict[str, Any]]] = []
         for i, item in enumerate(remaining):
             pid = str(item.get("paper_id", ""))
             if pid and per_paper_count.get(pid, 0) >= per_paper_limit:
                 continue
-            
+            eligible.append((i, item))
+
+        if not eligible:
+            break
+
+        best_idx = eligible[0][0]
+        best_mmr = float("-inf")
+        for i, item in eligible:
             relevance = float(item.get("score", 0.0))
             
             # Compute max cosine similarity to already-selected items
@@ -365,26 +635,6 @@ def _select_diverse(
         pid = str(winner.get("paper_id", ""))
         if pid:
             per_paper_count[pid] = per_paper_count.get(pid, 0) + 1
-
-    # --- 后处理：确保每篇论文至少有一个 chunk 被选中 ---
-    selected_pids = {str(item.get("paper_id", "")) for item in selected}
-    missing_pids: set[str] = set()
-    for item in remaining:
-        pid = str(item.get("paper_id", ""))
-        if pid and pid not in selected_pids:
-            missing_pids.add(pid)
-
-    if missing_pids:
-        # 找出每篇缺失论文的最佳 chunk
-        best_per_paper: dict[str, dict[str, Any]] = {}
-        for item in remaining:
-            pid = str(item.get("paper_id", ""))
-            if pid in missing_pids:
-                score = float(item.get("score", 0.0))
-                if pid not in best_per_paper or score > best_per_paper[pid].get("score", 0.0):
-                    best_per_paper[pid] = item
-                    
-    selected.extend(best_per_paper.values())
     
     return selected
 
@@ -419,8 +669,10 @@ class PaperKbConfig:
     enabled: bool = True
     embedding_api_key: str = ""
     embedding_api_base: str = "https://api.openai.com/v1"
-    embedding_model: str = "/data1/project/models/bge-small-zh-v1.5"
-    rerank_model: str = "/data1/project/models/Qwen3-Reranker-0.6B"
+    embedding_model: str = "text-embedding-3-small"
+    embedding_fallback: str = "hash"
+    embedding_batch_size: int = 64
+    rerank_model: str = ""
     retrieval_top_k: int = 5
     max_chunk_chars: int = 4096
     min_chunk_chars: int = 300
@@ -430,6 +682,14 @@ class PaperKbConfig:
     chroma_persist_dir: str = ""  # Will default to {workspace}/kb/chroma
     mmr_lambda: float = 0.7  # Relevance-diversity trade-off for MMR selection (1.0=relevance-only)
     use_hybrid_retrieval: bool = True  # Enable BM25+dense RRF hybrid retrieval
+    rrf_k: int = 60
+    dense_rrf_weight: float = 0.5
+    sparse_rrf_weight: float = 0.5
+    bm25_title_weight: float = 5.0
+    bm25_keywords_weight: float = 3.0
+    bm25_summary_weight: float = 1.5
+    bm25_questions_weight: float = 2.0
+    bm25_body_weight: float = 1.0
 
 
 class PaperKnowledgeBase:
@@ -454,15 +714,91 @@ class PaperKnowledgeBase:
         self.chunks_file = self.base_dir / "chunks.jsonl"
         self.embedding_model = None
         self.rerank_model = None
+        self._jsonl_lock = asyncio.Lock()
+        self._embedding_model_lock = asyncio.Lock()
+        self._embedding_backend = self._resolve_embedding_backend()
+        self._embedding_last_error = ""
+        self._embedding_dimension: int | None = (
+            256 if self._embedding_backend == "hash_lexical" else None
+        )
+        if self._embedding_backend == "hash_lexical":
+            logger.warning(
+                "No semantic embedding backend is configured; using the explicit "
+                "hash_lexical fallback. Retrieval is degraded to lexical similarity."
+            )
         
         # Initialize Chroma collections for semantic retrieval
         self._chroma_client = None
         self._summary_collection = None
         self._question_collection = None
         self._chunk_collection = None
-        # BM25 sparse indexes (keyed by Chroma collection name)
-        self._bm25_indexes: dict[str, _BM25Index] = {}
+        self._lexical_index: _SQLiteBM25Index | None = None
+        self._lexical_last_error = ""
+        self._init_lexical_index()
         self._init_chroma_collections()
+
+    def _chunks_source_mtime_ns(self) -> int:
+        try:
+            return self.chunks_file.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    def _lexical_rows_from_jsonl(self) -> list[dict[str, Any]]:
+        docs = {
+            str(row.get("paper_id", "")): row
+            for row in self._read_jsonl(self.docs_file)
+            if row.get("paper_id")
+        }
+        rows: list[dict[str, Any]] = []
+        for chunk in self._read_jsonl(self.chunks_file):
+            chunk_id = str(chunk.get("chunk_id", ""))
+            paper_id = str(chunk.get("paper_id", ""))
+            if not chunk_id or not paper_id:
+                continue
+            doc = docs.get(paper_id, {})
+            rows.append({
+                "chunk_id": chunk_id,
+                "paper_id": paper_id,
+                "title": doc.get("title", chunk.get("paper_title", "")),
+                "keywords": chunk.get("keywords", []),
+                "summary": chunk.get("summary", ""),
+                "questions": chunk.get("hypothetical_questions", []),
+                "body": chunk.get("text", ""),
+            })
+        return rows
+
+    def _init_lexical_index(self) -> None:
+        """Open the persistent sparse index and repair it from canonical JSONL."""
+        try:
+            self._lexical_index = _SQLiteBM25Index(
+                self.base_dir / "lexical.db",
+                field_weights=(
+                    self.config.bm25_title_weight,
+                    self.config.bm25_keywords_weight,
+                    self.config.bm25_summary_weight,
+                    self.config.bm25_questions_weight,
+                    self.config.bm25_body_weight,
+                ),
+            )
+            source_mtime_ns = self._chunks_source_mtime_ns()
+            if self._lexical_index.needs_sync(source_mtime_ns):
+                rows = self._lexical_rows_from_jsonl()
+                self._lexical_index.rebuild(
+                    rows,
+                    source_mtime_ns=source_mtime_ns,
+                )
+                logger.info(
+                    "SQLite FTS5 index rebuilt from JSONL: {} parent chunks",
+                    len(rows),
+                )
+            self._lexical_last_error = ""
+        except Exception as exc:
+            self._lexical_last_error = str(exc)
+            self._lexical_index = None
+            logger.warning(
+                "SQLite FTS5 initialization failed; sparse retrieval disabled: {}",
+                exc,
+            )
 
     def _init_chroma_collections(self) -> None:
         """Initialize Chroma vector database collections."""
@@ -499,65 +835,12 @@ class PaperKnowledgeBase:
                 self._question_collection.count(),
                 self._chunk_collection.count(),
             )
-            # Rebuild BM25 indexes from existing Chroma data
-            self._init_bm25_from_chroma()
         except Exception as e:
             logger.warning("Chroma initialization failed: {}, falling back to JSONL-only mode", e)
             self._chroma_client = None
             self._summary_collection = None
             self._question_collection = None
             self._chunk_collection = None
-
-    def _init_bm25_from_chroma(self) -> None:
-        """Rebuild BM25 indexes from existing Chroma collections on startup."""
-        if not self.config.use_hybrid_retrieval:
-            return
-        if not self._chroma_client or not self._summary_collection:
-            return
-        
-        try:
-            self._rebuild_bm25_index(
-                collection=self._summary_collection,
-                index_key="summaries",
-                label="summaries",
-            )
-            if self._question_collection:
-                self._rebuild_bm25_index(
-                    collection=self._question_collection,
-                    index_key="questions",
-                    label="questions",
-                )
-        except Exception as e:
-            logger.warning("BM25 index rebuild failed: {}", e)
-
-    def _rebuild_bm25_index(self, *, collection: Any, index_key: str, label: str) -> None:
-        if collection.count() <= 0:
-            return
-        idx = _BM25Index()
-        self._bm25_indexes[index_key] = idx
-        page_size = 500
-        offset = 0
-        while True:
-            batch = collection.get(
-                limit=page_size,
-                offset=offset,
-                include=["documents"],
-            )
-            ids = batch.get("ids", [])
-            docs = batch.get("documents", [])
-            if not ids:
-                break
-            for doc_id, doc_text in zip(ids, docs):
-                if doc_text:
-                    idx.index(doc_id, str(doc_text))
-            offset += len(ids)
-            if len(ids) < page_size:
-                break
-        logger.info(
-            "BM25 {} index rebuilt: {} docs",
-            label,
-            len(idx._corpus),
-        )
 
     def _read_jsonl(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
@@ -577,43 +860,281 @@ class PaperKnowledgeBase:
         return records
 
     def _write_jsonl(self, path: Path, rows: list[dict[str, Any]]) -> None:
-        with path.open("w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        """Atomically replace a JSONL file after fully writing a sibling temp file."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                tmp_name = f.name
+                for row in rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+        finally:
+            if tmp_name:
+                try:
+                    Path(tmp_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-    async def embed_text(self, text: str) -> list[float]:
-        clean = text.strip()
-        if not clean:
-            return []
-        if Path(self.config.embedding_model).exists():
-            try:
-                if self.embedding_model is None:
-                    from sentence_transformers import SentenceTransformer
-                    self.embedding_model = SentenceTransformer(self.config.embedding_model)
-                return self.embedding_model.encode(clean).tolist()
-            except Exception as e:
-                logger.warning("Embedding model failed, try embedding API")
+    async def _persist_paper_rows(
+        self,
+        *,
+        doc_row: dict[str, Any],
+        chunk_rows: list[dict[str, Any]],
+    ) -> None:
+        """Idempotently replace one paper's JSONL rows under an in-process lock."""
+        paper_id = str(doc_row.get("paper_id", ""))
+        async with self._jsonl_lock:
+            documents = [
+                row for row in self._read_jsonl(self.docs_file)
+                if str(row.get("paper_id", "")) != paper_id
+            ]
+            chunks = [
+                row for row in self._read_jsonl(self.chunks_file)
+                if str(row.get("paper_id", "")) != paper_id
+            ]
+            documents.append(doc_row)
+            chunks.extend(chunk_rows)
+            self._write_jsonl(self.docs_file, documents)
+            self._write_jsonl(self.chunks_file, chunks)
 
-        if not self.config.embedding_api_key:
-            return _hash_embedding(clean)
+    async def _replace_lexical_paper(
+        self,
+        *,
+        doc_row: dict[str, Any],
+        chunk_rows: list[dict[str, Any]],
+    ) -> None:
+        """Replace one paper in the derived FTS index without blocking the loop."""
+        if self._lexical_index is None:
+            return
+        paper_id = str(doc_row.get("paper_id", ""))
+        rows = [{
+            "chunk_id": row.get("chunk_id", ""),
+            "paper_id": paper_id,
+            "title": doc_row.get("title", ""),
+            "keywords": row.get("keywords", []),
+            "summary": row.get("summary", ""),
+            "questions": row.get("hypothetical_questions", []),
+            "body": row.get("text", ""),
+        } for row in chunk_rows]
+        try:
+            await asyncio.to_thread(
+                self._lexical_index.replace_paper,
+                paper_id,
+                rows,
+                source_mtime_ns=self._chunks_source_mtime_ns(),
+            )
+            self._lexical_last_error = ""
+        except Exception as exc:
+            # JSONL is canonical.  Leave its mtime marker unmatched so the
+            # next process start repairs the derived FTS index automatically.
+            self._lexical_last_error = str(exc)
+            logger.warning("SQLite FTS5 update failed for paper {}: {}", paper_id, exc)
+
+    def get_lexical_status(self) -> dict[str, Any]:
+        if self._lexical_index is None:
+            return {
+                "backend": "unavailable",
+                "document_count": None,
+                "degraded": True,
+                "reason": self._lexical_last_error or "sqlite_fts5_unavailable",
+            }
+        try:
+            status = self._lexical_index.get_status()
+        except Exception as exc:
+            self._lexical_last_error = str(exc)
+            return {
+                "backend": "sqlite_fts5",
+                "document_count": None,
+                "degraded": True,
+                "reason": str(exc),
+            }
+        status["degraded"] = bool(self._lexical_last_error)
+        status["reason"] = self._lexical_last_error
+        return status
+
+    def _resolve_embedding_backend(self) -> str:
+        """Choose one stable backend for the lifetime of this KB instance."""
+        model_path = Path(self.config.embedding_model).expanduser()
+        if self.config.embedding_model and model_path.exists():
+            return "local_sentence_transformer"
+        if self.config.embedding_api_key:
+            return "openai_compatible_api"
+        if self.config.embedding_fallback == "hash":
+            return "hash_lexical"
+        return "unavailable"
+
+    def get_embedding_status(self) -> dict[str, Any]:
+        """Return observable backend health without exposing credentials."""
+        reason = ""
+        if self._embedding_backend == "hash_lexical":
+            reason = "no_semantic_embedding_backend_configured"
+        elif self._embedding_backend == "unavailable":
+            reason = "embedding_backend_unavailable"
+        if self._embedding_last_error:
+            reason = self._embedding_last_error
+        active_model = (
+            self.config.embedding_model
+            if self._embedding_backend in {
+                "local_sentence_transformer",
+                "openai_compatible_api",
+            }
+            else "hash-lexical-256" if self._embedding_backend == "hash_lexical" else None
+        )
+        return {
+            "backend": self._embedding_backend,
+            "model": active_model,
+            "configured_model": self.config.embedding_model,
+            "batch_size": max(1, self.config.embedding_batch_size),
+            "dimension": self._embedding_dimension,
+            "degraded": self._embedding_backend in {"hash_lexical", "unavailable"}
+            or bool(self._embedding_last_error),
+            "reason": reason,
+        }
+
+    async def _embed_api_batch(self, texts: list[str]) -> list[list[float]]:
         headers = {
             "Authorization": f"Bearer {self.config.embedding_api_key}",
             "Content-Type": "application/json",
         }
-        payload = {"model": self.config.embedding_model, "input": clean}
+        payload = {"model": self.config.embedding_model, "input": texts}
         url = self.config.embedding_api_base.rstrip("/") + "/embeddings"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+
+        data = response.json().get("data", [])
+        ordered: list[list[float] | None] = [None] * len(texts)
+        for position, item in enumerate(data):
+            if not isinstance(item, dict) or not isinstance(item.get("embedding"), list):
+                continue
+            try:
+                index = int(item.get("index", position))
+            except (TypeError, ValueError):
+                index = position
+            if 0 <= index < len(ordered):
+                ordered[index] = [float(value) for value in item["embedding"]]
+        if any(vector is None for vector in ordered):
+            raise RuntimeError(
+                f"Embedding API returned {len(data)} vectors for {len(texts)} inputs"
+            )
+        return [vector for vector in ordered if vector is not None]
+
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Embed texts in stable, bounded batches while preserving input order.
+
+        Once an API or local semantic backend is selected, failures are raised
+        instead of silently switching to hash vectors with a different
+        dimension.  Hash fallback is used only when explicitly configured as
+        the backend at initialization time.
+        """
+        if not texts:
+            return []
+
+        results: list[list[float]] = [[] for _ in texts]
+        nonempty = [(index, text.strip()) for index, text in enumerate(texts) if text.strip()]
+        if not nonempty:
+            return results
+
+        backend = self._embedding_backend
+        batch_size = max(1, self.config.embedding_batch_size)
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.post(url, headers=headers, json=payload)
-                resp.raise_for_status()
-            data = resp.json().get("data", [])
-            if data and isinstance(data[0], dict) and isinstance(data[0].get("embedding"), list):
-                return [float(x) for x in data[0]["embedding"]]
+            for start in range(0, len(nonempty), batch_size):
+                batch = nonempty[start:start + batch_size]
+                batch_texts = [text for _, text in batch]
+
+                if backend == "hash_lexical":
+                    vectors = [_hash_embedding(text) for text in batch_texts]
+                elif backend == "local_sentence_transformer":
+                    if self.embedding_model is None:
+                        async with self._embedding_model_lock:
+                            if self.embedding_model is None:
+                                from sentence_transformers import SentenceTransformer
+
+                                self.embedding_model = await asyncio.to_thread(
+                                    SentenceTransformer,
+                                    str(Path(self.config.embedding_model).expanduser()),
+                                )
+                    encoded = await asyncio.to_thread(
+                        self.embedding_model.encode,
+                        batch_texts,
+                        normalize_embeddings=True,
+                    )
+                    vectors = encoded.tolist() if hasattr(encoded, "tolist") else list(encoded)
+                elif backend == "openai_compatible_api":
+                    vectors = await self._embed_api_batch(batch_texts)
+                else:
+                    raise RuntimeError(
+                        "No embedding backend is available. Configure embeddingApiKey, "
+                        "a local embeddingModel path, or embeddingFallback='hash'."
+                    )
+
+                if len(vectors) != len(batch):
+                    raise RuntimeError(
+                        f"Embedding backend returned {len(vectors)} vectors for {len(batch)} inputs"
+                    )
+                normalized_vectors: list[list[float]] = []
+                for vector in vectors:
+                    normalized = [float(value) for value in vector]
+                    if not normalized:
+                        raise RuntimeError("Embedding backend returned an empty vector")
+                    if not all(math.isfinite(value) for value in normalized):
+                        raise RuntimeError("Embedding backend returned a non-finite vector")
+                    if self._embedding_dimension is None:
+                        self._embedding_dimension = len(normalized)
+                    elif len(normalized) != self._embedding_dimension:
+                        raise RuntimeError(
+                            "Embedding dimension changed from "
+                            f"{self._embedding_dimension} to {len(normalized)}"
+                        )
+                    normalized_vectors.append(normalized)
+
+                for (original_index, _), vector in zip(batch, normalized_vectors):
+                    results[original_index] = vector
+
+            self._embedding_last_error = ""
+            return results
         except Exception as exc:
-            logger.warning("Embedding API failed, fallback to hash embedding: {}", exc)
-        return _hash_embedding(clean)
+            self._embedding_last_error = f"{backend}_failed: {exc}"
+            raise RuntimeError(self._embedding_last_error) from exc
+
+    async def embed_text(self, text: str) -> list[float]:
+        vectors = await self.embed_texts([text])
+        return vectors[0]
+
+    async def _upsert_chroma_batches(
+        self,
+        collection: Any,
+        *,
+        ids: list[str],
+        embeddings: list[list[float]],
+        documents: list[str],
+        metadatas: list[dict[str, Any]],
+    ) -> None:
+        """Upsert a collection without blocking the event loop per record."""
+        batch_size = max(1, min(500, self.config.embedding_batch_size * 4))
+        for start in range(0, len(ids), batch_size):
+            end = start + batch_size
+            await asyncio.to_thread(
+                collection.upsert,
+                ids=ids[start:end],
+                embeddings=embeddings[start:end],
+                documents=documents[start:end],
+                metadatas=metadatas[start:end],
+            )
     
     def rerank_similarity(self, query: str, doc: str) -> float:
+        if not self.config.rerank_model:
+            raise RuntimeError("No cross-encoder rerank model is configured")
         if self.rerank_model is None:
             from sentence_transformers import CrossEncoder
             self.rerank_model = CrossEncoder(self.config.rerank_model)
@@ -658,7 +1179,6 @@ class PaperKnowledgeBase:
         if not paper_id:
             paper_id = hashlib.md5((_normalize_space(doc.get("title", "")) or "paper").encode()).hexdigest()[:12]
         now = datetime.utcnow().isoformat()
-        documents = self._read_jsonl(self.docs_file)
         doc_row = {
             "paper_id": paper_id,
             "title": doc.get("title", ""),
@@ -670,52 +1190,50 @@ class PaperKnowledgeBase:
             "venue": doc.get("venue", ""),
             "updated_at": now,
         }
-        kept_docs = [d for d in documents if d.get("paper_id") != paper_id]
-        kept_docs.append(doc_row)
-        self._write_jsonl(self.docs_file, kept_docs)
-
-        existing_chunks = self._read_jsonl(self.chunks_file)
-        existing_chunks = [c for c in existing_chunks if c.get("paper_id") != paper_id]
-        chunk_count = 0
+        new_chunks: list[dict[str, Any]] = []
         if distilled_chunks:
             for idx, chunk in enumerate(distilled_chunks):
                 chunk_text = str(chunk.get("text", "")).strip()
                 if not chunk_text:
                     continue
-                emb = await self.embed_text(chunk_text)
                 row = {
                     "chunk_id": f"{paper_id}:{idx}",
                     "paper_id": paper_id,
                     "chunk_index": idx,
                     "text": chunk_text,
-                    "embedding": emb,
                     "updated_at": now,
                 }
                 for key in ("section", "kind", "keywords", "claims", "limitations", "source_span"):
                     if key in chunk:
                         row[key] = chunk[key]
-                existing_chunks.append(row)
-                chunk_count += 1
+                new_chunks.append(row)
         else:
             chunks = self.split_into_chunks(text)
             for idx, chunk in enumerate(chunks):
-                emb = await self.embed_text(chunk)
-                existing_chunks.append(
+                new_chunks.append(
                     {
                         "chunk_id": f"{paper_id}:{idx}",
                         "paper_id": paper_id,
                         "chunk_index": idx,
                         "text": chunk,
-                        "embedding": emb,
                         "updated_at": now,
                     }
                 )
-            chunk_count = len(chunks)
-        self._write_jsonl(self.chunks_file, existing_chunks)
+        embeddings = await self.embed_texts([str(row["text"]) for row in new_chunks])
+        for row, embedding in zip(new_chunks, embeddings):
+            row["embedding"] = embedding
+        await self._persist_paper_rows(doc_row=doc_row, chunk_rows=new_chunks)
+        await self._replace_lexical_paper(doc_row=doc_row, chunk_rows=new_chunks)
+        embedding_status = self.get_embedding_status()
+        lexical_status = self.get_lexical_status()
         return {
             "paper_id": paper_id,
-            "chunk_count": chunk_count,
+            "chunk_count": len(new_chunks),
             "distilled": bool(distilled_chunks),
+            "storage_backend": "jsonl",
+            "embedding": embedding_status,
+            "lexical": lexical_status,
+            "degraded": bool(embedding_status["degraded"] or lexical_status["degraded"]),
         }
 
     async def upsert_semantic_chunks(
@@ -745,11 +1263,8 @@ class PaperKnowledgeBase:
         title = str(doc.get("title", "")).strip()
         if not paper_id:
             paper_id = hashlib.md5((_normalize_space(doc.get("title", "")) or "paper").encode()).hexdigest()[:12]
-        
+
         now = datetime.utcnow().isoformat()
-        
-        # Update documents.jsonl (metadata)
-        documents = self._read_jsonl(self.docs_file)
         doc_row = {
             "paper_id": paper_id,
             "title": title,
@@ -761,133 +1276,196 @@ class PaperKnowledgeBase:
             "venue": doc.get("venue", ""),
             "updated_at": now,
         }
-        kept_docs = [d for d in documents if d.get("paper_id") != paper_id]
-        kept_docs.append(doc_row)
-        self._write_jsonl(self.docs_file, kept_docs)
-        
-        # If Chroma not available, fallback to traditional storage
-        if not self._chroma_client or not self._summary_collection:
-            logger.warning("Chroma not available, falling back to traditional upsert")
-            return await self.upsert_document(doc, "", distilled_chunks=chunk_metadata)
-        
-        # Clear existing chunks for this paper
-        self._delete_paper_from_chroma(paper_id)
-        
-        chunk_count = 0
-        question_count = 0
-        
+
+        # Build the parent rows once and always persist them to JSONL.  JSONL is
+        # the durable fallback/export representation; Chroma is the semantic index.
+        parent_rows: list[dict[str, Any]] = []
         for idx, chunk in enumerate(semantic_chunks):
             chunk_text = str(chunk.get("text", "")).strip()
             if not chunk_text or len(chunk_text) < self.config.min_chunk_chars:
                 continue
-            
-            chunk_id = f"{paper_id}:{idx}"
-            section = chunk.get("section", "content")
-            heading_level = chunk.get("heading_level", 0)
-            heading_path = chunk.get("heading_path", "content")
-            
-            # Get or generate metadata for this chunk
-            meta = None
-            if chunk_metadata and idx < len(chunk_metadata):
-                meta = chunk_metadata[idx]
-            
-            summary = meta.get("summary", "") if meta else chunk_text[:200]
-            questions = meta.get("hypothetical_questions", []) if meta else []
-            keywords = meta.get("keywords", []) if meta else []
-            
-            # Store parent chunk (without embedding, just metadata)
-            ents = meta.get("entities", []) if meta else []
-            clms = meta.get("claims", []) if meta else []
-            self._chunk_collection.upsert(
-                ids=[chunk_id],
-                documents=[chunk_text],
-                metadatas=[{
-                    "paper_id": paper_id,
-                    "paper_title": title,
-                    "paper_year": str(doc.get("year") or ""),
-                    "paper_source": doc.get("source", "unknown"),
-                    "section": section,
-                    "heading_level": str(heading_level),
-                    "heading_path": heading_path,
-                    "keywords": json.dumps(keywords),
-                    "entities": json.dumps(ents),
-                    "claims": json.dumps(clms),
-                    "updated_at": now,
-                }],
-            )
-            chunk_count += 1
-            
-            # Generate and store summary embedding
+            meta = chunk_metadata[idx] if chunk_metadata and idx < len(chunk_metadata) else {}
+            parent_rows.append({
+                "chunk_id": f"{paper_id}:{idx}",
+                "paper_id": paper_id,
+                "chunk_index": idx,
+                "text": chunk_text,
+                "section": chunk.get("section", "content"),
+                "heading_level": chunk.get("heading_level", 0),
+                "heading_path": chunk.get("heading_path", "content"),
+                "kind": "semantic_chunk",
+                "summary": meta.get("summary", chunk_text[:200]),
+                "hypothetical_questions": meta.get("hypothetical_questions", []),
+                "keywords": meta.get("keywords", []),
+                "entities": meta.get("entities", []),
+                "claims": meta.get("claims", []),
+                "updated_at": now,
+            })
+
+        parent_embeddings = await self.embed_texts(
+            [str(row["text"]) for row in parent_rows]
+        )
+        for row, embedding in zip(parent_rows, parent_embeddings):
+            row["embedding"] = embedding
+
+        await self._persist_paper_rows(doc_row=doc_row, chunk_rows=parent_rows)
+        await self._replace_lexical_paper(doc_row=doc_row, chunk_rows=parent_rows)
+        embedding_status = self.get_embedding_status()
+        lexical_status = self.get_lexical_status()
+
+        # If Chroma is unavailable, parent-chunk retrieval remains functional.
+        if not self._chroma_client or not self._summary_collection:
+            logger.warning("Chroma not available, falling back to traditional upsert")
+            return {
+                "paper_id": paper_id,
+                "chunk_count": len(parent_rows),
+                "question_count": 0,
+                "success": True,
+                "storage_backend": "jsonl",
+                "degraded": True,
+                "embedding": embedding_status,
+                "lexical": lexical_status,
+                "degradation_reasons": [
+                    reason for reason in (
+                        "chroma_unavailable",
+                        str(embedding_status.get("reason", "")),
+                        str(lexical_status.get("reason", "")),
+                    ) if reason
+                ],
+            }
+
+        # Clear existing chunks for this paper
+        self._delete_paper_from_chroma(paper_id)
+
+        parent_ids: list[str] = []
+        parent_documents: list[str] = []
+        parent_metadatas: list[dict[str, Any]] = []
+        summary_records: list[tuple[str, str, dict[str, Any]]] = []
+        question_records: list[tuple[str, str, dict[str, Any]]] = []
+
+        for row in parent_rows:
+            chunk_id = str(row["chunk_id"])
+            chunk_text = str(row["text"])
+            section = str(row.get("section", "content"))
+            heading_level = row.get("heading_level", 0)
+            heading_path = str(row.get("heading_path", "content"))
+            keywords = row.get("keywords", []) or []
+            entities = row.get("entities", []) or []
+            claims = row.get("claims", []) or []
+
+            parent_ids.append(chunk_id)
+            parent_documents.append(chunk_text)
+            parent_metadatas.append({
+                "paper_id": paper_id,
+                "paper_title": title,
+                "paper_year": str(doc.get("year") or ""),
+                "paper_source": doc.get("source", "unknown"),
+                "section": section,
+                "heading_level": str(heading_level),
+                "heading_path": heading_path,
+                "keywords": json.dumps(keywords),
+                "entities": json.dumps(entities),
+                "claims": json.dumps(claims),
+                "updated_at": now,
+            })
+
+            summary = str(row.get("summary", "")).strip()
             if summary:
-                summary_emb = await self.embed_text(summary)
-                if summary_emb:
-                    self._summary_collection.upsert(
-                        ids=[f"{chunk_id}:summary"],
-                        embeddings=[summary_emb],
-                        documents=[summary],
-                        metadatas=[{
-                            "paper_id": paper_id,
-                            "paper_title": title,
-                            "paper_source": doc.get("source", "unknown"),
-                            "paper_year": str(doc.get("year") or ""),
-                            "chunk_id": chunk_id,
-                            "section": section,
-                            "heading_path": heading_path,
-                            "type": "summary",
-                        }],
-                    )
-                    # BM25 index for hybrid retrieval
-                    if self.config.use_hybrid_retrieval:
-                        if "summaries" not in self._bm25_indexes:
-                            self._bm25_indexes["summaries"] = _BM25Index()
-                        self._bm25_indexes["summaries"].index(
-                            f"{chunk_id}:summary", summary
-                        )
-            
-            # Generate and store question embeddings
-            for q_idx, question in enumerate(questions[:self.config.num_hypothetical_questions]):
+                summary_records.append((
+                    f"{chunk_id}:summary",
+                    summary,
+                    {
+                        "paper_id": paper_id,
+                        "paper_title": title,
+                        "paper_source": doc.get("source", "unknown"),
+                        "paper_year": str(doc.get("year") or ""),
+                        "chunk_id": chunk_id,
+                        "section": section,
+                        "heading_path": heading_path,
+                        "type": "summary",
+                    },
+                ))
+
+            questions = row.get("hypothetical_questions", []) or []
+            for question_index, question in enumerate(
+                questions[:self.config.num_hypothetical_questions]
+            ):
                 if not question:
                     continue
-                q_emb = await self.embed_text(question)
-                if q_emb:
-                    self._question_collection.upsert(
-                        ids=[f"{chunk_id}:q{q_idx}"],
-                        embeddings=[q_emb],
-                        documents=[question],
-                        metadatas=[{
-                            "paper_id": paper_id,
-                            "paper_title": title,
-                            "paper_source": doc.get("source", "unknown"),
-                            "paper_year": str(doc.get("year") or ""),
-                            "chunk_id": chunk_id,
-                            "section": section,
-                            "heading_path": heading_path,
-                            "question_idx": str(q_idx),
-                            "type": "hypothetical_question",
-                        }],
-                    )
-                    question_count += 1
-                    # BM25 index for hybrid retrieval
-                    if self.config.use_hybrid_retrieval:
-                        if "questions" not in self._bm25_indexes:
-                            self._bm25_indexes["questions"] = _BM25Index()
-                        self._bm25_indexes["questions"].index(
-                            f"{chunk_id}:q{q_idx}", question
-                        )
-        
+                question_records.append((
+                    f"{chunk_id}:q{question_index}",
+                    str(question),
+                    {
+                        "paper_id": paper_id,
+                        "paper_title": title,
+                        "paper_source": doc.get("source", "unknown"),
+                        "paper_year": str(doc.get("year") or ""),
+                        "chunk_id": chunk_id,
+                        "section": section,
+                        "heading_path": heading_path,
+                        "question_idx": str(question_index),
+                        "type": "hypothetical_question",
+                    },
+                ))
+
+        if parent_ids:
+            await self._upsert_chroma_batches(
+                self._chunk_collection,
+                ids=parent_ids,
+                embeddings=[list(row.get("embedding", [])) for row in parent_rows],
+                documents=parent_documents,
+                metadatas=parent_metadatas,
+            )
+
+        auxiliary_records = summary_records + question_records
+        auxiliary_embeddings = await self.embed_texts(
+            [record[1] for record in auxiliary_records]
+        )
+        summary_embeddings = auxiliary_embeddings[:len(summary_records)]
+        question_embeddings = auxiliary_embeddings[len(summary_records):]
+
+        if summary_records:
+            await self._upsert_chroma_batches(
+                self._summary_collection,
+                ids=[record[0] for record in summary_records],
+                embeddings=summary_embeddings,
+                documents=[record[1] for record in summary_records],
+                metadatas=[record[2] for record in summary_records],
+            )
+        if question_records:
+            await self._upsert_chroma_batches(
+                self._question_collection,
+                ids=[record[0] for record in question_records],
+                embeddings=question_embeddings,
+                documents=[record[1] for record in question_records],
+                metadatas=[record[2] for record in question_records],
+            )
+
+        question_count = len(question_records)
+
         logger.info(
             "Upserted semantic chunks: paper_id={}, chunks={}, questions={}, summaries={}",
             paper_id,
-            chunk_count,
+            len(parent_rows),
             question_count,
-            chunk_count,
+            len(parent_rows),
         )
-        
+
         return {
             "paper_id": paper_id,
-            "chunk_count": chunk_count,
+            "chunk_count": len(parent_rows),
             "question_count": question_count,
             "success": True,
+            "storage_backend": "chroma+jsonl",
+            "degraded": bool(embedding_status["degraded"] or lexical_status["degraded"]),
+            "embedding": embedding_status,
+            "lexical": lexical_status,
+            "degradation_reasons": [
+                reason for reason in (
+                    str(embedding_status.get("reason", "")),
+                    str(lexical_status.get("reason", "")),
+                ) if reason
+            ],
         }
 
     def _delete_paper_from_chroma(self, paper_id: str) -> None:
@@ -925,12 +1503,55 @@ class PaperKnowledgeBase:
                 logger.debug("Deleted paper {} from Chroma: chunks={}, summaries={}, questions={}", 
                             paper_id, len(chunk_ids), len(summary_ids), len(question_ids))
             
-            # Also clean BM25 indexes
-            prefix = paper_id + ":"
-            for idx in self._bm25_indexes.values():
-                idx.remove_by_prefix(prefix)
         except Exception as e:
             logger.warning("Failed to delete paper {} from Chroma: {}", paper_id, e)
+
+    async def _retrieve_jsonl_multiquery(
+        self,
+        *,
+        query: str,
+        queries: list[str] | None,
+        entities: list[dict[str, str]] | None,
+        top_k: int,
+        per_paper_limit: int,
+    ) -> list[dict[str, Any]]:
+        """Retrieve and merge JSONL results for backend fallback/recovery."""
+        query_list = [item for item in ([query] + list(queries or [])) if item]
+        if not query_list:
+            return []
+
+        merged: dict[str, dict[str, Any]] = {}
+        for fallback_query in dict.fromkeys(query_list):
+            results = await self.retrieve(
+                fallback_query,
+                max(top_k * 2, top_k),
+                prefer_distilled=True,
+                per_paper_limit=max(per_paper_limit, top_k),
+            )
+            for item in results:
+                chunk_id = str(item.get("chunk_id", ""))
+                current = merged.get(chunk_id, {})
+                if chunk_id and float(item.get("score", 0.0)) > float(current.get("score", -1.0)):
+                    merged[chunk_id] = item
+
+        fallback_results = list(merged.values())
+        if entities:
+            ids = {str(item.get("paper_id", "")).strip() for item in entities if item.get("paper_id")}
+            titles = {str(item.get("title", "")).strip().lower() for item in entities if item.get("title")}
+            fallback_results = [
+                item for item in fallback_results
+                if (not ids and not titles)
+                or str(item.get("paper_id", "")) in ids
+                or any(title in str(item.get("title", "")).lower() for title in titles)
+            ]
+
+        fallback_results.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        return _select_diverse(
+            fallback_results,
+            k=top_k,
+            per_paper_limit=max(1, per_paper_limit),
+            mmr_lambda=self.config.mmr_lambda,
+        )
 
     async def retrieve_by_hypothetical_questions(
         self,
@@ -947,8 +1568,9 @@ class PaperKnowledgeBase:
         """Retrieve chunks using hypothetical question embeddings (HyDE approach).
         
         This method searches across:
-        1. Summary embeddings (paper_summaries collection)
-        2. Hypothetical question embeddings (paper_questions collection)
+        1. Parent chunk embeddings (paper_chunks collection)
+        2. Summary embeddings (paper_summaries collection)
+        3. Hypothetical question embeddings (paper_questions collection)
         
         Then retrieves the corresponding parent documents from paper_chunks.
         
@@ -965,23 +1587,42 @@ class PaperKnowledgeBase:
                      When provided, each entity is searched with its own
                      metadata filter and query, then results are merged.
             per_paper_limit: Max chunks per paper to avoid over-concentration
-            search_mode: "hybrid" | "questions_only" | "summaries_only"
+            search_mode: "hybrid" | "questions_only" | "summaries_only" |
+                "chunks_only"
             where_filter: Optional Chroma where filter for metadata
             use_hybrid: Enable BM25+dense RRF fusion (when BM25 index exists)
         
         Returns:
             List of dicts with chunk info and parent text
         """
-        if not self._chroma_client or not self._summary_collection:
-            logger.warning("Chroma not available, falling back to traditional retrieve")
-            effective_query = query or (queries[0] if queries else "")
-            return await self.retrieve(effective_query, top_k, prefer_distilled=True, per_paper_limit=per_paper_limit)
-        
+        valid_modes = {"hybrid", "questions_only", "summaries_only", "chunks_only"}
+        if search_mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported search_mode={search_mode!r}; expected one of {sorted(valid_modes)}"
+            )
+
         k = max(1, top_k or self.config.retrieval_top_k)
+        mode_collections = {
+            "hybrid": (self._chunk_collection, self._summary_collection, self._question_collection),
+            "chunks_only": (self._chunk_collection,),
+            "summaries_only": (self._summary_collection,),
+            "questions_only": (self._question_collection,),
+        }
+        if not self._chroma_client or not any(
+            collection is not None for collection in mode_collections[search_mode]
+        ):
+            logger.warning("Chroma not available, falling back to traditional retrieve")
+            return await self._retrieve_jsonl_multiquery(
+                query=query,
+                queries=queries,
+                entities=entities,
+                top_k=k,
+                per_paper_limit=per_paper_limit,
+            )
         
         # --- Entity-aware retrieval ---
         if entities:
-            return await self._retrieve_by_entities(
+            entity_results = await self._retrieve_by_entities(
                 entities=entities,
                 query=query,
                 queries=queries,
@@ -990,8 +1631,18 @@ class PaperKnowledgeBase:
                 search_mode=search_mode,
                 use_hybrid=use_hybrid,
             )
+            if entity_results or not self.chunks_file.exists():
+                return entity_results
+            logger.warning("Chroma entity lookup returned no chunks; retrying against JSONL fallback")
+            return await self._retrieve_jsonl_multiquery(
+                query=query,
+                queries=queries,
+                entities=entities,
+                top_k=k,
+                per_paper_limit=per_paper_limit,
+            )
         
-        return await self._retrieve_dense_hybrid(
+        results = await self._retrieve_dense_hybrid(
             query=query,
             queries=queries,
             top_k=k,
@@ -999,6 +1650,17 @@ class PaperKnowledgeBase:
             search_mode=search_mode,
             where_filter=where_filter,
             use_hybrid=use_hybrid,
+        )
+        if results or not self.chunks_file.exists():
+            return results
+
+        logger.warning("Chroma returned no paper chunks; retrying against JSONL fallback")
+        return await self._retrieve_jsonl_multiquery(
+            query=query,
+            queries=queries,
+            entities=entities,
+            top_k=k,
+            per_paper_limit=per_paper_limit,
         )
 
     async def _retrieve_by_entities(
@@ -1023,7 +1685,18 @@ class PaperKnowledgeBase:
             ent_filter: dict[str, Any] = {}
             pid = (ent.get("paper_id") or "").strip()
             title = (ent.get("title") or "").strip()
-            entity_query_list = ent.get("queries") or queries or [query] or []
+            entity_query_list: list[str] = []
+            seen_entity_queries: set[str] = set()
+            for entity_query in [
+                query,
+                *(queries or []),
+                *(ent.get("queries") or []),
+            ]:
+                normalized_query = re.sub(r"\s+", " ", str(entity_query or "")).strip()
+                query_key = normalized_query.casefold()
+                if normalized_query and query_key not in seen_entity_queries:
+                    seen_entity_queries.add(query_key)
+                    entity_query_list.append(normalized_query)
             
             if pid:
                 # arXiv IDs may have version suffixes; match exact paper_id
@@ -1071,6 +1744,52 @@ class PaperKnowledgeBase:
         )
         return final_entity
 
+    def _hydrate_parent_chunks(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Attach parent text, metadata and embeddings before diversity selection."""
+        if not candidates or not self._chunk_collection:
+            return candidates
+        try:
+            parent_results = self._chunk_collection.get(
+                ids=[str(item.get("chunk_id", "")) for item in candidates if item.get("chunk_id")],
+                include=["documents", "metadatas", "embeddings"],
+            )
+        except Exception as exc:
+            logger.warning("Failed to hydrate parent chunks: {}", exc)
+            return candidates
+
+        ids = parent_results.get("ids", []) or []
+        documents = parent_results.get("documents", []) or []
+        metadatas = parent_results.get("metadatas", []) or []
+        embeddings = parent_results.get("embeddings", [])
+        if embeddings is None:
+            embeddings = []
+        id_to_index = {str(chunk_id): idx for idx, chunk_id in enumerate(ids)}
+
+        hydrated: list[dict[str, Any]] = []
+        for candidate in candidates:
+            chunk_id = str(candidate.get("chunk_id", ""))
+            idx = id_to_index.get(chunk_id)
+            if idx is None:
+                continue
+            item = dict(candidate)
+            item["text"] = documents[idx] if idx < len(documents) else ""
+            if idx < len(embeddings) and embeddings[idx] is not None:
+                emb = embeddings[idx]
+                item["embedding"] = emb.tolist() if hasattr(emb, "tolist") else list(emb)
+            if idx < len(metadatas):
+                meta = metadatas[idx] or {}
+                item["paper_id"] = meta.get("paper_id", item.get("paper_id", ""))
+                item["paper_title"] = meta.get("paper_title", "")
+                item["paper_year"] = meta.get("paper_year")
+                item["paper_source"] = meta.get("paper_source", "")
+                for key in ("keywords", "entities", "claims"):
+                    try:
+                        item[key] = json.loads(meta.get(key, "[]"))
+                    except (TypeError, json.JSONDecodeError):
+                        item[key] = []
+            hydrated.append(item)
+        return hydrated
+
     async def _retrieve_dense_hybrid(
         self,
         *,
@@ -1087,154 +1806,215 @@ class PaperKnowledgeBase:
         # Build query list: multi-query mode takes precedence
         query_list: list[str] = [query] if query else []
         query_list += list(queries) if queries else []
+        query_list = list(dict.fromkeys(item for item in query_list if item))
         if not query_list:
             return []
         
         matched_chunks: dict[str, dict[str, Any]] = {}
-        max_candidates = top_k * 10
-        bm25_enabled = use_hybrid and self.config.use_hybrid_retrieval
-        
-        # Accumulate BM25 rankings for RRF
-        bm25_rankings: list[list[tuple[str, float]]] = []
-        
-        for q in query_list:
-            q_emb = await self.embed_text(q)
-            if not q_emb:
-                continue
-            
-            # --- Dense: search summaries ---
-            if search_mode in ("hybrid", "summaries_only"):
-                try:
-                    summary_results = self._summary_collection.query(
-                        query_embeddings=[q_emb],
-                        n_results=top_k * 2,
-                        include=["metadatas", "documents", "distances"],
-                        where=where_filter,
-                    )
-                    
-                    if summary_results and summary_results.get("ids"):
-                        ids = summary_results["ids"][0]
-                        metas = summary_results["metadatas"][0] if summary_results.get("metadatas") else []
-                        docs = summary_results["documents"][0] if summary_results.get("documents") else []
-                        distances = summary_results["distances"][0] if summary_results.get("distances") else []
-                        
-                        for i, id_ in enumerate(ids):
-                            meta = metas[i] if i < len(metas) else {}
-                            chunk_id = meta.get("chunk_id", "")
-                            if not chunk_id:
-                                continue
-                            
-                            dist = distances[i] if i < len(distances) else 1.0
-                            score = 1.0 - dist
-                            
-                            if chunk_id not in matched_chunks or score > matched_chunks[chunk_id].get("score", 0):
-                                matched_chunks[chunk_id] = {
-                                    "chunk_id": chunk_id,
-                                    "paper_id": meta.get("paper_id", ""),
-                                    "section": meta.get("section", ""),
-                                    "heading_path": meta.get("heading_path", ""),
-                                    "score": score,
-                                    "matched_by": "summary",
-                                    "matched_text": docs[i] if i < len(docs) else "",
-                                }
-                except Exception as e:
-                    logger.warning("Summary search failed: {}", e)
-            
-            # --- Dense: search hypothetical questions ---
-            if search_mode in ("hybrid", "questions_only"):
-                try:
-                    question_results = self._question_collection.query(
-                        query_embeddings=[q_emb],
-                        n_results=top_k * 3,
-                        include=["metadatas", "documents", "distances"],
-                        where=where_filter,
-                    )
-                    
-                    if question_results and question_results.get("ids"):
-                        ids = question_results["ids"][0]
-                        metas = question_results["metadatas"][0] if question_results.get("metadatas") else []
-                        docs = question_results["documents"][0] if question_results.get("documents") else []
-                        distances = question_results["distances"][0] if question_results.get("distances") else []
-                        
-                        for i, id_ in enumerate(ids):
-                            meta = metas[i] if i < len(metas) else {}
-                            chunk_id = meta.get("chunk_id", "")
-                            if not chunk_id:
-                                continue
-                            
-                            dist = distances[i] if i < len(distances) else 1.0
-                            score = 1.0 - dist
-                            
-                            if chunk_id not in matched_chunks or score > matched_chunks[chunk_id].get("score", 0):
-                                matched_chunks[chunk_id] = {
-                                    "chunk_id": chunk_id,
-                                    "paper_id": meta.get("paper_id", ""),
-                                    "section": meta.get("section", ""),
-                                    "heading_path": meta.get("heading_path", ""),
-                                    "score": score,
-                                    "matched_by": "question",
-                                    "matched_text": docs[i] if i < len(docs) else "",
-                                }
-                except Exception as e:
-                    logger.warning("Question search failed: {}", e)
-            
-            # --- Sparse: BM25 (if enabled) ---
-            if bm25_enabled and not where_filter:
-                if search_mode in ("hybrid", "summaries_only"):
-                    bm25_idx = self._bm25_indexes.get("summaries")
-                    if bm25_idx:
-                        bm25_rankings.append(bm25_idx.search(q, top_n=top_k * 2))
-                
-                if search_mode in ("hybrid", "questions_only"):
-                    bm25_idx = self._bm25_indexes.get("questions")
-                    if bm25_idx:
-                        bm25_rankings.append(bm25_idx.search(q, top_n=top_k * 3))
-            
-            # Early trim: keep only top max_candidates by score
-            if len(matched_chunks) > max_candidates:
-                sorted_items = sorted(matched_chunks.values(), key=lambda x: x.get("score", 0), reverse=True)
-                matched_chunks = {item["chunk_id"]: item for item in sorted_items[:max_candidates]}
-        
-        # --- RRF fusion: dense + BM25 ---
-        if bm25_enabled and bm25_rankings:
-            dense_scores: list[tuple[str, float]] = [
-                (cid, info["score"]) for cid, info in matched_chunks.items()
-            ]
-            dense_scores.sort(key=lambda x: x[1], reverse=True)
-            
-            all_rankings = [dense_scores[:top_k * 10]] + bm25_rankings
-            fused = _rrf_fuse(all_rankings, k=60)
-            
-            # Normalise RRF scores to the same scale as dense scores before blending.
-            # Raw RRF scores are typically 0.01-0.05 whereas dense cosine scores
-            # are 0.7-0.95.  Without normalisation the blended score for a perfect
-            # match drops from ~0.90 to ~0.45, which can fall below the retrieval
-            # quality threshold and cause false "insufficient" verdicts.
-            max_dense = max((info.get("score", 0) for info in matched_chunks.values()), default=1.0)
-            max_rrf = max(fused.values(), default=1.0)
-            scale = max_dense / max(1e-6, max_rrf) if max_rrf > 0 else 1.0
+        dense_rankings: list[list[tuple[str, float]]] = []
+        sparse_rankings: list[list[tuple[str, float]]] = []
+        sparse_scores: dict[str, float] = {}
+        sparse_enabled = (
+            use_hybrid
+            and self.config.use_hybrid_retrieval
+            and self._lexical_index is not None
+        )
 
-            logger.info("RRF fusion: max_dense={} max_rrf={} scale={}", max_dense, max_rrf, scale)
-            
-            # Blend: 50% dense + 50% RRF (normalised)
-            for chunk_id, fused_score in fused.items():
-                prev = matched_chunks.get(chunk_id)
-                if prev is not None:
-                    prev["score"] = 0.5 * prev.get("score", 0) + 0.5 * (fused_score * scale)
-                    prev["matched_by"] = (prev.get("matched_by", "") or "") + "+bm25"
-            
-            # For chunks that *only* appear in BM25 (not in dense), add them
-            # with the normalised RRF score as their base score.
-            for chunk_id, fused_score in fused.items():
-                if chunk_id not in matched_chunks:
-                    matched_chunks[chunk_id] = {
-                        "chunk_id": chunk_id,
-                        "score": fused_score * scale,
-                        "matched_by": "bm25_only",
-                    }
+        def _collapse_ranking(
+            ranking: list[tuple[str, float]],
+        ) -> list[tuple[str, float]]:
+            best: dict[str, float] = {}
+            for chunk_id, score in ranking:
+                if chunk_id:
+                    best[chunk_id] = max(best.get(chunk_id, float("-inf")), score)
+            return sorted(best.items(), key=lambda item: item[1], reverse=True)
+
+        def _record_dense(
+            *,
+            chunk_id: str,
+            score: float,
+            metadata: dict[str, Any],
+            matched_by: str,
+            matched_text: str,
+        ) -> None:
+            item = matched_chunks.setdefault(chunk_id, {"chunk_id": chunk_id})
+            previous_dense = float(item.get("dense_score", float("-inf")))
+            if score >= previous_dense:
+                item.update({
+                    "paper_id": metadata.get("paper_id", ""),
+                    "section": metadata.get("section", ""),
+                    "heading_path": metadata.get("heading_path", ""),
+                    "matched_text": matched_text,
+                })
+            item["dense_score"] = max(previous_dense, score)
+            item["score"] = item["dense_score"]
+            item["score_type"] = "dense_cosine"
+            matched_sources = set(filter(None, str(item.get("matched_by", "")).split("+")))
+            matched_sources.add(matched_by)
+            item["matched_by"] = "+".join(sorted(matched_sources))
         
-        # Sort by score and apply per_paper_limit
+        query_embeddings = await self.embed_texts(query_list)
+        valid_query_embeddings = [
+            embedding for embedding in query_embeddings if embedding
+        ]
+
+        # One batched Chroma query per enabled view instead of one call per
+        # rewritten query. Each returned row remains an independent RRF list.
+        dense_views: list[tuple[str, Any, int]] = []
+        if search_mode in ("hybrid", "chunks_only") and self._chunk_collection is not None:
+            dense_views.append(("chunk", self._chunk_collection, top_k * 3))
+        if search_mode in ("hybrid", "summaries_only") and self._summary_collection is not None:
+            dense_views.append(("summary", self._summary_collection, top_k * 2))
+        if search_mode in ("hybrid", "questions_only") and self._question_collection is not None:
+            dense_views.append(("question", self._question_collection, top_k * 3))
+
+        if valid_query_embeddings:
+            for matched_by, collection, candidate_count in dense_views:
+                try:
+                    dense_results = await asyncio.to_thread(
+                        collection.query,
+                        query_embeddings=valid_query_embeddings,
+                        n_results=max(top_k, candidate_count),
+                        include=["metadatas", "documents", "distances"],
+                        where=where_filter,
+                    )
+                    result_ids = dense_results.get("ids", []) if dense_results else []
+                    result_metas = dense_results.get("metadatas", []) if dense_results else []
+                    result_docs = dense_results.get("documents", []) if dense_results else []
+                    result_distances = dense_results.get("distances", []) if dense_results else []
+
+                    for query_index in range(len(valid_query_embeddings)):
+                        ids = result_ids[query_index] if query_index < len(result_ids) else []
+                        metas = result_metas[query_index] if query_index < len(result_metas) else []
+                        docs = result_docs[query_index] if query_index < len(result_docs) else []
+                        distances = (
+                            result_distances[query_index]
+                            if query_index < len(result_distances)
+                            else []
+                        )
+                        ranking: list[tuple[str, float]] = []
+                        for result_index, result_id in enumerate(ids or []):
+                            meta = metas[result_index] if result_index < len(metas) else {}
+                            # Parent chunks use their Chroma ID directly; summary
+                            # and question views carry the parent ID in metadata.
+                            chunk_id = str(meta.get("chunk_id") or result_id or "")
+                            if not chunk_id:
+                                continue
+                            distance = (
+                                distances[result_index]
+                                if result_index < len(distances)
+                                else 1.0
+                            )
+                            score = 1.0 - float(distance)
+                            ranking.append((chunk_id, score))
+                            _record_dense(
+                                chunk_id=chunk_id,
+                                score=score,
+                                metadata=meta,
+                                matched_by=matched_by,
+                                matched_text=(
+                                    docs[result_index]
+                                    if result_index < len(docs)
+                                    else ""
+                                ),
+                            )
+                        collapsed = _collapse_ranking(ranking)
+                        if collapsed:
+                            dense_rankings.append(collapsed)
+                except Exception as exc:
+                    logger.warning("{} dense search failed: {}", matched_by, exc)
+
+        # --- Sparse: one weighted multi-field FTS ranking per rewritten query ---
+        if sparse_enabled:
+            if search_mode == "summaries_only":
+                sparse_fields: tuple[str, ...] | None = ("summary",)
+            elif search_mode == "questions_only":
+                sparse_fields = ("questions",)
+            elif search_mode == "chunks_only":
+                sparse_fields = ("title", "keywords", "body")
+            else:
+                sparse_fields = None
+
+            paper_id_filter = ""
+            title_filter = ""
+            if where_filter:
+                paper_id_value = where_filter.get("paper_id")
+                if isinstance(paper_id_value, str):
+                    paper_id_filter = paper_id_value
+                title_value = where_filter.get("paper_title")
+                if isinstance(title_value, dict):
+                    title_filter = str(title_value.get("$contains", ""))
+                elif isinstance(title_value, str):
+                    title_filter = title_value
+
+            def _search_sparse_queries() -> list[list[tuple[str, float]]]:
+                assert self._lexical_index is not None
+                return [
+                    self._lexical_index.search(
+                        sparse_query,
+                        top_n=top_k * 10,
+                        fields=sparse_fields,
+                        paper_id=paper_id_filter,
+                        title_contains=title_filter,
+                    )
+                    for sparse_query in query_list
+                ]
+
+            try:
+                sparse_rankings = [
+                    ranking
+                    for ranking in await asyncio.to_thread(_search_sparse_queries)
+                    if ranking
+                ]
+                self._lexical_last_error = ""
+                for ranking in sparse_rankings:
+                    for chunk_id, bm25_score in ranking:
+                        sparse_scores[chunk_id] = max(
+                            sparse_scores.get(chunk_id, float("-inf")),
+                            bm25_score,
+                        )
+            except Exception as exc:
+                self._lexical_last_error = str(exc)
+                sparse_rankings = []
+                logger.warning("SQLite FTS5 search failed: {}", exc)
+
+        # RRF is a ranking score, not a semantic similarity.  Give Dense and
+        # Sparse fixed family weights, then divide each family weight equally
+        # among its views/rewrites so query decomposition cannot bias fusion.
+        if sparse_rankings:
+            fused = _weighted_rrf_fuse(
+                [
+                    (dense_rankings, self.config.dense_rrf_weight),
+                    (sparse_rankings, self.config.sparse_rrf_weight),
+                ],
+                k=max(1, self.config.rrf_k),
+            )
+            max_rrf = max(fused.values(), default=1.0)
+            for chunk_id, raw_rrf_score in fused.items():
+                item = matched_chunks.setdefault(chunk_id, {"chunk_id": chunk_id})
+                dense_score = item.get("dense_score")
+                bm25_score = sparse_scores.get(chunk_id)
+                item["dense_score"] = dense_score
+                item["bm25_score"] = bm25_score
+                item["rrf_score"] = raw_rrf_score
+                item["score"] = raw_rrf_score / max(1e-12, max_rrf)
+                item["score_type"] = "weighted_rrf"
+                if dense_score is not None and bm25_score is not None:
+                    matched_sources = set(filter(
+                        None,
+                        str(item.get("matched_by", "dense")).split("+"),
+                    ))
+                    matched_sources.add("bm25")
+                    item["matched_by"] = "+".join(sorted(matched_sources))
+                elif bm25_score is not None:
+                    item["matched_by"] = "bm25_only"
+                else:
+                    item["matched_by"] = item.get("matched_by", "dense")
+        
+        # Hydrate parent embeddings before MMR; otherwise this path silently
+        # degrades to relevance-only greedy selection.
         sorted_chunks = sorted(matched_chunks.values(), key=lambda x: x.get("score", 0), reverse=True)
+        sorted_chunks = self._hydrate_parent_chunks(sorted_chunks)
         
         if apply_diversity:
             final_chunks = _select_diverse(
@@ -1246,49 +2026,6 @@ class PaperKnowledgeBase:
         else:
             final_chunks = sorted_chunks[:top_k]
         
-        # Retrieve parent documents for matched chunks
-        if final_chunks:
-            chunk_ids = [c["chunk_id"] for c in final_chunks]
-            # logger.info("Retrieving parent documents for chunk_ids: {}", chunk_ids[:10])
-            # chunk_ids = [cid.rsplit(":", 1)[0] if cid.count(":") == 2 else cid for cid in chunk_ids]  # Extract paper_id:chunk_index
-            # chunk_ids = list(set(chunk_ids))  # Unique chunk_ids
-            # logger.info("Normalized chunk_ids for retrieval: {}", chunk_ids[:10])
-            # visited = set()
-            try:
-                parent_results = self._chunk_collection.get(
-                    ids=chunk_ids,
-                    include=["documents", "metadatas"],
-                )
-
-                id_to_index = {id_: idx for idx, id_ in enumerate(parent_results["ids"])}
-                
-                parent_docs = parent_results.get("documents", [])
-                parent_metas = parent_results.get("metadatas", [])
-                # logger.info("Retrieved parent metadata: {}", parent_metas[:10])
-                
-                for i, chunk in enumerate(final_chunks):
-                    chunk_id = chunk["chunk_id"]
-                    # chunk_id = chunk_id.rsplit(":", 1)[0] if chunk_id.count(":") == 2 else chunk_id
-                    # if chunk_id in visited:
-                    #     continue
-                    # visited.add(chunk_id)
-                    try:
-                        idx = id_to_index.get(chunk_id)
-                        chunk["text"] = parent_docs[idx] if idx < len(parent_docs) else ""
-                        if idx < len(parent_metas):
-                            meta = parent_metas[idx]
-                            chunk["chunk_id"] = chunk_id
-                            chunk["paper_title"] = meta.get("paper_title", "")
-                            chunk["paper_year"] = meta.get("paper_year")
-                            chunk["paper_source"] = meta.get("paper_source", "")
-                            chunk["keywords"] = json.loads(meta.get("keywords", "[]"))
-                            chunk["entities"] = json.loads(meta.get("entities", "[]"))
-                            chunk["claims"] = json.loads(meta.get("claims", "[]"))
-                    except (ValueError, IndexError):
-                        pass
-            except Exception as e:
-                logger.warning("Failed to retrieve parent documents: {}", e)
-
         if final_chunks:
             assets_path = self.base_dir / "figures.jsonl"
             assets_by_key = _load_asset_kv(assets_path)
@@ -1406,10 +2143,98 @@ class PaperKnowledgeBase:
                 "title": d.get("title", ""),
                 "authors": d.get("authors", []),
                 "abstract": d.get("abstract", ""),
+                "url": d.get("url", ""),
                 "year": d.get("year"),
                 "source": d.get("source", ""),
             }
         return meta
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return storage statistics without exposing backend internals to the API."""
+        docs = self._read_jsonl(self.docs_file)
+        chunks = self._read_jsonl(self.chunks_file)
+        chunk_counts: dict[str, int] = defaultdict(int)
+        for chunk in chunks:
+            pid = str(chunk.get("paper_id", ""))
+            if pid:
+                chunk_counts[pid] += 1
+
+        chroma_count: int | None = None
+        chroma_consistent: bool | None = None
+        if self._chunk_collection is not None:
+            try:
+                chroma_count = int(self._chunk_collection.count())
+                chroma_consistent = chroma_count == len(chunks)
+                if not chroma_consistent:
+                    logger.warning(
+                        "Paper KB backend count mismatch: chroma={} jsonl={}",
+                        chroma_count,
+                        len(chunks),
+                    )
+            except Exception as exc:
+                logger.debug("Unable to read Chroma stats: {}", exc)
+
+        embedding_status = self.get_embedding_status()
+        lexical_status = self.get_lexical_status()
+        lexical_count = lexical_status.get("document_count")
+        lexical_consistent = (
+            lexical_count == len(chunks)
+            if isinstance(lexical_count, int)
+            else None
+        )
+        backends_consistent = chroma_consistent is True and lexical_consistent is True
+        storage_degraded = (
+            self._chunk_collection is None
+            or chroma_consistent is not True
+            or lexical_consistent is not True
+        )
+        degradation_reasons: list[str] = []
+        if self._chunk_collection is None:
+            degradation_reasons.append("chroma_unavailable")
+        elif chroma_consistent is not True:
+            degradation_reasons.append("chroma_jsonl_inconsistent")
+        if lexical_status.get("reason"):
+            degradation_reasons.append(str(lexical_status["reason"]))
+        elif lexical_consistent is not True:
+            degradation_reasons.append("lexical_jsonl_inconsistent")
+        if embedding_status.get("reason"):
+            degradation_reasons.append(str(embedding_status["reason"]))
+
+        if self._chunk_collection is not None and self._lexical_index is not None:
+            storage_backend = "chroma+sqlite_fts5+jsonl"
+        elif self._chunk_collection is not None:
+            storage_backend = "chroma+jsonl"
+        elif self._lexical_index is not None:
+            storage_backend = "sqlite_fts5+jsonl"
+        else:
+            storage_backend = "jsonl"
+
+        recent = sorted(docs, key=lambda row: str(row.get("updated_at", "")), reverse=True)[:10]
+        return {
+            "paper_count": len({str(row.get("paper_id")) for row in docs if row.get("paper_id")}),
+            "chunk_count": len(chunks),
+            "chroma_chunk_count": chroma_count,
+            "lexical_chunk_count": lexical_count,
+            "storage_backend": storage_backend,
+            "chroma_consistent": chroma_consistent,
+            "lexical_consistent": lexical_consistent,
+            "backends_consistent": backends_consistent,
+            "embedding": embedding_status,
+            "lexical": lexical_status,
+            "degraded": storage_degraded or bool(embedding_status["degraded"]),
+            "degradation_reasons": degradation_reasons,
+            "recent_papers": [
+                {
+                    "paper_id": row.get("paper_id", ""),
+                    "title": row.get("title", ""),
+                    "source": row.get("source", ""),
+                    "year": row.get("year"),
+                    "chunk_count": chunk_counts.get(str(row.get("paper_id", "")), 0),
+                    "updated_at": row.get("updated_at", ""),
+                }
+                for row in recent
+            ],
+        }
 
     def retrieve_lexical(
         self,

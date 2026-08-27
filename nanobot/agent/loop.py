@@ -271,6 +271,7 @@ class AgentLoop:
 
         if self.tools_config.paper.enable:
             paper_cfg = self.tools_config.paper
+            self._mineru_api_token = paper_cfg.mineru_api_token
             self.kb = PaperKnowledgeBase(
                 workspace=self.workspace,
                 config=PaperKbConfig(
@@ -278,6 +279,16 @@ class AgentLoop:
                     embedding_api_key=paper_cfg.embedding_api_key,
                     embedding_api_base=paper_cfg.embedding_api_base,
                     embedding_model=paper_cfg.embedding_model,
+                    embedding_fallback=paper_cfg.embedding_fallback,
+                    embedding_batch_size=paper_cfg.embedding_batch_size,
+                    rrf_k=paper_cfg.rrf_k,
+                    dense_rrf_weight=paper_cfg.dense_rrf_weight,
+                    sparse_rrf_weight=paper_cfg.sparse_rrf_weight,
+                    bm25_title_weight=paper_cfg.bm25_title_weight,
+                    bm25_keywords_weight=paper_cfg.bm25_keywords_weight,
+                    bm25_summary_weight=paper_cfg.bm25_summary_weight,
+                    bm25_questions_weight=paper_cfg.bm25_questions_weight,
+                    bm25_body_weight=paper_cfg.bm25_body_weight,
                     retrieval_top_k=paper_cfg.retrieval_top_k,
                     max_chunk_chars=paper_cfg.max_chunk_chars,
                     min_chunk_chars=paper_cfg.min_chunk_chars,
@@ -367,6 +378,7 @@ class AgentLoop:
                     kb=self.kb,
                     provider=self.provider,
                     model=self.model,
+                    mineru_api_token=self._mineru_api_token,
                 )
             )
             self.tools.register(KBRetrieveTool(workspace=self.workspace, kb=self.kb))
@@ -1166,10 +1178,11 @@ class AgentLoop:
             "research_phase", "papers_for_selection", "search_completed",
             "external_papers", "ingested_papers",
             "routing_decision", "routing_reasoning",
-            "retrieval_results", "retrieval_quality",
+            "retrieval_results", "retrieval_quality", "embedding_status",
             "rewritten_queries", "rewrite_reasoning",
             "sub_queries_detail", "extracted_entities",
             "referenced_papers", "requires_clarification",
+            "external_search_completed", "post_research_retrieval",
             "iteration_count", "max_iterations",
             "user_query", "session_id",
             "recent_dialog_context",
@@ -1477,7 +1490,6 @@ class AgentLoop:
             return {"status": "error", "error": "Knowledge base not enabled"}
 
         from nanobot.agent.tools.paper import (
-            MINERU_TOKEN,
             _extract_assets_and_strip,
             _extract_figure_table_blocks,
             _extract_front_matter,
@@ -1488,34 +1500,43 @@ class AgentLoop:
             _save_asset_kv,
             _split_markdown_semantic,
             _strip_front_matter,
+            _valid_extracted_text,
         )
 
         pdf_path = Path(local_pdf_path)
         text_content: str = ""
 
         # 1. Parse PDF using MinerULoader (precise markdown output).
-        try:
-            from langchain_mineru import MinerULoader
+        if self._mineru_api_token:
+            try:
+                from langchain_mineru import MinerULoader
 
-            loader = MinerULoader(
-                source=str(pdf_path),
-                language="en",
-                mode="precision",
-                token=MINERU_TOKEN,
-            )
-            parsed = loader.load()
-            text_content = parsed[0].page_content if parsed else ""
-        except Exception:
-            logger.warning(
-                "MinerULoader failed for {}, falling back to extract_text",
-                pdf_path,
-            )
+                loader = MinerULoader(
+                    source=str(pdf_path),
+                    language="en",
+                    mode="precision",
+                    token=self._mineru_api_token,
+                )
+                parsed = await asyncio.to_thread(loader.load)
+                text_content = parsed[0].page_content if parsed else ""
+            except Exception:
+                logger.warning(
+                    "MinerULoader failed for {}, falling back to extract_text",
+                    pdf_path,
+                )
 
-        if not text_content:
+        if not _valid_extracted_text(text_content):
             from nanobot.utils.document import extract_text
 
-            text_content = extract_text(pdf_path)
+            text_content = await asyncio.to_thread(extract_text, pdf_path)
             text_content = text_content if isinstance(text_content, str) else ""
+
+        if not _valid_extracted_text(text_content):
+            return {
+                "status": "error",
+                "error": "failed_to_parse_content",
+                "paper_id": str(doc.get("paper_id", "paper")),
+            }
 
         assets_path = self.workspace / "kb" / "figures.jsonl"
         paper_id = str(doc.get("paper_id", "paper"))
@@ -1564,7 +1585,6 @@ class AgentLoop:
         # 2. Save .md (body only, without front matter) for inspection.
         md_path = pdf_path.with_suffix(".md")
         md_path.write_text(body_text, encoding="utf-8")
-        pdf_path.unlink(missing_ok=True)
 
         # 3. Semantic chunking on body text.
         semantic_chunks = _split_markdown_semantic(
@@ -1600,6 +1620,8 @@ class AgentLoop:
         )
         result["status"] = "ok"
         result["local_md"] = str(md_path)
+        # Delete the uploaded PDF only after the complete indexing transaction succeeds.
+        pdf_path.unlink(missing_ok=True)
         return result
 
     def _schedule_skill_extraction(self, result: dict[str, Any], user_query: str) -> None:
@@ -1642,8 +1664,8 @@ class AgentLoop:
         """
         if not self._multi_agent_graph:
             return False
-
-        return True
+        if not self.tools_config.paper.multi_agent_orchestrator_enabled:
+            return False
         
         content_lower = content.lower()
         

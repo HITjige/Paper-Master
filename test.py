@@ -42,7 +42,7 @@ from nanobot.agent.tools.paper import _strip_front_matter, _merge_split_paragrap
 #     source="/home/eeg2img/.nanobot/workspace/kb/BraVL：Decoding Visual Neural Representations by Multimodal Learning of Brain-Visual-Linguistic Features (TPAMI23).pdf",
 #     language="en",
 #     mode="precision",
-#     token="eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiIzMDkwMDk0MCIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3NzEyNTM5NiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiIiwib3BlbklkIjpudWxsLCJ1dWlkIjoiM2RkZGExYzMtNWNhNC00YWRmLThkZGUtN2NlZTMyODRmODUyIiwiZW1haWwiOiIiLCJleHAiOjE3ODQ5MDEzOTZ9.LyGD4DRvRzZffORrZDlcygd0VlylT9jitn0jIkU6t3v2rRxT8xOQW4GyP3YcQsk_VNIwVstA-adePkEwgu8w5Q"
+#     token=os.environ["MINERU_API_TOKEN"]
 # )
 # docs = loader.load()
 # text_content = docs[0].page_content
@@ -98,7 +98,7 @@ print("All parsed asset references across chunks:\n", Counter(all_parsed_refs))
 # from mineru import MinerU
 
 # # Get your free token from https://mineru.net/apiManage/token
-# client = MinerU("eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiIzMDkwMDk0MCIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3NzEyNTM5NiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiIiwib3BlbklkIjpudWxsLCJ1dWlkIjoiM2RkZGExYzMtNWNhNC00YWRmLThkZGUtN2NlZTMyODRmODUyIiwiZW1haWwiOiIiLCJleHAiOjE3ODQ5MDEzOTZ9.LyGD4DRvRzZffORrZDlcygd0VlylT9jitn0jIkU6t3v2rRxT8xOQW4GyP3YcQsk_VNIwVstA-adePkEwgu8w5Q")
+# client = MinerU(os.environ["MINERU_API_TOKEN"])
 # result = client.extract("/home/eeg2img/.nanobot/workspace/kb/Visual Decoding and Reconstruction via EEG Embeddings with Guided Diffusion (NIPS24).pdf", pages="1-3", language="en", mode="precision")
 
 # print(type(result.markdown))

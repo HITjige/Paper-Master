@@ -25,7 +25,6 @@ from nanobot.agent.multi_agent.conditions import (
     NODE_SYNTHESIS,
     NODE_HYBRID_ENTRY,
     critic_conditional,
-    hybrid_retrieval_conditional,
     research_phase_conditional,
     retrieval_conditional,
     router_conditional,

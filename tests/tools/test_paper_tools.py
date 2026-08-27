@@ -1,5 +1,7 @@
+import asyncio
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -10,15 +12,16 @@ from nanobot.agent.tools.paper import (
     PaperRerankTool,
     PaperSearchTool,
     PaperSimilarityTool,
+    _rrf_fuse_paper_rankings,
 )
 
 
 @pytest.mark.asyncio
 async def test_paper_search_returns_ranked_results(tmp_path: Path, monkeypatch):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enable=True))
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
     tool = PaperSearchTool(workspace=tmp_path, kb=kb)
 
-    async def _fake_parse_arxiv(query: str, max_results: int = 20):
+    async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20):
         return [
             {
                 "paper_id": "a1",
@@ -39,21 +42,82 @@ async def test_paper_search_returns_ranked_results(tmp_path: Path, monkeypatch):
         ]
 
     monkeypatch.setattr("nanobot.agent.tools.paper._parse_arxiv", _fake_parse_arxiv)
-    result = await tool.execute("latest time series forecasting transformer papers", top_k=2)
+    result = await tool.execute(
+        "latest time series forecasting transformer papers",
+        candidate_queries=["time series forecasting transformer"],
+        rerank_top_k=2,
+    )
     payload = json.loads(result)
     assert payload["results"][0]["paper_id"] == "a1"
     assert len(payload["results"]) == 2
-    assert payload.get("candidate_set_id")
+    assert payload["deduped_total"] == 2
+
+
+def test_external_multi_query_rrf_rewards_cross_query_agreement():
+    fused = _rrf_fuse_paper_rankings(
+        [
+            [
+                {"paper_id": "single", "title": "Single-query hit"},
+                {"paper_id": "2401.12345v1", "title": "Shared hit"},
+            ],
+            [{"paper_id": "2401.12345v2", "title": "Shared hit"}],
+        ],
+        ["query one", "query two"],
+    )
+
+    assert [paper["paper_id"] for paper in fused] == ["2401.12345v1", "single"]
+    assert fused[0]["query_hit_count"] == 2
+    assert fused[0]["query_rrf_score"] == 1.0
+    assert fused[0]["query_matches"] == [
+        {"query_index": 0, "rank": 2, "query": "query one"},
+        {"query_index": 1, "rank": 1, "query": "query two"},
+    ]
+
+
+def test_kb_retrieve_modes_map_to_distinct_multi_view_searches(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=True)
+
+        def __init__(self):
+            self.retrieve = AsyncMock(return_value=[])
+            self.retrieve_by_hypothetical_questions = AsyncMock(return_value=[])
+
+        def get_embedding_status(self):
+            return {"backend": "test"}
+
+        def get_lexical_status(self):
+            return {"backend": "test"}
+
+    kb = _FakeKB()
+    tool = KBRetrieveTool(workspace=tmp_path, kb=kb)
+    expected = {
+        "hypothetical": "questions_only",
+        "traditional": "chunks_only",
+        "hybrid": "hybrid",
+    }
+
+    for retrieval_mode, search_mode in expected.items():
+        payload = json.loads(asyncio.run(tool.execute(
+            query="paper retrieval",
+            retrieval_mode=retrieval_mode,
+        )))
+        assert payload["retrieval_mode"] == retrieval_mode
+        assert (
+            kb.retrieve_by_hypothetical_questions.await_args.kwargs["search_mode"]
+            == search_mode
+        )
+
+    assert kb.retrieve.await_count == 0
 
 
 @pytest.mark.asyncio
-async def test_similarity_and_rerank_support_candidate_set_id(tmp_path: Path, monkeypatch):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enable=True))
+async def test_similarity_and_rerank_accept_stateless_candidates(tmp_path: Path, monkeypatch):
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
     search_tool = PaperSearchTool(workspace=tmp_path, kb=kb)
     sim_tool = PaperSimilarityTool(workspace=tmp_path, kb=kb)
     rerank_tool = PaperRerankTool(workspace=tmp_path, kb=kb)
 
-    async def _fake_parse_arxiv(query: str, max_results: int = 20):
+    async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20):
         return [
             {
                 "paper_id": "b1",
@@ -74,27 +138,31 @@ async def test_similarity_and_rerank_support_candidate_set_id(tmp_path: Path, mo
         ]
 
     monkeypatch.setattr("nanobot.agent.tools.paper._parse_arxiv", _fake_parse_arxiv)
-    search_payload = json.loads(await search_tool.execute(query="eeg diffusion", top_k=2))
-    candidate_set_id = search_payload.get("candidate_set_id")
-    assert candidate_set_id
+    search_payload = json.loads(await search_tool.execute(
+        query="eeg diffusion",
+        candidate_queries=["eeg diffusion"],
+        rerank_top_k=2,
+    ))
+    candidates = search_payload["results"]
+    assert candidates
 
     sim_payload = json.loads(
-        await sim_tool.execute(query="eeg diffusion", candidate_set_id=candidate_set_id)
+        await sim_tool.execute(query="eeg diffusion", papers=candidates)
     )
     assert sim_payload["results"]
 
     rerank_payload = json.loads(
-        await rerank_tool.execute(query="eeg diffusion", candidate_set_id=candidate_set_id, top_k=2)
+        await rerank_tool.execute(query="eeg diffusion", papers=sim_payload["results"], top_k=2)
     )
     assert rerank_payload["results"]
 
 
 @pytest.mark.asyncio
 async def test_paper_search_pipeline_mode(tmp_path: Path, monkeypatch):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enable=True))
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
     tool = PaperSearchTool(workspace=tmp_path, kb=kb)
 
-    async def _fake_parse_arxiv(query: str, max_results: int = 20):
+    async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20):
         return [
             {
                 "paper_id": "c1",
@@ -108,15 +176,19 @@ async def test_paper_search_pipeline_mode(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr("nanobot.agent.tools.paper._parse_arxiv", _fake_parse_arxiv)
     payload = json.loads(
-        await tool.execute(query="scientific qa", mode="pipeline", top_k=1)
+        await tool.execute(
+            query="scientific qa",
+            candidate_queries=["scientific qa"],
+            rerank_top_k=1,
+        )
     )
-    assert payload.get("stage") == "pipeline_reranked"
     assert payload["results"]
+    assert "rerank_score" in payload["results"][0]
 
 
 @pytest.mark.asyncio
 async def test_paper_rerank_uses_similarity_and_recency(tmp_path: Path):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enable=True))
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
     tool = PaperRerankTool(workspace=tmp_path, kb=kb)
     papers = [
         {"paper_id": "p1", "title": "Older high sim", "abstract": "forecasting", "year": 2018, "similarity_score": 0.95, "source": "arxiv"},
@@ -129,8 +201,31 @@ async def test_paper_rerank_uses_similarity_and_recency(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_paper_similarity_batches_embeddings(tmp_path: Path):
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    kb.embed_texts = AsyncMock(return_value=[
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+    tool = PaperSimilarityTool(workspace=tmp_path, kb=kb)
+
+    payload = json.loads(await tool.execute(
+        query="论文检索",
+        papers=[
+            {"paper_id": "p1", "title": "论文检索", "abstract": "相关研究"},
+            {"paper_id": "p2", "title": "图像分类", "abstract": "无关研究"},
+        ],
+        top_k=2,
+    ))
+
+    kb.embed_texts.assert_awaited_once()
+    assert payload["results"][0]["paper_id"] == "p1"
+
+
+@pytest.mark.asyncio
 async def test_paper_ingest_then_retrieve(tmp_path: Path, monkeypatch):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enable=True))
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
     ingest = PaperIngestTool(workspace=tmp_path, kb=kb)
     retrieve = KBRetrieveTool(workspace=tmp_path, kb=kb)
 
@@ -155,10 +250,12 @@ async def test_paper_ingest_then_retrieve(tmp_path: Path, monkeypatch):
 
         async def get(self, url: str):
             return _FakeResponse(
-                b"Neural retrieval augmented generation for scientific question answering."
+                b"# Introduction\n\n"
+                + b"Neural retrieval augmented generation for scientific question answering. " * 12
             )
 
     monkeypatch.setattr("nanobot.agent.tools.paper.httpx.AsyncClient", _FakeClient)
+    monkeypatch.setattr("nanobot.agent.tools.paper.validate_url_target", lambda url: (True, ""))
     paper = {
         "paper_id": "ingest-1",
         "title": "RAG for scientific QA",
@@ -176,7 +273,7 @@ async def test_paper_ingest_then_retrieve(tmp_path: Path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_paper_ingest_batch_mode(tmp_path: Path, monkeypatch):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enable=True))
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
     ingest = PaperIngestTool(workspace=tmp_path, kb=kb)
 
     class _FakeResponse:
@@ -200,10 +297,12 @@ async def test_paper_ingest_batch_mode(tmp_path: Path, monkeypatch):
 
         async def get(self, url: str):
             return _FakeResponse(
-                b"Abstract\nThis paper studies retrieval for QA.\nIntroduction\nMethod and experiments."
+                b"# Introduction\n\n"
+                + b"This paper studies retrieval for QA, including methods and experiments. " * 12
             )
 
     monkeypatch.setattr("nanobot.agent.tools.paper.httpx.AsyncClient", _FakeClient)
+    monkeypatch.setattr("nanobot.agent.tools.paper.validate_url_target", lambda url: (True, ""))
     payload = json.loads(
         await ingest.execute(
             papers=[
@@ -230,8 +329,59 @@ async def test_paper_ingest_batch_mode(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_paper_ingest_pdf_uses_local_extractor_without_mineru(tmp_path: Path, monkeypatch):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, min_chunk_chars=10),
+    )
+    ingest = PaperIngestTool(workspace=tmp_path, kb=kb, mineru_api_token="")
+
+    class _FakeResponse:
+        content = b"%PDF-1.7 fake test payload"
+        headers = {"content-type": "application/pdf"}
+        url = "https://example.org/paper.pdf"
+
+        def raise_for_status(self):
+            return None
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url: str):
+            return _FakeResponse()
+
+    def _fake_extract_text(path: Path) -> str:
+        assert path.suffix == ".pdf"
+        return "# Method\n\n" + "Local PDF extraction produces grounded paper text. " * 12
+
+    monkeypatch.setattr("nanobot.agent.tools.paper.httpx.AsyncClient", _FakeClient)
+    monkeypatch.setattr("nanobot.agent.tools.paper.validate_url_target", lambda url: (True, ""))
+    monkeypatch.setattr("nanobot.agent.tools.paper.validate_resolved_url", lambda url: (True, ""))
+    monkeypatch.setattr("nanobot.agent.tools.paper.extract_text", _fake_extract_text)
+
+    result = json.loads(await ingest.execute(
+        paper={
+            "paper_id": "pdf-fallback-1",
+            "title": "PDF fallback",
+            "pdf_url": "https://example.org/paper.pdf",
+        },
+        parse_mode="pdf",
+    ))
+
+    assert result["status"] == "ok"
+    assert result["chunk_count"] > 0
+
+
+@pytest.mark.asyncio
 async def test_paper_ingest_persists_distilled_metadata(tmp_path: Path, monkeypatch):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enable=True))
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
     ingest = PaperIngestTool(workspace=tmp_path, kb=kb)
 
     class _FakeResponse:
@@ -255,10 +405,12 @@ async def test_paper_ingest_persists_distilled_metadata(tmp_path: Path, monkeypa
 
         async def get(self, url: str):
             return _FakeResponse(
-                b"Abstract\nThis paper studies scientific QA.\nLimitations\nSmall dataset and compute constraints."
+                b"# Introduction\n\n"
+                + b"This paper studies scientific QA with small datasets and compute constraints. " * 12
             )
 
     monkeypatch.setattr("nanobot.agent.tools.paper.httpx.AsyncClient", _FakeClient)
+    monkeypatch.setattr("nanobot.agent.tools.paper.validate_url_target", lambda url: (True, ""))
     result = json.loads(
         await ingest.execute(
             paper={
@@ -272,11 +424,12 @@ async def test_paper_ingest_persists_distilled_metadata(tmp_path: Path, monkeypa
         )
     )
     assert result["status"] == "ok"
-    assert result.get("distilled") is True
+    assert result["mode"] == "hypothetical"
+    assert result["chunk_count"] > 0
 
 
 def test_kb_retrieve_uses_metadata_and_diversity(tmp_path: Path):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enable=True))
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
     kb.base_dir.mkdir(parents=True, exist_ok=True)
 
     docs = [

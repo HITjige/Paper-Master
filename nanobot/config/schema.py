@@ -230,6 +230,17 @@ class PaperToolsConfig(Base):
     embedding_model: str = "text-embedding-3-small"
     embedding_api_key: str = ""
     embedding_api_base: str = "https://api.openai.com/v1"
+    embedding_fallback: Literal["hash", "error"] = "hash"
+    embedding_batch_size: int = Field(default=64, ge=1, le=256)
+    rrf_k: int = Field(default=60, ge=1, le=1000)
+    dense_rrf_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+    sparse_rrf_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+    bm25_title_weight: float = Field(default=5.0, ge=0.0, le=20.0)
+    bm25_keywords_weight: float = Field(default=3.0, ge=0.0, le=20.0)
+    bm25_summary_weight: float = Field(default=1.5, ge=0.0, le=20.0)
+    bm25_questions_weight: float = Field(default=2.0, ge=0.0, le=20.0)
+    bm25_body_weight: float = Field(default=1.0, ge=0.0, le=20.0)
+    mineru_api_token: str = Field(default="", repr=False)
     max_chunk_chars: int = Field(default=4096, ge=200, le=10000)
     min_chunk_chars: int = Field(default=300, ge=50, le=5000)
 

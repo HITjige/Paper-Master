@@ -34,9 +34,9 @@
 
 结果缓存在 `state["rewritten_queries"]` 中，检索和研究节点共享。
 
-#### 2️⃣ 知识库检索 — HyDE（Hypothetical Document Embeddings）
+#### 2️⃣ 知识库检索 — 受 HyDE 启发的假设问题索引
 
-`PaperKnowledgeBase` (paper_kb.py) 实现了 **HyDE 检索范式**，使用 Chroma 向量数据库配合 **三层索引**：
+`PaperKnowledgeBase` (paper_kb.py) 使用 Chroma 向量数据库配合**摘要/假设问题/原文块三层索引**，同时将父文档持久化到 JSONL 作为降级检索与导出数据：
 
 | 集合 (Collection) | 存储内容 | 用途 |
 |---|---|---|
@@ -46,8 +46,8 @@
 
 **检索流程：**
 1. 对查询向量化，同时搜索 `summaries` 和 `questions` 集合
-2. **BM25 稀疏索引**做关键词检索
-3. **RRF (Reciprocal Rank Fusion)** 融合稠密向量和稀疏结果
+2. **SQLite FTS5/BM25 持久化稀疏索引**做关键词检索：每个父 Chunk 一行，按标题、关键词、摘要、假设问题、正文进行字段加权；使用中英文混合分词，中文同时生成字粒度与二元词
+3. **检索族归一的加权 RRF** 融合稠密向量和稀疏结果，Dense/Sparse 权重分别在各自的查询改写与视图间均分
 4. **MMR (Maximal Marginal Relevance)** 多样化选择，防止单篇论文垄断
 5. 评分低于 best_score × 0.3 的结果被过滤
 
@@ -72,13 +72,13 @@ research_node()
   │   ├─ 去重 (paper_id去重)
   │   ├─ PaperSimilarityTool      ← 粗排 (cosine + lexical混合)
   │   └─ PaperRerankTool          ← 精排 (sim × 0.6 + recency × 0.25 + source×0.15)
-  ├─ LLM选择 top ingest_limit 篇论文
+  ├─ 返回排序结果与摘要级证据，等待用户选择是否入库
   ├─ PaperIngestTool.execute()     ← 下载+解析+入库
   │   ├─ 下载PDF/HTML
   │   ├─ MinerU 解析PDF (结构保留)
-  │   ├─ MarkdownHeaderTextSplitter 语义分块
+  │   ├─ 基于 Markdown 标题层级的自定义语义分块
   │   ├─ LLM生成每个chunk的元数据 (summary + 假设性问题 + keywords + entities + claims)
-  │   └─ upsert_semantic_chunks() → 入库到Chroma三层索引
+  │   └─ upsert_semantic_chunks() → 写入 Chroma 三层索引 + SQLite FTS5 + JSONL 父文档
   └─ 设置 post_research_retrieval=true → 回检索层检索新入库内容
 ```
 
@@ -100,7 +100,7 @@ upsert到Chroma (summaries + questions + chunks三层)
 
 ```
 synthesis_node()
-  ├─ 格式化检索结果（按paper_id分组，含section路径）
+  ├─ 格式化全文检索结果与外部摘要（显式标注 evidence_level）
   ├─ 调用LLM综合生成答案
   │   ├─ 回答语言与用户一致
   │   ├─ 使用Markdown表格/列表/粗体
@@ -112,7 +112,7 @@ critic_node()
   ├─ 评估答案质量: passed / needs_revision / needs_more_info
   │   ├─ passed → 结束，输出 final_answer
   │   ├─ needs_revision → 回 synthesis 修改 (最多3轮)
-  │   └─ needs_more_info → 再触发 research
+  │   └─ needs_more_info → 自动补充外部摘要检索
   └─ 防止死循环（max_iterations=3）
 ```
 
@@ -144,9 +144,9 @@ Router Agent ──direct──→ Synthesis ──→ Critic ──passed──
 
 ---
 
-### 📦 后续管线：Skill Extractor（论文知识沉淀）
+### 📦 可选后续管线：Skill Extractor（论文知识沉淀）
 
-论文对话完成后，`SkillExtractor` (skill_extractor.py) 异步运行：
+项目包含 `SkillExtractor` (skill_extractor.py) 的实现，但当前主循环中的调度调用默认未开启。启用该调度后，其设计流程为：
 
 1. **Phase 1**：分析 multi-agent 完整对话 + 论文内容，判断是否有可复用的技能
 2. **Phase 2**：委托 `AgentRunner` 创建/编辑 `SKILL.md` 文件
@@ -164,14 +164,14 @@ eval_paper_agent.py 用 paper_eval_dataset.json 评测检索/重排质量：
 
 ### 关键设计亮点
 
-1. **HyDE 假设性文档嵌入**：不直接存论文文本嵌入，而是存：
+1. **多视角语义索引**：在保留原文父块的同时存：
    - LLM 生成的摘要嵌入（capture 全局内容）
    - LLM 生成的假设性问题嵌入（capture 用户可能的问法）
    
-2. **RRF 混合检索**：稠密向量 + BM25 稀疏索引融合，兼顾语义和关键词
+2. **持久化混合检索**：Chroma 稠密向量 + SQLite FTS5/BM25 稀疏索引经加权 RRF 融合，兼顾语义和关键词
 
 3. **MMR 多样化**：Max Marginal Relevance 避免同一篇论文的多个 chunk 垄断结果
 
 4. **查询重写共享**：检索和研究节点复用同一组优化后的查询，减少 LLM 调用
 
-5. **防循环机制**：`loop_guard_count` + `post_research_retrieval` 标志，确保研究→检索循环后强制进入合成
+5. **防循环机制**：`external_search_completed` + `post_research_retrieval` 标志，确保研究→检索循环后强制进入合成

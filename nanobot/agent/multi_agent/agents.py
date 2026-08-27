@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -246,7 +247,7 @@ Write high-quality, evidence-based answers using retrieved information.
 
 <input_sources>
   <source>Internal retrieval results from the knowledge base.</source>
-  <source>External papers newly ingested into the knowledge base.</source>
+  <source>External arXiv metadata and abstracts labelled as abstract-only evidence.</source>
   <source>Both internal and external sources in hybrid mode.</source>
   <source>No sources in direct mode; use general knowledge only then.</source>
 </input_sources>
@@ -661,8 +662,9 @@ You are an expert academic search query optimizer. Your task is to analyze the u
 
 <rules>
 <rule id="translate-english">
-- ALL `rewritten_queries` and `keywords` MUST be in **English**, even if the user query is in Chinese or another language.
-- Paper databases (KB, arXiv) are indexed in English. Translate faithfully — preserve technical terminology.
+- Produce an English retrieval variant for non-English input because external paper databases such as arXiv are primarily indexed in English.
+- The application separately preserves the source-language original for local lexical and exact-term retrieval, so translate faithfully and preserve technical terminology.
+- `keywords` should be English for external paper search; `rewritten_queries` should be useful cross-lingual/decomposed variants rather than copies of the source query.
 </rule>
 
 <rule id="remove-noise">
@@ -817,7 +819,7 @@ Output:
 
 <critical_reminder>
 Return ONLY the JSON object. No markdown fences, no explanation outside the JSON.
-All `rewritten_queries` and `keywords` MUST be in English.
+For non-English input, provide useful English `rewritten_queries` and English external-search `keywords`; the source-language original is retained by the application.
 If no specific paper is referenced, `target_paper` MUST be an empty dict {{}} or omitted.
 </critical_reminder>"""
 
@@ -890,11 +892,13 @@ def format_sources_section(
         return saxutils.escape(str(text))
 
     parts: list[str] = []
+    full_text_ids: set[str] = set()
 
     if retrieval_results:
         grouped: dict[str, dict[str, Any]] = {}
         for r in retrieval_results:
             pid = str(r.get("paper_id", "unknown"))
+            full_text_ids.add(pid)
             if pid not in grouped:
                 grouped[pid] = {"paper_id": pid, "chunks": []}
             grouped[pid]["chunks"].append(r)
@@ -918,29 +922,29 @@ def format_sources_section(
 
             chunks = sorted(group["chunks"], key=lambda c: c.get("score", 0), reverse=True)
 
-            parts.append(f'  <paper id="{_esc(pid)}">')
-            parts.append(f'    <metadata>')
+            parts.append(f'  <paper id="{_esc(pid)}" evidence_level="full_text">')
+            parts.append('    <metadata>')
             parts.append(f'      <title>{_esc(title)}</title>')
             if a_str:
                 parts.append(f'      <authors>{_esc(a_str)}</authors>')
             if year:
                 parts.append(f'      <year>{_esc(str(year))}</year>')
-            parts.append(f'    </metadata>')
+            parts.append('    </metadata>')
 
             if abstract:
-                parts.append(f'    <global_abstract>')
+                parts.append('    <global_abstract>')
                 parts.append(f'      {_esc(abstract)}')
-                parts.append(f'    </global_abstract>')
+                parts.append('    </global_abstract>')
 
-            parts.append(f'    <retrieved_chunks>')
+            parts.append('    <retrieved_chunks>')
             for chunk in chunks:
                 section = chunk.get("heading_path", chunk.get("section", ""))
                 text = str(chunk.get("text", ""))
                 score = chunk.get("score", 0)
                 parts.append(f'      <chunk section="{_esc(section)}" score="{score:.3f}">')
                 parts.append(f'        {_esc(text)}')
-                parts.append(f'      </chunk>')
-            parts.append(f'    </retrieved_chunks>')
+                parts.append('      </chunk>')
+            parts.append('    </retrieved_chunks>')
 
             # ---- Collect linked_assets from all chunks (dedup by key) ----
             seen_asset_keys: set[str] = set()
@@ -953,7 +957,7 @@ def format_sources_section(
                         all_assets.append(asset)
 
             if all_assets:
-                parts.append(f'    <referenced_figures_tables>')
+                parts.append('    <referenced_figures_tables>')
                 for asset in all_assets:
                     ak = _esc(str(asset.get("key", "")))
                     cap = _esc(str(asset.get("caption", "")))
@@ -962,21 +966,86 @@ def format_sources_section(
                     ref_line = f'      <asset key="{ak}" type="{_esc(atype)}" caption="{cap}"'
                     if content and atype == "table":
                         ref_line += '>\n'
-                        ref_line += f'        {str(content)}\n'
+                        ref_line += f'        {_esc(str(content))}\n'
                         ref_line += '      </asset>'
                     else:
                         ref_line += ' />'
                     parts.append(ref_line)
-                parts.append(f'    </referenced_figures_tables>')
+                parts.append('    </referenced_figures_tables>')
             # ---- End asset section ----
 
-            parts.append(f'  </paper>')
+            parts.append('  </paper>')
+
+    for paper in external_papers or []:
+        pid = str(paper.get("paper_id", "")).strip()
+        if not pid or pid in full_text_ids:
+            continue
+        title = str(paper.get("title", ""))
+        authors = paper.get("authors", [])
+        authors_text = ", ".join(str(item) for item in authors[:5]) if isinstance(authors, list) else str(authors)
+        abstract = str(paper.get("abstract", ""))[:3000]
+        parts.append(f'  <paper id="{_esc(pid)}" evidence_level="abstract_only">')
+        parts.append(f'    <title>{_esc(title)}</title>')
+        if authors_text:
+            parts.append(f'    <authors>{_esc(authors_text)}</authors>')
+        if paper.get("year"):
+            parts.append(f'    <year>{_esc(str(paper.get("year")))}</year>')
+        if paper.get("url"):
+            parts.append(f'    <url>{_esc(str(paper.get("url")))}</url>')
+        if abstract:
+            parts.append(f'    <abstract>{_esc(abstract)}</abstract>')
+        parts.append('    <usage_constraint>Abstract-only evidence; do not infer unreported method details or experiment values.</usage_constraint>')
+        parts.append('  </paper>')
 
     if not parts:
         return ('<sources>No external sources provided. '
                 'Answer based on your knowledge.</sources>')
 
-    return '\n'.join(parts)
+    return '<sources>\n' + '\n'.join(parts) + '\n</sources>'
+
+
+def collect_answer_citations(
+    answer: str,
+    *,
+    retrieval_results: Optional[list] = None,
+    docs_meta: Optional[dict[str, dict[str, Any]]] = None,
+    external_papers: Optional[list] = None,
+) -> tuple[list[str], list[str]]:
+    """Resolve inline ``[paper_id]`` markers and report fabricated IDs."""
+    available: dict[str, dict[str, Any]] = {}
+    full_text_ids = {str(item.get("paper_id", "")) for item in retrieval_results or []}
+    for pid in full_text_ids:
+        if pid:
+            available[pid] = {**(docs_meta or {}).get(pid, {}), "evidence_level": "full_text"}
+    for paper in external_papers or []:
+        pid = str(paper.get("paper_id", ""))
+        if pid and pid not in available:
+            available[pid] = {**paper, "evidence_level": "abstract_only"}
+
+    # Exclude ordinary Markdown links (``[label](url)``). Unknown bracketed
+    # text is considered a fabricated citation only when it resembles a paper
+    # identifier; this avoids treating prose such as ``[optional]`` as a source.
+    marker_ids = list(dict.fromkeys(re.findall(
+        r"\[([A-Za-z0-9][A-Za-z0-9._:/-]{1,127})\](?!\()",
+        answer or "",
+    )))
+    cited_ids = [pid for pid in marker_ids if pid in available]
+    invalid = [
+        pid for pid in marker_ids
+        if pid not in available
+        and any(char.isdigit() for char in pid)
+        and any(separator in pid for separator in (".", ":", "-"))
+    ]
+    citations: list[str] = []
+    for pid in cited_ids:
+        meta = available.get(pid)
+        if not meta:
+            continue
+        title = str(meta.get("title", "") or pid)
+        url = str(meta.get("url", ""))
+        evidence = str(meta.get("evidence_level", "unknown"))
+        citations.append(f"[{pid}] {title}" + (f" — {url}" if url else "") + f" ({evidence})")
+    return citations, invalid
 
 
 def get_agent_prompts(

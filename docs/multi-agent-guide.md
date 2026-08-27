@@ -97,7 +97,7 @@ The Router analyzes your query and decides:
 
 ### 2. Retrieval (if internal/hybrid)
 
-- Searches vector database using HyDE (Hypothetical Document Embeddings)
+- Searches the summary/question/original-chunk indexes using dense + lexical retrieval
 - Evaluates result quality
 - If insufficient, triggers external search
 
@@ -105,9 +105,9 @@ The Router analyzes your query and decides:
 
 - Generates multiple search queries
 - Searches arXiv
-- Reranks results using cross-encoder
-- Downloads and parses top papers
-- Ingests into knowledge base
+- Reranks results using semantic similarity, recency, and source priors
+- Returns abstract-level evidence and lets the user select papers
+- Downloads, parses, and ingests only the selected papers
 
 ### 4. Synthesis
 
@@ -124,28 +124,58 @@ The Router analyzes your query and decides:
 
 ## Configuration
 
-Add to your `nanobot.toml`:
+Add to `~/.nanobot/config.json` (the MinerU token is optional):
 
-```toml
-[tools.paper]
-enable = true
-embedding_model = "/path/to/bge-small-zh-v1.5"
-rerank_model = "/path/to/Qwen3-Reranker-0.6B"
-auto_context_retrieve = true
-auto_context_top_k = 5
-
-[multi_agent]
-max_iterations = 3
-similarity_threshold = 0.2
-top_k = 5
-ingest_limit = 3
+```json
+{
+  "tools": {
+    "paper": {
+      "enable": true,
+      "multiAgentOrchestratorEnabled": true,
+      "embeddingModel": "text-embedding-3-small",
+      "embeddingApiKey": "${OPENAI_API_KEY}",
+      "embeddingFallback": "error",
+      "embeddingBatchSize": 64,
+      "rrfK": 60,
+      "denseRrfWeight": 0.5,
+      "sparseRrfWeight": 0.5,
+      "bm25TitleWeight": 5.0,
+      "bm25KeywordsWeight": 3.0,
+      "bm25SummaryWeight": 1.5,
+      "bm25QuestionsWeight": 2.0,
+      "bm25BodyWeight": 1.0,
+      "mineruApiToken": "${MINERU_API_TOKEN}",
+      "retrievalTopK": 5,
+      "autoContextRetrieve": true,
+      "autoContextTopK": 5
+    }
+  }
+}
 ```
+
+If MinerU is not used, omit `mineruApiToken`. If it is used, export
+`MINERU_API_TOKEN` before starting nanobot; unresolved `${...}` variables are
+treated as configuration errors.
+
+For production retrieval, configure either an embedding API key or a local
+SentenceTransformer directory. `embeddingFallback: "error"` prevents startup
+configuration mistakes from silently becoming lexical-only retrieval. The
+default `"hash"` fallback remains available for offline development and is
+reported as `hash_lexical` with `degraded: true` by KB APIs. Embedding requests
+are sent in batches controlled by `embeddingBatchSize`.
+
+Sparse retrieval is stored in `kb/lexical.db` using SQLite FTS5. Each parent
+chunk is one weighted document with title, keywords, summary, hypothetical
+questions, and body fields. `denseRrfWeight` and `sparseRrfWeight` are family
+weights: each family's weight is divided among its query rewrites and views,
+so adding rewrites does not give that family extra RRF votes. The index is
+automatically rebuilt from canonical JSONL when its schema/tokenizer version
+or source file modification marker changes.
 
 ## Requirements
 
 ```bash
-# Install LangGraph
-pip install langgraph
+pip install -e ".[paper]"
 
 # Ensure paper tools are enabled
 # See paper-tools-guide.md

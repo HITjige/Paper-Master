@@ -460,35 +460,34 @@ async def handle_kb_stats(request: web.Request) -> web.Response:
     agent_loop = request.app["agent_loop"]
     kb = getattr(agent_loop, "kb", None)
     if kb is None:
-        return web.json_response({"paper_count": 0, "chunk_count": 0, "recent_papers": []})
+        return web.json_response({
+            "paper_count": 0,
+            "chunk_count": 0,
+            "chroma_chunk_count": None,
+            "lexical_chunk_count": None,
+            "storage_backend": "disabled",
+            "chroma_consistent": None,
+            "lexical_consistent": None,
+            "backends_consistent": None,
+            "embedding": {
+                "backend": "disabled",
+                "model": "",
+                "batch_size": 0,
+                "degraded": True,
+                "reason": "paper_kb_disabled",
+            },
+            "lexical": {
+                "backend": "disabled",
+                "document_count": None,
+                "degraded": True,
+                "reason": "paper_kb_disabled",
+            },
+            "degraded": True,
+            "degradation_reasons": ["paper_kb_disabled"],
+            "recent_papers": [],
+        })
 
-    # Count from JSONL files
-    docs = kb._read_jsonl(kb.docs_file)
-    chunks = kb._read_jsonl(kb.chunks_file)
-
-    # Count unique papers per doc
-    paper_ids = {d.get("paper_id") for d in docs if d.get("paper_id")}
-    chunk_count = len(chunks)
-
-    # Recent papers (last 10)
-    recent = sorted(docs, key=lambda d: d.get("updated_at", ""), reverse=True)[:10]
-    recent_papers = [
-        {
-            "paper_id": d.get("paper_id", ""),
-            "title": d.get("title", ""),
-            "source": d.get("source", ""),
-            "year": d.get("year"),
-            "chunk_count": sum(1 for c in chunks if c.get("paper_id") == d.get("paper_id")),
-            "updated_at": d.get("updated_at", ""),
-        }
-        for d in recent
-    ]
-
-    return web.json_response({
-        "paper_count": len(paper_ids),
-        "chunk_count": chunk_count,
-        "recent_papers": recent_papers,
-    })
+    return web.json_response(kb.get_stats())
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ from nanobot.agent.multi_agent.agents import (
     SYNTHESIS_USER_TEMPLATE,
     UNIFIED_QUERY_SYSTEM_PROMPT,
     UNIFIED_QUERY_USER_TEMPLATE,
+    collect_answer_citations,
     format_sources_section,
     get_agent_prompts,
 )
@@ -82,7 +83,14 @@ class AgentNodes:
             title = str(item.get("paper_title") or item.get("title") or item.get("paper_id") or "unknown")
             section = str(item.get("section", ""))
             score = float(item.get("score", 0.0) or 0.0)
-            lines.append(f"{idx}. score={score:.3f}; section={section}; title={title[:120]}")
+            score_type = str(item.get("score_type", "unknown"))
+            dense_score = item.get("dense_score")
+            bm25_score = item.get("bm25_score")
+            lines.append(
+                f"{idx}. score={score:.3f} ({score_type}); "
+                f"dense={dense_score}; bm25={bm25_score}; "
+                f"section={section}; title={title[:120]}"
+            )
         return "\n".join(lines)
 
     async def _emit_progress(self, msg: str) -> None:
@@ -236,6 +244,7 @@ class AgentNodes:
         
         # Remove common filler prefixes
         filler_prefixes = [
+            r"^(?:请|麻烦)?\s*(?:帮我)?\s*(?:找|检索|查找|搜索)\s*",
             r"^(please|pls|帮我|请|麻烦|能不能|可以|能否)\s*",
             r"^(can you|could you|would you)\s*",
             r"^(I want to|I need to|I would like to)\s*",
@@ -250,7 +259,7 @@ class AgentNodes:
         # Remove trailing filler
         filler_suffixes = [
             r"\s*(please|pls|谢谢|thanks?|thank you)[.!]*$",
-            r"\s*\?+\s*$",
+            r"\s*[?？]+\s*$",
             # Chinese trailing filler
             r"\s*(的论文|的文献|的文章|方面的|相关的|是什么|怎么做|怎么样|吗)[?？!！.]*$",
             # English trailing filler
@@ -266,6 +275,35 @@ class AgentNodes:
         # it as-is — the LLM rewrite step will translate to English for search.
         # Rule-based rewrite only strips filler; it doesn't translate.
         return cleaned if cleaned else query
+
+    @classmethod
+    def _merge_query_variants(
+        cls,
+        user_query: str,
+        rewritten_queries: list[Any] | None = None,
+    ) -> list[str]:
+        """Preserve source-language and cleaned queries before LLM variants."""
+        candidates: list[Any] = [user_query, cls._rule_based_rewrite(user_query)]
+        candidates.extend(rewritten_queries or [])
+
+        merged: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            value = re.sub(r"\s+", " ", str(candidate or "")).strip()
+            key = value.casefold()
+            if value and key not in seen:
+                seen.add(key)
+                merged.append(value)
+        return merged
+
+    @staticmethod
+    def _select_external_queries(queries: list[str]) -> list[str]:
+        """Prefer translated variants for English-first external databases."""
+        non_cjk_queries = [
+            query for query in queries
+            if not re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", query)
+        ]
+        return non_cjk_queries or queries
 
     @staticmethod
     def _should_trigger_llm_rewrite(
@@ -662,6 +700,18 @@ class AgentNodes:
         
         if not original_results:
             return False
+
+        # Weighted RRF is normalized independently for each result set, so its
+        # top score is rank-relative (normally 1.0) and cannot be compared
+        # across the original and rewritten searches as if it were cosine.
+        if any(
+            result.get("score_type") == "weighted_rrf"
+            for result in [*original_results, *rewritten_results]
+        ):
+            logger.debug(
+                "Rewrite degradation: skipping cross-run score comparison for weighted RRF"
+            )
+            return False
         
         # Compare top-1 scores
         orig_top1 = max((r.get("score", 0) for r in original_results), default=0)
@@ -792,7 +842,7 @@ class AgentNodes:
             # ---- Build rewritten_queries flat list ----
             rewritten_queries: list[str] = []
             sub_queries_detail: list[dict[str, Any]] = []
-            extracted_entities: dict[str, dict[str, str]] = {}
+            extracted_entities: dict[str, dict[str, Any]] = {}
             all_referenced_papers: list[dict[str, str]] = []
             
             if isinstance(sub_queries_raw, list):
@@ -817,23 +867,24 @@ class AgentNodes:
                         # Remove 'arxiv:' prefix if present
                         if pid.startswith("arxiv:"):
                             pid = pid[6:]
-                        if pid not in extracted_entities:
+                        entity_key = pid.casefold() or f"title:{title.casefold()}"
+                        if entity_key not in extracted_entities:
                             all_referenced_papers.append({
                                 "paper_id": pid,
                                 "title": title,
                             })
-                            extracted_entities[pid] = {
+                            extracted_entities[entity_key] = {
                                 "paper_id": pid,
                                 "title": title,
                                 "queries": rq_list if rq_list else [],
                             }
                         else:
-                            pid_queries = extracted_entities[pid].get("queries", [])
+                            pid_queries = extracted_entities[entity_key].get("queries", [])
                             for rq in rq_list:
                                 rq_str = str(rq).strip()
                                 if rq_str and rq_str not in pid_queries:
                                     pid_queries.append(rq_str)
-                            extracted_entities[pid]["queries"] = pid_queries
+                            extracted_entities[entity_key]["queries"] = pid_queries
                     
                     # keywords
                     keywords = sq.get("keywords", [])
@@ -857,20 +908,17 @@ class AgentNodes:
 
             extracted_entities = list(extracted_entities.values()) if extracted_entities else []
             
-            # Ensure at least one query exists (fallback to cleaned original)
+            # Retain the source-language original for exact terms and Chinese
+            # sparse retrieval, then append cleaned/cross-lingual variants.
+            rewritten_queries = self._merge_query_variants(user_query, rewritten_queries)
             if not rewritten_queries:
-                rewritten_queries = [self._rule_based_rewrite(user_query)]
+                rewritten_queries = [user_query.strip()]
                 sub_queries_detail = [{
                     "rewritten_queries": rewritten_queries,
                     "target_paper": {},
                     "keywords": [],
                     "time_filter": None,
                 }]
-            
-            # Ensure the cleaned original is always in the list (as first element)
-            cleaned_query = self._rule_based_rewrite(user_query)
-            # if cleaned_query.lower() not in [q.lower() for q in rewritten_queries]:
-            #     rewritten_queries.insert(0, cleaned_query)
             
             # Merge referenced_papers from state with newly resolved ones
             existing_refs = state.get("referenced_papers", [])
@@ -909,10 +957,10 @@ class AgentNodes:
         except Exception as e:
             logger.warning("_unified_query_rewrite failed: {}, falling back to rule-based", e)
             # Fallback: rule-based rewrite only
-            cleaned_query = self._rule_based_rewrite(user_query)
-            state["rewritten_queries"] = [cleaned_query]
+            fallback_queries = self._merge_query_variants(user_query)
+            state["rewritten_queries"] = fallback_queries
             state["sub_queries_detail"] = [{
-                "rewritten_queries": [cleaned_query],
+                "rewritten_queries": fallback_queries,
                 "target_paper": {},
                 "keywords": [],
                 "time_filter": None,
@@ -924,7 +972,7 @@ class AgentNodes:
             state["rewrite_fallback_used"] = True
             
             return {
-                "rewritten_queries": [cleaned_query],
+                "rewritten_queries": fallback_queries,
                 "sub_queries_detail": state["sub_queries_detail"],
                 "extracted_entities": [],
                 "rewrite_reasoning": f"unified_rewrite_failed: {e}",
@@ -950,39 +998,44 @@ class AgentNodes:
         
         Flow (unified):
         1. Return cached queries if already present
-        2. If query_rewrite_enabled=False, return rule-cleaned query only
+        2. If query_rewrite_enabled=False, return original + cleaned query
         3. If query_rewrite_use_llm=True, call _unified_query_rewrite (single LLM call)
-        4. Otherwise, fall back to rule-based cleaning only
+        4. Otherwise, return original + rule-based cleaned query
         
         Args:
             user_query: Original user query
             state: Current workflow state
             
         Returns:
-            Deduplicated list of optimized query strings (always includes
-            the cleaned original as first element)
+            Deduplicated list of optimized query strings. The source-language
+            original comes first, followed by a distinct cleaned form and rewrites.
         """
         # Return cached queries if already prepared
         cached = state.get("rewritten_queries")
         if cached and isinstance(cached, list) and len(cached) > 0:
+            cached = self._merge_query_variants(user_query, cached)
+            state["rewritten_queries"] = cached
             logger.info(
                 "_prepare_queries: reusing cached {} queries",
                 len(cached),
             )
-            return [str(q) for q in cached]
+            return cached
         
         query_rewrite_enabled = state.get("query_rewrite_enabled", True)
         if not query_rewrite_enabled:
-            # No rewrite, just return cleaned original
-            cleaned = self._rule_based_rewrite(user_query)
-            state["rewritten_queries"] = [cleaned]
-            return [cleaned]
+            prepared = self._merge_query_variants(user_query)
+            state["rewritten_queries"] = prepared
+            return prepared
         
         query_rewrite_use_llm = state.get("query_rewrite_use_llm", True)
         if query_rewrite_use_llm:
             # Unified single LLM call: rewrite + decompose + entity extract
             result = await self._unified_query_rewrite(user_query, state)
-            all_queries = result.get("rewritten_queries", [])
+            all_queries = self._merge_query_variants(
+                user_query,
+                result.get("rewritten_queries", []),
+            )
+            state["rewritten_queries"] = all_queries
             logger.info(
                 "_prepare_queries: unified rewrite produced {} queries, confidence={:.2f}",
                 len(all_queries),
@@ -991,15 +1044,15 @@ class AgentNodes:
             return all_queries
         else:
             # LLM disabled — only rule-based cleaning
-            cleaned = self._rule_based_rewrite(user_query)
-            state["rewritten_queries"] = [cleaned]
+            prepared = self._merge_query_variants(user_query)
+            state["rewritten_queries"] = prepared
             state["sub_queries_detail"] = [{
-                "rewritten_queries": [cleaned],
+                "rewritten_queries": prepared,
                 "target_paper": {},
                 "keywords": [],
                 "time_filter": None,
             }]
-            return [cleaned]
+            return prepared
 
     # ================================================================
     # Research candidate selection
@@ -1170,12 +1223,12 @@ class AgentNodes:
         recent_dialog = state.get("recent_dialog_context", "") or "(empty)"
         long_term_memory = state.get("long_term_memory_context", "") or "(empty)"
         user_profile = state.get("user_profile_context", "") or "(empty)"
-        fallback_delta = float(state.get("rewrite_fallback_delta_threshold", 0.05) or 0.05)
+        embedding_status = self.kb.get_embedding_status()
+        state["embedding_status"] = embedding_status
         
         # Handle post-research loop: clear the flag so we don't loop forever
         post_research = state.get("post_research_retrieval", False)
         if post_research:
-            state["post_research_retrieval"] = False
             logger.info("Retrieval Agent: Post-research retrieval — retrieving newly ingested papers")
             await self._emit_progress("📚 检索刚入库的论文内容...")
         else:
@@ -1241,29 +1294,8 @@ class AgentNodes:
             
             state["retrieval_results"] = results
             state["rewrite_fallback_used"] = False
-            
-            # Check degradation: compare multi-query results vs original single-query
-            if not post_research and len(all_queries) > 1 and results:
-                original_results = await self.kb.retrieve_by_hypothetical_questions(
-                    query=user_query,
-                    top_k=self.top_k,
-                    per_paper_limit=3,
-                    search_mode="hybrid",
-                )
-                
-                degraded = self._check_rewrite_degradation(
-                    original_results, results, delta_threshold=fallback_delta
-                )
-                
-                if degraded:
-                    logger.warning(
-                        "Retrieval Agent: Multi-query rewrite degraded, falling back to original query results"
-                    )
-                    state["retrieval_results"] = original_results
-                    state["rewrite_fallback_used"] = True
-                    results = original_results
-                else:
-                    logger.info("Retrieval Agent: Multi-query rewrite performed better or equal to original")
+            embedding_status = self.kb.get_embedding_status()
+            state["embedding_status"] = embedding_status
             
             # Assess quality
             if not results:
@@ -1297,7 +1329,23 @@ class AgentNodes:
                 low = self.similarity_threshold - margin
                 high = self.similarity_threshold + margin
 
-                if best_score <= low:
+                embedding_degraded = bool(embedding_status.get("degraded"))
+                score_is_rank_based = any(
+                    result.get("score_type") == "weighted_rrf"
+                    for result in results
+                )
+                thresholds_unavailable = embedding_degraded or score_is_rank_based
+                if thresholds_unavailable:
+                    logger.warning(
+                        "Retrieval Agent: Semantic score thresholds unavailable "
+                        "(embedding_backend={}, reason={}, score_type={}); "
+                        "using LLM quality assessment",
+                        embedding_status.get("backend"),
+                        embedding_status.get("reason"),
+                        results[0].get("score_type", "unknown"),
+                    )
+
+                if not thresholds_unavailable and best_score <= low:
                     state["retrieval_quality"] = "insufficient"
                     logger.warning(
                         "Retrieval Agent: Deterministic insufficient (best_score={:.3f}, low={:.3f})",
@@ -1307,7 +1355,7 @@ class AgentNodes:
                     await self._emit_progress(
                         f"📚 知识库检索完成: {len(results)} 条结果，匹配度不足 (best={best_score:.3f})，将转至外部搜索"
                     )
-                elif best_score >= high:
+                elif not thresholds_unavailable and best_score >= high:
                     state["retrieval_quality"] = "sufficient"
                     logger.info(
                         "Retrieval Agent: Deterministic sufficient (best_score={:.3f}, high={:.3f})",
@@ -1362,21 +1410,26 @@ class AgentNodes:
                         
                     except Exception as e:
                         logger.error("Retrieval Agent LLM assessment failed: {}", e)
-                        # Default to sufficient
-                        state["retrieval_quality"] = "sufficient"
-                        logger.info(
-                            "Retrieval Agent: Found {} results (best_score={:.3f})",
-                            len(results),
-                            best_score,
+                        # Lexical hash scores are not calibrated as semantic
+                        # similarities, so a failed judge must fail closed.
+                        state["retrieval_quality"] = (
+                            "insufficient" if thresholds_unavailable else "sufficient"
                         )
-                        await self._emit_progress(
-                            f"📚 知识库检索完成: {len(results)} 条结果 (best={best_score:.3f})"
-                        )
+                        if state["retrieval_quality"] == "sufficient":
+                            logger.info(
+                                "Retrieval Agent: Found {} results (best_score={:.3f})",
+                                len(results),
+                                best_score,
+                            )
+                            await self._emit_progress(
+                                f"📚 知识库检索完成: {len(results)} 条结果 (best={best_score:.3f})"
+                            )
             
         except Exception as e:
             logger.error("Retrieval Agent failed: {}", e)
             state["retrieval_results"] = []
             state["retrieval_quality"] = "insufficient"
+            state["embedding_status"] = self.kb.get_embedding_status()
             state["error_message"] = str(e)
         
         return state
@@ -1417,6 +1470,7 @@ class AgentNodes:
             if not search_tool:
                 logger.error("Research Agent: Search tool not available")
                 state["error_message"] = "Paper search tool not available"
+                state["external_search_completed"] = True
                 state["research_phase"] = "complete"
                 return state
             
@@ -1429,28 +1483,48 @@ class AgentNodes:
             
             # ---- Extract keywords and time_filter from sub_queries_detail ----
             sub_queries_detail = state.get("sub_queries_detail", [])
-            all_keywords: list[list[str]] = []
+            keywords_by_query: dict[str, list[str]] = {}
             time_filters: list[str] = []
             if sub_queries_detail and isinstance(sub_queries_detail, list):
                 for sq in sub_queries_detail:
                     if isinstance(sq, dict):
                         kw = sq.get("keywords", [])
                         if isinstance(kw, list):
-                            all_keywords.append([str(k).strip() for k in kw if str(k).strip()])
+                            normalized_keywords = [
+                                str(k).strip() for k in kw if str(k).strip()
+                            ]
+                            for rewritten_query in sq.get("rewritten_queries", []) or []:
+                                key = re.sub(
+                                    r"\s+", " ", str(rewritten_query)
+                                ).strip().casefold()
+                                if key and normalized_keywords:
+                                    keywords_by_query[key] = normalized_keywords
                         tf = sq.get("time_filter")
                         if tf and str(tf).strip():
                             time_filters.append(str(tf).strip())
             time_filter = time_filters[0] if time_filters else None
             
-            if all_keywords:
+            if keywords_by_query:
                 logger.info(
-                    "Research Agent: Using {} keywords from sub_queries_detail: {}",
-                    len(all_keywords),
-                    all_keywords[:10],
+                    "Research Agent: Using keyword mappings for {} rewritten queries",
+                    len(keywords_by_query),
                 )
             # ---- End keywords/time_filter extraction ----
             
-            search_queries = all_queries if all_queries else [user_query]
+            prepared_queries = all_queries if all_queries else [user_query]
+            search_queries = self._select_external_queries(prepared_queries)
+            if len(search_queries) != len(prepared_queries):
+                logger.info(
+                    "Research Agent: kept {} translated queries for English-first arXiv search; source-language variants remain enabled for local retrieval",
+                    len(search_queries),
+                )
+            aligned_keywords = [
+                keywords_by_query.get(
+                    re.sub(r"\s+", " ", str(search_query)).strip().casefold(),
+                    [],
+                )
+                for search_query in search_queries
+            ]
             
             # Execute search
             logger.info(
@@ -1461,7 +1535,7 @@ class AgentNodes:
             sr = await search_tool.execute(
                 query=user_query,
                 candidate_queries=search_queries,
-                keywords=all_keywords if all_keywords else None,
+                keywords=aligned_keywords if any(aligned_keywords) else None,
                 source="arxiv",
                 search_topk=60,
                 recall_top_k=20,
@@ -1475,6 +1549,7 @@ class AgentNodes:
                 logger.warning("Research Agent: Multi-query search returned 0 results, falling back")
                 fallback_sr = await search_tool.execute(
                     query=user_query,
+                    candidate_queries=[user_query],
                     source="arxiv",
                     search_topk=60,
                     recall_top_k=20,
@@ -1506,6 +1581,7 @@ class AgentNodes:
                 state["papers_for_selection"] = []
                 state["external_papers"] = []
                 state["search_completed"] = True
+                state["external_search_completed"] = True
                 state["research_phase"] = "complete"
                 await self._emit_progress("❌ 未找到相关论文")
                 return state
@@ -1514,6 +1590,18 @@ class AgentNodes:
             state["papers_for_selection"] = all_papers[:20]  # Limit to 20 for selection
             state["external_papers"] = all_papers  # Keep full list for compatibility
             state["search_completed"] = True
+            state["external_search_completed"] = True
+
+            # A Critic-triggered supplementary search is fully automatic: its
+            # abstracts are already usable as explicitly labelled evidence, so
+            # do not pause for another ingestion choice.
+            if state.pop("critic_triggered_research", False):
+                state["research_phase"] = "complete"
+                await self._emit_progress(
+                    f"🔎 补充检索完成: 找到 {len(all_papers)} 篇摘要证据"
+                )
+                return state
+
             state["research_phase"] = "select"  # Waiting for user selection
             
             # Format selection info for user
@@ -1530,6 +1618,7 @@ class AgentNodes:
         except Exception as e:
             logger.error("Research search phase failed: {}", e)
             state["error_message"] = str(e)
+            state["external_search_completed"] = True
             state["research_phase"] = "complete"
         
         return state
@@ -1601,9 +1690,12 @@ class AgentNodes:
             )
             
             ingest_data = json.loads(ingest_result)
+            ingest_rows = ingest_data.get("results")
+            if not isinstance(ingest_rows, list):
+                ingest_rows = [ingest_data]
             ingested = [
                 r.get("paper_id", "")
-                for r in ingest_data.get("results", [])
+                for r in ingest_rows
                 if r.get("status") == "ok"
             ]
             
@@ -1627,6 +1719,8 @@ class AgentNodes:
     async def _research_complete_phase(self, state: MultiAgentState) -> MultiAgentState:
         """Phase 3: Finalize research and set loop guard."""
         state["research_phase"] = "complete"
+        state["external_search_completed"] = True
+        state["post_research_retrieval"] = True
         current_guard = int(state.get("loop_guard_count", 0) or 0)
         state["loop_guard_count"] = current_guard + 1
         return state
@@ -1861,6 +1955,7 @@ class AgentNodes:
         sources_section = format_sources_section(
             retrieval_results,
             docs_meta=docs_meta,
+            external_papers=external_papers,
         )
 
         logger.info(
@@ -1915,6 +2010,14 @@ class AgentNodes:
             
             content = response.content or ""
             state["draft_answer"] = content.strip()
+            citations, invalid_citations = collect_answer_citations(
+                state["draft_answer"],
+                retrieval_results=retrieval_results,
+                docs_meta=docs_meta,
+                external_papers=external_papers,
+            )
+            state["citations"] = citations
+            state["invalid_citations"] = invalid_citations
             
             # # Try to parse JSON
             # try:
@@ -1989,12 +2092,14 @@ class AgentNodes:
             state["final_answer"] = draft_answer
             logger.warning("Critic Agent: Max iterations reached, forcing completion")
             await self._emit_progress("⚠️ 达到最大迭代次数，强制输出答案")
+            return state
         
         # Load paper metadata and format sources
         docs_meta = self.kb.load_docs_meta() if hasattr(self, "kb") else {}
         sources_section = format_sources_section(
             retrieval_results,
             docs_meta=docs_meta,
+            external_papers=external_papers,
         )
         
         # Include previous critic context for progressive review
@@ -2008,6 +2113,13 @@ class AgentNodes:
             )
 
         critic_history_context = critic_history_context + critic_context_extra
+        invalid_citations = state.get("invalid_citations", [])
+        if invalid_citations:
+            critic_history_context += (
+                "\nDeterministic citation validation failed for IDs: "
+                + ", ".join(str(pid) for pid in invalid_citations)
+                + ". These citations must be removed or replaced with available source IDs.\n"
+            )
 
         rewrite_context_parts = []
         if rewritten_queries:
@@ -2051,6 +2163,12 @@ class AgentNodes:
             result = json.loads(content.strip())
             
             verdict = result.get("verdict", "needs_revision")
+            if invalid_citations and verdict == "passed":
+                verdict = "needs_revision"
+                result["issues"] = list(result.get("issues", [])) + [
+                    f"Unsupported citation IDs: {', '.join(str(pid) for pid in invalid_citations)}"
+                ]
+                result["suggestion"] = "Remove or replace citations that are absent from the provided sources."
             state["critic_verdict"] = verdict
             state["critic_issues"] = result.get("issues", [])
             state["critic_suggestion"] = result.get("suggestion", "")
@@ -2065,6 +2183,14 @@ class AgentNodes:
             else:
                 state["is_complete"] = False
                 state["iteration_count"] = iteration_count + 1
+                if verdict == "needs_more_info":
+                    # Reset the completed phase so the graph executes one fresh,
+                    # bounded external search instead of cycling on old evidence.
+                    state["research_phase"] = "search"
+                    state["search_completed"] = False
+                    state["external_search_completed"] = False
+                    state["post_research_retrieval"] = False
+                    state["critic_triggered_research"] = True
                 logger.info(
                     "Critic Agent: Answer needs {} (iteration {}/{})",
                     verdict,

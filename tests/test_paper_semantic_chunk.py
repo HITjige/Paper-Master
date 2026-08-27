@@ -1,20 +1,26 @@
 """Tests for paper semantic chunking and hypothetical question retrieval."""
 
+import asyncio
 import json
-import pytest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-from nanobot.agent.tools.paper import (
-    _split_markdown_semantic,
-    _generate_chunk_metadata,
-    _remove_noisy_blocks,
-)
+import pytest
+
 from nanobot.agent.paper_kb import (
     PaperKbConfig,
     PaperKnowledgeBase,
+    _hash_embedding,
+    _select_diverse,
+    _SQLiteBM25Index,
+    _weighted_rrf_fuse,
+    tokenize_text,
 )
-
+from nanobot.agent.tools.paper import (
+    _generate_chunk_metadata,
+    _remove_noisy_blocks,
+    _split_markdown_semantic,
+)
 
 # Sample markdown text for testing
 SAMPLE_MARKDOWN = """
@@ -67,6 +73,435 @@ We presented a novel Markdown-based chunking method that improves retrieval accu
 
 We thank the anonymous reviewers for their helpful comments.
 """
+
+
+def test_select_diverse_respects_k_and_per_paper_limit():
+    scored = [
+        {"chunk_id": "p1:0", "paper_id": "p1", "score": 0.9, "embedding": [1.0, 0.0]},
+        {"chunk_id": "p1:1", "paper_id": "p1", "score": 0.8, "embedding": [0.9, 0.1]},
+        {"chunk_id": "p2:0", "paper_id": "p2", "score": 0.7, "embedding": [0.0, 1.0]},
+    ]
+    selected = _select_diverse(scored, k=3, per_paper_limit=1)
+    assert len(selected) == 2
+    assert {item["paper_id"] for item in selected} == {"p1", "p2"}
+
+
+def test_select_diverse_handles_candidate_count_below_k():
+    selected = _select_diverse(
+        [{"chunk_id": "p1:0", "paper_id": "p1", "score": 1.0, "embedding": [1.0]}],
+        k=5,
+        per_paper_limit=2,
+    )
+    assert [item["chunk_id"] for item in selected] == ["p1:0"]
+
+
+def test_mixed_tokenizer_supports_chinese_and_english():
+    tokens = tokenize_text("多智能体论文检索 Agentic RAG")
+    assert "多智" in tokens
+    assert "论文" in tokens
+    assert "检索" in tokens
+    assert "agentic" in tokens
+    assert "rag" in tokens
+
+
+def test_chinese_tokens_work_in_hash_embedding():
+    assert any(value != 0.0 for value in _hash_embedding("中文论文检索"))
+
+
+def test_sqlite_fts5_indexes_one_weighted_row_per_parent_chunk(tmp_path: Path):
+    index = _SQLiteBM25Index(tmp_path / "lexical.db")
+    try:
+        index.replace_paper(
+            "paper-1",
+            [{
+                "chunk_id": "paper-1:0",
+                "paper_id": "paper-1",
+                "title": "多智能体论文检索",
+                "keywords": ["RAG", "BM25"],
+                "summary": "结合稀疏与稠密向量的混合检索",
+                "questions": ["如何检索中文论文？"],
+                "body": "系统使用查询重写和重排。",
+            }],
+            source_mtime_ns=1,
+        )
+        index.replace_paper(
+            "paper-2",
+            [{
+                "chunk_id": "paper-2:0",
+                "paper_id": "paper-2",
+                "title": "图像分类",
+                "body": "卷积神经网络视觉识别。",
+            }],
+            source_mtime_ns=2,
+        )
+
+        assert index.count() == 2
+        assert index.search("中文论文检索", top_n=1)[0][0] == "paper-1:0"
+        assert index.search("图像分类", top_n=1, paper_id="paper-2")[0][0] == "paper-2:0"
+        assert index.search("中文论文", top_n=5, paper_id="paper-2") == []
+
+        # Replacing a paper removes stale parent chunks instead of appending duplicates.
+        index.replace_paper(
+            "paper-1",
+            [{
+                "chunk_id": "paper-1:1",
+                "paper_id": "paper-1",
+                "title": "新的检索论文",
+                "body": "持久化倒排索引。",
+            }],
+            source_mtime_ns=3,
+        )
+        assert index.count() == 2
+        assert index.search("多智能体", top_n=5) == []
+        assert index.search("持久化倒排索引", top_n=1)[0][0] == "paper-1:1"
+    finally:
+        index.close()
+
+
+def test_weighted_rrf_normalizes_each_retrieval_family():
+    fused = _weighted_rrf_fuse(
+        [
+            ([[('dense', 0.9)], [('dense', 0.8)]], 0.5),
+            ([[('sparse', 8.0)]], 0.5),
+        ],
+        k=60,
+    )
+
+    assert fused["dense"] == pytest.approx(fused["sparse"])
+
+
+def test_paper_kb_rebuilds_persistent_fts_from_jsonl(tmp_path: Path):
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir(parents=True)
+    (kb_dir / "documents.jsonl").write_text(
+        json.dumps({"paper_id": "p1", "title": "中文论文检索"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (kb_dir / "chunks.jsonl").write_text(
+        json.dumps({
+            "chunk_id": "p1:0",
+            "paper_id": "p1",
+            "text": "持久化 SQLite FTS5 倒排索引",
+            "summary": "中文混合检索",
+            "hypothetical_questions": ["如何检索中文论文？"],
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, enable_hypothetical_retrieval=False),
+    )
+    try:
+        status = kb.get_lexical_status()
+        assert status["backend"] == "sqlite_fts5"
+        assert status["document_count"] == 1
+        assert kb._lexical_index.search("中文论文", top_n=1)[0][0] == "p1:0"
+    finally:
+        kb._lexical_index.close()
+
+
+def test_hybrid_retrieval_exposes_separate_dense_sparse_and_rrf_scores(
+    tmp_path: Path,
+    monkeypatch,
+):
+    class _DenseCollection:
+        def query(self, **kwargs):
+            return {
+                "ids": [["p2:0:summary"]],
+                "metadatas": [[{
+                    "chunk_id": "p2:0",
+                    "paper_id": "p2",
+                    "section": "Method",
+                }]],
+                "documents": [["dense-only summary"]],
+                "distances": [[0.1]],
+            }
+
+    class _EmptyCollection:
+        def query(self, **kwargs):
+            return {"ids": [[]], "metadatas": [[]], "documents": [[]], "distances": [[]]}
+
+    class _ParentCollection:
+        def get(self, *, ids, include):
+            documents = {
+                "p1:0": "中文论文检索使用 BM25。",
+                "p2:0": "Dense semantic retrieval.",
+            }
+            return {
+                "ids": ids,
+                "documents": [documents[item] for item in ids],
+                "metadatas": [{
+                    "paper_id": item.split(":")[0],
+                    "paper_title": item,
+                    "keywords": "[]",
+                    "entities": "[]",
+                    "claims": "[]",
+                } for item in ids],
+                "embeddings": [[1.0, 0.0] for _ in ids],
+            }
+
+    async def _direct_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr("nanobot.agent.paper_kb.asyncio.to_thread", _direct_to_thread)
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, enable_hypothetical_retrieval=False),
+    )
+    try:
+        kb._lexical_index.replace_paper(
+            "p1",
+            [{
+                "chunk_id": "p1:0",
+                "paper_id": "p1",
+                "title": "中文论文检索",
+                "body": "BM25 稀疏倒排索引",
+            }],
+            source_mtime_ns=1,
+        )
+        kb._summary_collection = _DenseCollection()
+        kb._question_collection = _EmptyCollection()
+        kb._chunk_collection = _ParentCollection()
+
+        results = asyncio.run(kb._retrieve_dense_hybrid(
+            query="中文论文检索",
+            top_k=2,
+            per_paper_limit=2,
+            search_mode="hybrid",
+            where_filter=None,
+            use_hybrid=True,
+        ))
+
+        assert {row["chunk_id"] for row in results} == {"p1:0", "p2:0"}
+        assert all(row["score_type"] == "weighted_rrf" for row in results)
+        sparse = next(row for row in results if row["chunk_id"] == "p1:0")
+        dense = next(row for row in results if row["chunk_id"] == "p2:0")
+        assert sparse["bm25_score"] is not None
+        assert sparse["dense_score"] is None
+        assert dense["dense_score"] == pytest.approx(0.9)
+        assert dense["bm25_score"] is None
+    finally:
+        kb._lexical_index.close()
+
+
+@pytest.mark.asyncio
+async def test_default_embedding_fallback_is_explicit(tmp_path: Path):
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    status = kb.get_embedding_status()
+
+    assert status["backend"] == "hash_lexical"
+    assert status["model"] == "hash-lexical-256"
+    assert status["configured_model"] == "text-embedding-3-small"
+    assert status["degraded"] is True
+    assert status["reason"] == "no_semantic_embedding_backend_configured"
+    assert status["dimension"] == 256
+    assert any(await kb.embed_text("中文语义检索"))
+
+
+@pytest.mark.asyncio
+async def test_embedding_error_mode_does_not_silently_hash(tmp_path: Path):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, embedding_fallback="error"),
+    )
+
+    with pytest.raises(RuntimeError, match="No embedding backend is available"):
+        await kb.embed_text("must fail")
+
+
+@pytest.mark.asyncio
+async def test_embedding_api_batches_and_preserves_empty_positions(tmp_path: Path, monkeypatch):
+    calls: list[list[str]] = []
+
+    class _FakeResponse:
+        def __init__(self, texts: list[str]):
+            self._texts = texts
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {"index": index, "embedding": [float(len(text)), float(index + 1)]}
+                    for index, text in enumerate(self._texts)
+                ]
+            }
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url: str, *, headers: dict, json: dict):
+            texts = list(json["input"])
+            calls.append(texts)
+            return _FakeResponse(texts)
+
+    monkeypatch.setattr("nanobot.agent.paper_kb.httpx.AsyncClient", _FakeClient)
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            embedding_api_key="test-key",
+            embedding_batch_size=2,
+        ),
+    )
+
+    vectors = await kb.embed_texts(["one", "two", "", "three"])
+
+    assert calls == [["one", "two"], ["three"]]
+    assert vectors[0] == [3.0, 1.0]
+    assert vectors[1] == [3.0, 2.0]
+    assert vectors[2] == []
+    assert vectors[3] == [5.0, 1.0]
+    assert kb.get_embedding_status()["dimension"] == 2
+
+
+@pytest.mark.asyncio
+async def test_embedding_rejects_dimension_changes_between_batches(tmp_path: Path, monkeypatch):
+    dimensions = iter((2, 3))
+
+    async def _fake_embed_batch(texts: list[str]) -> list[list[float]]:
+        dimension = next(dimensions)
+        return [[1.0] * dimension for _ in texts]
+
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            embedding_api_key="test-key",
+            embedding_batch_size=1,
+        ),
+    )
+    monkeypatch.setattr(kb, "_embed_api_batch", _fake_embed_batch)
+
+    with pytest.raises(RuntimeError, match="Embedding dimension changed from 2 to 3"):
+        await kb.embed_texts(["first", "second"])
+
+    status = kb.get_embedding_status()
+    assert status["degraded"] is True
+    assert "dimension changed" in status["reason"]
+
+
+@pytest.mark.asyncio
+async def test_embedding_api_failure_never_switches_to_hash(tmp_path: Path, monkeypatch):
+    async def _failing_embed_batch(texts: list[str]) -> list[list[float]]:
+        raise TimeoutError("embedding service timed out")
+
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, embedding_api_key="test-key"),
+    )
+    monkeypatch.setattr(kb, "_embed_api_batch", _failing_embed_batch)
+
+    with pytest.raises(RuntimeError, match="embedding service timed out"):
+        await kb.embed_text("query")
+
+    status = kb.get_embedding_status()
+    assert status["backend"] == "openai_compatible_api"
+    assert status["degraded"] is True
+    assert status["dimension"] is None
+
+
+@pytest.mark.asyncio
+async def test_multi_query_retrieval_batches_query_embeddings(tmp_path: Path):
+    class _EmptyCollection:
+        def query(self, **kwargs):
+            return {
+                "ids": [[]],
+                "metadatas": [[]],
+                "documents": [[]],
+                "distances": [[]],
+            }
+
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, enable_hypothetical_retrieval=False),
+    )
+    kb._summary_collection = _EmptyCollection()
+    kb._question_collection = _EmptyCollection()
+    kb.embed_texts = AsyncMock(return_value=[[1.0, 0.0], [0.0, 1.0]])
+
+    results = await kb._retrieve_dense_hybrid(
+        queries=["中文查询", "English query"],
+        top_k=2,
+        per_paper_limit=1,
+        search_mode="hybrid",
+        where_filter=None,
+        use_hybrid=False,
+    )
+
+    assert results == []
+    kb.embed_texts.assert_awaited_once_with(["中文查询", "English query"])
+
+
+def test_parent_chunk_dense_view_batches_multi_query_search(tmp_path: Path, monkeypatch):
+    class _ParentCollection:
+        def __init__(self):
+            self.query_calls = []
+
+        def query(self, **kwargs):
+            self.query_calls.append(kwargs)
+            return {
+                "ids": [["p1:0"], ["p2:0"]],
+                "metadatas": [[{"paper_id": "p1"}], [{"paper_id": "p2"}]],
+                "documents": [["parent one"], ["parent two"]],
+                "distances": [[0.1], [0.2]],
+            }
+
+        def get(self, *, ids, include):
+            return {
+                "ids": ids,
+                "documents": ["hydrated " + chunk_id for chunk_id in ids],
+                "metadatas": [{
+                    "paper_id": chunk_id.split(":")[0],
+                    "paper_title": chunk_id,
+                    "keywords": "[]",
+                    "entities": "[]",
+                    "claims": "[]",
+                } for chunk_id in ids],
+                "embeddings": [[1.0, 0.0] for _ in ids],
+            }
+
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, enable_hypothetical_retrieval=False),
+    )
+    parent_collection = _ParentCollection()
+    kb._chunk_collection = parent_collection
+    kb.embed_texts = AsyncMock(return_value=[[1.0, 0.0], [0.0, 1.0]])
+
+    async def _direct_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr("nanobot.agent.paper_kb.asyncio.to_thread", _direct_to_thread)
+
+    try:
+        results = asyncio.run(kb._retrieve_dense_hybrid(
+            queries=["first query", "second query"],
+            top_k=2,
+            per_paper_limit=1,
+            search_mode="chunks_only",
+            where_filter=None,
+            use_hybrid=False,
+        ))
+    finally:
+        kb._lexical_index.close()
+
+    assert {row["chunk_id"] for row in results} == {"p1:0", "p2:0"}
+    assert all(row["matched_by"] == "chunk" for row in results)
+    assert len(parent_collection.query_calls) == 1
+    assert parent_collection.query_calls[0]["query_embeddings"] == [
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ]
 
 
 class TestMarkdownSemanticChunking:
@@ -217,6 +652,7 @@ class TestPaperKnowledgeBaseWithChroma:
             num_hypothetical_questions=3,
             enable_hypothetical_retrieval=True,
             chroma_persist_dir=str(tmp_path / "chroma"),
+            min_chunk_chars=10,
         )
 
     @pytest.fixture
@@ -278,17 +714,26 @@ class TestPaperKnowledgeBaseWithChroma:
             },
         ]
         
+        original_embed_texts = paper_kb.embed_texts
+        paper_kb.embed_texts = AsyncMock(side_effect=original_embed_texts)
         result = await paper_kb.upsert_semantic_chunks(doc, semantic_chunks, chunk_metadata)
         
         assert result["paper_id"] == "test-paper-001"
         assert result["chunk_count"] == 2
         assert result["question_count"] == 6  # 3 questions per chunk
         assert result["success"] is True
+        assert paper_kb.embed_texts.await_count == 2
+        assert len(paper_kb.embed_texts.await_args_list[0].args[0]) == 2
+        assert len(paper_kb.embed_texts.await_args_list[1].args[0]) == 8
         
         # Verify Chroma collections have data
         assert paper_kb._chunk_collection.count() >= 2
         assert paper_kb._summary_collection.count() >= 2
         assert paper_kb._question_collection.count() >= 6
+        assert result["lexical"]["document_count"] == 2
+        assert paper_kb._lexical_index.count() == 2
+        jsonl_chunks = paper_kb._read_jsonl(paper_kb.chunks_file)
+        assert sum(1 for chunk in jsonl_chunks if chunk.get("paper_id") == "test-paper-001") == 2
 
     @pytest.mark.asyncio
     async def test_retrieve_by_hypothetical_questions(self, paper_kb: PaperKnowledgeBase):
@@ -335,6 +780,40 @@ class TestPaperKnowledgeBaseWithChroma:
         assert "text" in results[0]
         assert "chunk_id" in results[0]
         assert "matched_by" in results[0]  # Should show whether matched by question or summary
+
+    @pytest.mark.asyncio
+    async def test_jsonl_fallback_keeps_semantic_chunks_retrievable(
+        self,
+        paper_kb: PaperKnowledgeBase,
+    ):
+        """A missing Chroma backend must not turn a successful ingest into zero chunks."""
+        paper_kb._chroma_client = None
+        paper_kb._summary_collection = None
+        paper_kb._question_collection = None
+        paper_kb._chunk_collection = None
+
+        result = await paper_kb.upsert_semantic_chunks(
+            {"paper_id": "fallback-001", "title": "Fallback Paper", "year": 2025},
+            [{
+                "section": "Method",
+                "text": "The fallback method stores semantic parent chunks in JSONL.",
+                "heading_path": "Method",
+            }],
+            [{
+                "summary": "A JSONL fallback method.",
+                "hypothetical_questions": ["How does fallback storage work?"],
+                "keywords": ["fallback", "jsonl"],
+            }],
+        )
+
+        assert result["success"] is True
+        assert result["degraded"] is True
+        assert result["chunk_count"] == 1
+        retrieved = await paper_kb.retrieve_by_hypothetical_questions(
+            query="fallback JSONL storage",
+            top_k=1,
+        )
+        assert retrieved[0]["paper_id"] == "fallback-001"
 
     @pytest.mark.asyncio
     async def test_delete_paper_from_chroma(self, paper_kb: PaperKnowledgeBase):

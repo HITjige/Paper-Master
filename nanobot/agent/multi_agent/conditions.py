@@ -56,51 +56,32 @@ def retrieval_conditional(state: MultiAgentState) -> Literal["synthesis", "resea
     Returns:
         Next node name: "synthesis" or "research"
     """
-    # Loop guard: after any research→retrieval cycle, always proceed to
-    # synthesis. Uses loop_guard_count (set by research_node, never cleared
-    # by retrieval_node) rather than post_research_retrieval (which gets
-    # cleared before the conditional runs).
-    loop_guard = int(state.get("loop_guard_count", 0) or 0)
-    if loop_guard > 0:
-        logger.debug(
-            "Retrieval conditional: post-research cycle (guard={}), forcing synthesis",
-            loop_guard,
-        )
+    if state.get("post_research_retrieval"):
+        logger.debug("Retrieval conditional: post-research retrieval, forcing synthesis")
         return "synthesis"
-    
+
+    # An attempted external search is terminal for this retrieval/research
+    # cycle even when arXiv returned no results (or the search tool failed).
+    # Otherwise an insufficient local result would immediately trigger the
+    # same external search again.
+    if state.get("external_search_completed"):
+        logger.debug("Retrieval conditional: external search already attempted, forcing synthesis")
+        return "synthesis"
+
     quality = state.get("retrieval_quality", "insufficient")
     routing_decision = state.get("routing_decision", "")
-    
+
     logger.debug("Retrieval conditional: quality={}", quality)
-    
+
+    # Hybrid means both sources: a sufficient local hit must not bypass the
+    # first external search.
+    if routing_decision == "hybrid" and not state.get("external_search_completed"):
+        return "research"
+
     # If quality is sufficient, proceed to synthesis
     if quality == "sufficient":
         return "synthesis"
     
-    # If insufficient, need external research
-    # But if we're in hybrid mode and already did retrieval,
-    # we still want to do research to get external papers
-    return "research"
-
-
-def hybrid_retrieval_conditional(state: MultiAgentState) -> Literal["research", "synthesis"]:
-    """Route in hybrid mode after retrieval.
-    
-    In hybrid mode, we always do research after retrieval to get external papers,
-    then combine both sources in synthesis.
-    
-    Args:
-        state: Current workflow state
-        
-    Returns:
-        Next node name: "research" or "synthesis"
-    """
-    retrieval_quality = state.get("retrieval_quality", "insufficient")
-    
-    logger.debug("Hybrid retrieval conditional: quality={}", retrieval_quality)
-    
-    # In hybrid mode, we always do research to get external papers
-    # Even if internal retrieval was good, we want both sources
     return "research"
 
 

@@ -13,7 +13,7 @@ from pathlib import Path
 from statistics import mean
 
 from nanobot.agent.paper_kb import PaperKbConfig, PaperKnowledgeBase
-from nanobot.agent.tools.paper import PaperRerankTool, PaperSearchTool
+from nanobot.agent.tools.paper import PaperSearchTool
 
 
 def _recall_at_k(predicted: list[str], expected: set[str], k: int) -> float:
@@ -30,16 +30,25 @@ def _mrr(predicted: list[str], expected: set[str]) -> float:
     return 0.0
 
 
-async def _evaluate_item(search_tool: PaperSearchTool, rerank_tool: PaperRerankTool, item: dict) -> dict:
+async def _evaluate_item(search_tool: PaperSearchTool, item: dict) -> dict:
     query = item.get("query", "")
     expected = set(item.get("relevant_paper_ids", []))
-    raw_search = await search_tool.execute(query=query, max_results=item.get("max_results", 20), top_k=20)
-    search_payload = json.loads(raw_search)
-    candidates = search_payload.get("results", [])
-    reranked_raw = await rerank_tool.execute(query=query, papers=candidates, top_k=item.get("top_k", 10))
-    reranked = json.loads(reranked_raw).get("results", [])
-    predicted_ids = [str(x.get("paper_id", "")) for x in reranked if x.get("paper_id")]
+    if not expected:
+        return {
+            "query": query,
+            "skipped": True,
+            "reason": "missing_relevance_labels",
+        }
     k = int(item.get("top_k", 10))
+    raw_search = await search_tool.execute(
+        query=query,
+        search_topk=int(item.get("search_topk", item.get("max_results", 60))),
+        recall_top_k=max(20, k),
+        rerank_top_k=k,
+    )
+    search_payload = json.loads(raw_search)
+    ranked = search_payload.get("results", [])
+    predicted_ids = [str(x.get("paper_id", "")) for x in ranked if x.get("paper_id")]
     return {
         "query": query,
         "recall_at_k": _recall_at_k(predicted_ids, expected, k),
@@ -52,20 +61,30 @@ async def _evaluate_item(search_tool: PaperSearchTool, rerank_tool: PaperRerankT
 async def main(dataset_path: Path, workspace: Path) -> None:
     data = json.loads(dataset_path.read_text(encoding="utf-8"))
     items = data if isinstance(data, list) else data.get("items", [])
-    kb = PaperKnowledgeBase(workspace, PaperKbConfig(enable=True))
+    kb = PaperKnowledgeBase(workspace, PaperKbConfig(enabled=True))
     search_tool = PaperSearchTool(workspace=workspace, kb=kb)
-    rerank_tool = PaperRerankTool(workspace=workspace, kb=kb)
     reports = []
     for item in items:
-        reports.append(await _evaluate_item(search_tool, rerank_tool, item))
+        reports.append(await _evaluate_item(search_tool, item))
 
-    if not reports:
-        print("No evaluation items found.")
+    labeled = [report for report in reports if not report.get("skipped")]
+    if not labeled:
+        print(json.dumps({
+            "summary": {
+                "count": len(reports),
+                "labeled_count": 0,
+                "skipped_count": len(reports),
+                "error": "No labeled evaluation items found.",
+            },
+            "reports": reports,
+        }, ensure_ascii=False, indent=2))
         return
     summary = {
         "count": len(reports),
-        "avg_recall_at_k": round(mean(x["recall_at_k"] for x in reports), 6),
-        "avg_mrr": round(mean(x["mrr"] for x in reports), 6),
+        "labeled_count": len(labeled),
+        "skipped_count": len(reports) - len(labeled),
+        "avg_recall_at_k": round(mean(x["recall_at_k"] for x in labeled), 6),
+        "avg_mrr": round(mean(x["mrr"] for x in labeled), 6),
     }
     print(json.dumps({"summary": summary, "reports": reports}, ensure_ascii=False, indent=2))
 

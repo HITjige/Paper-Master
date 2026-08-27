@@ -61,37 +61,25 @@ if state.get("research_phase") == "select":
     papers = state["papers_for_selection"]
     selected_ids = [papers[0]["paper_id"], papers[1]["paper_id"]]
     
-    # 更新 state 以触发 ingest 阶段
-    state["user_selected_papers"] = selected_ids
-    state["research_phase"] = "ingest"
-    
-    # 第二次调用 - 执行 ingest 阶段
-    final_state = await graph.graph.ainvoke(state)
+    # 使用公开的 resume 接口恢复，接口会解析 ID/序号/all/skip
+    final_state = await graph.resume(
+        saved_state=state,
+        user_input=", ".join(selected_ids),
+    )
 ```
 
 ### 跳过摄取
 
 ```python
 if state.get("research_phase") == "select":
-    # 用户选择跳过
-    state["user_skip_ingest"] = True
-    # 可以设置一个空列表或保持 user_selected_papers 为空
-    state["user_selected_papers"] = []
-    state["research_phase"] = "ingest"
-    
-    final_state = await graph.graph.ainvoke(state)
+    final_state = await graph.resume(saved_state=state, user_input="skip")
 ```
 
 ### 摄取全部
 
 ```python
 if state.get("research_phase") == "select":
-    # 用户选择全部
-    papers = state["papers_for_selection"]
-    state["user_selected_papers"] = [p["paper_id"] for p in papers]
-    state["research_phase"] = "ingest"
-    
-    final_state = await graph.graph.ainvoke(state)
+    final_state = await graph.resume(saved_state=state, user_input="all")
 ```
 
 ## 选择界面格式
@@ -125,9 +113,9 @@ if state.get("research_phase") == "select":
 
 ## 与现有流程的兼容性
 
-- 如果不使用新字段，系统会保持原有行为（自动摄取 top_k 论文）
+- 正常入口会自动初始化这些字段；外部搜索完成后默认等待用户选择，不会自动摄取 top_k 论文
 - `external_papers` 和 `ingested_papers` 字段仍然可用
-- 可以通过设置 `research_phase` 初始值为 `"ingest"` 来跳过选择过程
+- 建议通过 `graph.resume(...)` 恢复流程，不要直接手工拼装 ingest state
 
 ## 注意事项
 

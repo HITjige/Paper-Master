@@ -68,6 +68,8 @@ class MultiAgentState(TypedDict, total=False):
     sub_queries_detail: List[Dict[str, Any]]  # Full sub_queries structure from unified rewrite (each has rewritten_queries, target_paper, keywords, time_filter)
     requires_clarification: bool  # True if query references are too ambiguous to resolve
     post_research_retrieval: bool  # True after research→retrieval loop, prevents infinite cycle
+    external_search_completed: bool  # True after at least one external search attempt
+    critic_triggered_research: bool  # Supplementary search requested by Critic; do not pause for selection
     referenced_papers: List[Dict[str, str]]  # Papers mentioned in conversation: [{"paper_id", "title"}]
     recent_dialog_context: str
     long_term_memory_context: str
@@ -82,6 +84,7 @@ class MultiAgentState(TypedDict, total=False):
     # === Retrieval Results ===
     retrieval_results: List[Dict[str, Any]]
     retrieval_quality: str         # "sufficient" | "insufficient"
+    embedding_status: Dict[str, Any]
     
     # === External Research ===
     external_papers: List[Dict[str, Any]]
@@ -97,6 +100,7 @@ class MultiAgentState(TypedDict, total=False):
     # === Synthesis ===
     draft_answer: str
     citations: List[str]
+    invalid_citations: List[str]
     
     # === Critic Review ===
     critic_verdict: str            # "passed" | "needs_revision" | "needs_more_info"
@@ -191,6 +195,8 @@ def create_initial_state(
         "sub_queries_detail": [],
         "requires_clarification": False,
         "post_research_retrieval": False,
+        "external_search_completed": False,
+        "critic_triggered_research": False,
         "recent_dialog_context": kwargs.get("recent_dialog_context", ""),
         "long_term_memory_context": kwargs.get("long_term_memory_context", ""),
         "user_profile_context": kwargs.get("user_profile_context", ""),
@@ -200,6 +206,7 @@ def create_initial_state(
         "routing_reasoning": "",
         "retrieval_results": [],
         "retrieval_quality": "",
+        "embedding_status": {},
         "external_papers": [],
         "ingested_papers": [],
         
@@ -212,6 +219,7 @@ def create_initial_state(
         
         "draft_answer": "",
         "citations": [],
+        "invalid_citations": [],
         "critic_verdict": "",
         "critic_issues": [],
         "critic_suggestion": "",

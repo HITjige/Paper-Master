@@ -92,3 +92,6 @@ logs/
 tmp/
 temp/
 *.tmp
+
+# Record
+interview.md

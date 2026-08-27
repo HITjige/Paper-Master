@@ -49,8 +49,7 @@ graph TD
     A[User Question] --> B{KB has relevant knowledge?}
     B -->|Yes| C[kb_retrieve<br/>retrieve chunks]
     B -->|No/Insufficient| D[paper_search<br/>search candidate papers]
-    D --> E[paper_rerank<br/>rank and select]
-    E --> F[Select top-N papers]
+    D --> F[Select top-N papers]
     F --> G[paper_ingest<br/>download + parse + upsert<br/>⚠️ does NOT return knowledge]
     G --> H[kb_retrieve<br/>✅ MUST call to retrieve chunks]
     H --> I[Answer with citations]

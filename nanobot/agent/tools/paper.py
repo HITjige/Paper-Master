@@ -3,23 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import random
 import re
-import time
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
-from typing import Any
-import urllib
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlencode
 
 import httpx
-import hashlib
 from loguru import logger
 
-from nanobot.agent.paper_kb import PaperKnowledgeBase
+from nanobot.agent.paper_kb import PaperKnowledgeBase, tokenize_text
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import (
     ArraySchema,
@@ -30,12 +29,13 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
+from nanobot.security.network import validate_resolved_url, validate_url_target
 from nanobot.utils.document import extract_text
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
-MINERU_TOKEN = "eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiIzMDkwMDk0MCIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3NzEyNTM5NiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiIiwib3BlbklkIjpudWxsLCJ1dWlkIjoiM2RkZGExYzMtNWNhNC00YWRmLThkZGUtN2NlZTMyODRmODUyIiwiZW1haWwiOiIiLCJleHAiOjE3ODQ5MDEzOTZ9.LyGD4DRvRzZffORrZDlcygd0VlylT9jitn0jIkU6t3v2rRxT8xOQW4GyP3YcQsk_VNIwVstA-adePkEwgu8w5Q"
+MAX_PAPER_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 
 def _norm(text: str) -> str:
@@ -43,7 +43,27 @@ def _norm(text: str) -> str:
 
 
 def _tok(text: str) -> set[str]:
-    return {x for x in re.split(r"[^a-zA-Z0-9]+", text.lower()) if x and len(x) > 1}
+    return set(tokenize_text(text))
+
+
+def _safe_paper_id(value: Any) -> str:
+    """Return a filesystem-safe, stable paper identifier."""
+    raw = str(value or "paper")
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._") or "paper"
+    if clean != raw or len(clean) > 120:
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+        clean = f"{clean[:108]}-{digest}"
+    return clean
+
+
+def _valid_extracted_text(text: str, *, min_chars: int = 100) -> bool:
+    """Reject empty or obviously binary/garbled parser output."""
+    clean = (text or "").strip()
+    if len(clean) < min_chars or clean.lower().startswith("[error:"):
+        return False
+    replacement_ratio = clean.count("\ufffd") / max(1, len(clean))
+    printable_ratio = sum(ch.isprintable() or ch in "\n\r\t" for ch in clean) / len(clean)
+    return replacement_ratio < 0.01 and printable_ratio > 0.90
 
 
 async def _parse_arxiv(query: str, keywords: list[str], max_results: int = 20) -> list[dict[str, Any]]:
@@ -58,7 +78,7 @@ async def _parse_arxiv(query: str, keywords: list[str], max_results: int = 20) -
         "sortBy": "submittedDate",
         "sortOrder": "descending"
     }
-    query_string = urllib.parse.urlencode(params)
+    query_string = urlencode(params)
     url = (
         f"https://export.arxiv.org/api/query?{query_string}"
     )
@@ -343,22 +363,62 @@ async def _generate_candidate_queries(
         return result[:num_queries + 1]
 
 
-def _dedupe_papers_by_id(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deduplicate papers by paper_id, keeping the first occurrence.
-    
-    When merging results from multiple queries, the same paper may appear
-    multiple times. This removes duplicates by paper_id, preserving order.
-    """
-    seen_ids: set[str] = set()
-    deduped: list[dict[str, Any]] = []
-    for paper in papers:
-        pid = str(paper.get("paper_id", "") or paper.get("id", "")).strip()
-        if not pid:
-            pid = hashlib.md5(_norm(paper.get("title", "")).encode()).hexdigest()[:12]
-        if pid not in seen_ids:
-            seen_ids.add(pid)
-            deduped.append(paper)
-    return deduped
+def _paper_fusion_key(paper: dict[str, Any]) -> str:
+    """Build a canonical identity for cross-query result fusion."""
+    paper_id = str(paper.get("paper_id", "") or paper.get("id", "")).strip()
+    if paper_id:
+        canonical_id = re.sub(r"^arxiv:", "", paper_id, flags=re.IGNORECASE)
+        versioned_arxiv = re.fullmatch(
+            r"(?P<base>(?:\d{4}\.\d{4,5}|[a-z.-]+/\d{7}))v\d+",
+            canonical_id,
+            flags=re.IGNORECASE,
+        )
+        if versioned_arxiv:
+            canonical_id = versioned_arxiv.group("base")
+        return f"id:{canonical_id.casefold()}"
+    title = _norm(str(paper.get("title", ""))).casefold()
+    return "title:" + hashlib.sha256(title.encode("utf-8")).hexdigest()
+
+
+def _rrf_fuse_paper_rankings(
+    rankings: list[list[dict[str, Any]]],
+    queries: list[str] | None = None,
+    *,
+    k: int = 60,
+) -> list[dict[str, Any]]:
+    """Fuse external query rankings while retaining rank provenance."""
+    records: dict[str, dict[str, Any]] = {}
+    scores: dict[str, float] = {}
+    matches: dict[str, list[dict[str, Any]]] = {}
+
+    for query_index, ranking in enumerate(rankings):
+        seen_in_ranking: set[str] = set()
+        for rank, paper in enumerate(ranking, 1):
+            key = _paper_fusion_key(paper)
+            if key in seen_in_ranking:
+                continue
+            seen_in_ranking.add(key)
+            records.setdefault(key, dict(paper))
+            scores[key] = scores.get(key, 0.0) + 1.0 / (max(1, k) + rank)
+            match: dict[str, Any] = {
+                "query_index": query_index,
+                "rank": rank,
+            }
+            if queries and query_index < len(queries):
+                match["query"] = str(queries[query_index])[:200]
+            matches.setdefault(key, []).append(match)
+
+    max_score = max(scores.values(), default=1.0)
+    fused: list[dict[str, Any]] = []
+    for key, raw_score in scores.items():
+        paper = records[key]
+        paper["query_rrf_score"] = round(raw_score / max(1e-12, max_score), 6)
+        paper["query_rrf_raw_score"] = round(raw_score, 8)
+        paper["query_hit_count"] = len(matches.get(key, []))
+        paper["query_matches"] = matches.get(key, [])
+        fused.append(paper)
+    fused.sort(key=lambda paper: paper.get("query_rrf_raw_score", 0.0), reverse=True)
+    return fused
 
 
 def _extract_keywords_from_query(query: str, top_n: int = 8) -> list[str]:
@@ -413,7 +473,6 @@ class _PaperTool(Tool):
         search_topk=IntegerSchema(60, minimum=1, maximum=100),
         recall_top_k=IntegerSchema(20, minimum=1, maximum=50),
         rerank_top_k=IntegerSchema(5, minimum=1, maximum=20),
-        keywords=ArraySchema(StringSchema("keyword"), description="Optional explicit keywords"),
         required=["query"],
     )
 )
@@ -443,10 +502,23 @@ class PaperSearchTool(_PaperTool):
         
         # Step 1: Use externally-provided candidate queries when available,
         # otherwise generate them via LLM internally
+        keyword_by_query: dict[str, list[str]] = {}
         if candidate_queries:
-            search_queries = [str(q).strip() for q in candidate_queries if q and str(q).strip()]
-            if not search_queries:
-                search_queries = [query]
+            provided_queries = [
+                str(q).strip() for q in candidate_queries if q and str(q).strip()
+            ]
+            for index, candidate_query in enumerate(provided_queries):
+                if keywords and index < len(keywords) and keywords[index]:
+                    keyword_key = re.sub(r"\s+", " ", candidate_query).strip().casefold()
+                    keyword_by_query[keyword_key] = keywords[index]
+            search_queries = []
+            seen_queries: set[str] = set()
+            for candidate_query in provided_queries or [query]:
+                normalized = re.sub(r"\s+", " ", candidate_query).strip()
+                key = normalized.casefold()
+                if normalized and key not in seen_queries:
+                    seen_queries.add(key)
+                    search_queries.append(normalized)
             logger.info("paper_search: using {} external candidate_queries", len(search_queries))
         else:
             search_queries = await _generate_candidate_queries(
@@ -458,26 +530,20 @@ class PaperSearchTool(_PaperTool):
             logger.info("paper_search: original='{}' candidates={}", query[:50], search_queries)
         
         # Step 2: Concurrent retrieval for each candidate query
-        all_papers: list[dict[str, Any]] = []
         per_query_topk = max(search_topk // len(search_queries), 10)
         
         async def _search_one(q: str, i: int) -> list[dict[str, Any]]:
-            auto_kw = [_extract_keywords_from_query(q)]
-            kw = keywords if keywords else auto_kw
-            kw = kw[i] if i < len(kw) else None
+            kw = keyword_by_query.get(q.casefold()) or _extract_keywords_from_query(q)
             # Stagger concurrent requests to reduce arXiv 429 rate-limiting
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(3.0 * i)
             return await _parse_arxiv(q, kw, max_results=per_query_topk)
         
         results_per_query = await asyncio.gather(
             *[_search_one(q, i) for i, q in enumerate(search_queries)]
         )
         
-        for q_results in results_per_query:
-            all_papers.extend(q_results)
-        
-        # Step 3: Deduplicate by paper_id
-        all_papers = _dedupe_papers_by_id(all_papers)
+        # Step 3: Preserve each query's rank and fuse duplicate papers with RRF.
+        all_papers = _rrf_fuse_paper_rankings(results_per_query, search_queries)
         
         if not all_papers:
             logger.info("paper_search: query='{}' source={} results=0", query, source)
@@ -487,6 +553,7 @@ class PaperSearchTool(_PaperTool):
                     "candidate_queries": candidate_queries,
                     "results": [],
                     "reason": "no_results",
+                    "embedding": self.kb.get_embedding_status(),
                     "workflow_hint": "Broaden query and retry. Do not conclude no research exists from a single search.",
                 },
                 ensure_ascii=False,
@@ -503,7 +570,7 @@ class PaperSearchTool(_PaperTool):
         # Step 4: Similarity scoring (coarse ranking)
         sim_tool = PaperSimilarityTool(workspace=self.workspace, kb=self.kb)
         sim_payload = json.loads(
-            await sim_tool.execute(query=query, papers=all_papers, recall_top_k=recall_top_k)
+            await sim_tool.execute(query=query, papers=all_papers, top_k=recall_top_k)
         )
         candidates = sim_payload.get("results", []) if isinstance(sim_payload, dict) else []
         
@@ -527,101 +594,11 @@ class PaperSearchTool(_PaperTool):
                 "deduped_total": len(all_papers),
                 "total": len(ranked),
                 "results": _trim_papers_for_payload(ranked),
+                "embedding": self.kb.get_embedding_status(),
             },
             ensure_ascii=False,
         )
         
-        # Step 1: Use externally-provided candidate queries when available,
-        # otherwise generate them via LLM internally
-        if candidate_queries:
-            search_queries = [str(q).strip() for q in candidate_queries if q and str(q).strip()]
-            if not search_queries:
-                search_queries = [query]
-            logger.info("paper_search: using {} external candidate_queries", len(search_queries))
-        else:
-            search_queries = await _generate_candidate_queries(
-                original_query=query,
-                provider=self.provider,
-                model=self.model,
-                num_queries=num_candidate_queries,
-            )
-            logger.info("paper_search: original='{}' candidates={}", query[:50], search_queries)
-        
-        # Step 2: Concurrent retrieval for each candidate query
-        all_papers: list[dict[str, Any]] = []
-        per_query_topk = max(search_topk // len(search_queries), 10)
-        
-        async def _search_one(q: str, i: int) -> list[dict[str, Any]]:
-            auto_kw = [_extract_keywords_from_query(q)]
-            kw = keywords if keywords else auto_kw
-            kw = kw[i] if i < len(kw) else None
-            # Stagger concurrent requests to reduce arXiv 429 rate-limiting
-            await asyncio.sleep(3.0)
-            return await _parse_arxiv(q, kw, max_results=per_query_topk)
-        
-        results_per_query = await asyncio.gather(
-            *[_search_one(q, i) for i, q in enumerate(search_queries)]
-        )
-        
-        for q_results in results_per_query:
-            all_papers.extend(q_results)
-        
-        # Step 3: Deduplicate by paper_id
-        all_papers = _dedupe_papers_by_id(all_papers)
-        
-        if not all_papers:
-            logger.info("paper_search: query='{}' source={} results=0", query, source)
-            return json.dumps(
-                {
-                    "query": query,
-                    "candidate_queries": candidate_queries,
-                    "results": [],
-                    "reason": "no_results",
-                    "workflow_hint": "Broaden query and retry. Do not conclude no research exists from a single search.",
-                },
-                ensure_ascii=False,
-            )
-        
-        logger.info(
-            "paper_search: query='{}' candidates={} raw_total={} deduped_total={}",
-            query[:50],
-            candidate_queries,
-            sum(len(r) for r in results_per_query),
-            len(all_papers),
-        )
-        
-        # Step 4: Similarity scoring (coarse ranking)
-        sim_tool = PaperSimilarityTool(workspace=self.workspace, kb=self.kb)
-        sim_payload = json.loads(
-            await sim_tool.execute(query=query, papers=all_papers, recall_top_k=recall_top_k)
-        )
-        candidates = sim_payload.get("results", []) if isinstance(sim_payload, dict) else []
-        
-        # Step 5: Final reranking
-        rerank_tool = PaperRerankTool(workspace=self.workspace, kb=self.kb)
-        rerank_payload = json.loads(
-            await rerank_tool.execute(query=query, papers=candidates, top_k=rerank_top_k)
-        )
-        ranked = rerank_payload.get("results", []) if isinstance(rerank_payload, dict) else all_papers
-        next_step = "Use ranked results directly; call paper_ingest for deep internalization."
-        
-        return json.dumps(
-            {
-                "query": query,
-                "candidate_queries": search_queries,
-                "keywords_used": keywords or [_extract_keywords_from_query(query)],
-                "source": source,
-                "next_step": next_step,
-                "result_nonempty": len(all_papers) > 0,
-                "raw_total": sum(len(r) for r in results_per_query),
-                "deduped_total": len(all_papers),
-                "total": len(ranked),
-                "results": _trim_papers_for_payload(ranked),
-            },
-            ensure_ascii=False,
-        )
-
-
 @tool_parameters(
     tool_parameters_schema(
         query=StringSchema("Query text"),
@@ -639,7 +616,7 @@ class PaperSearchTool(_PaperTool):
             min_items=1,
             max_items=200,
         ),
-        recall_top_k=IntegerSchema(10, minimum=1, maximum=20),
+        top_k=IntegerSchema(10, minimum=1, maximum=50),
         required=["query"],
     )
 )
@@ -661,24 +638,34 @@ class PaperSimilarityTool(_PaperTool):
         if not papers:
             return json.dumps(
                 {
-                    "error": "papers or candidate_set_id is required",
+                    "error": "papers is required",
                     "query": query,
                 },
                 ensure_ascii=False,
             )
-        q_emb = await self.kb.embed_text(query)
+        documents = [
+            f"{str(paper.get('title', ''))}\n{str(paper.get('abstract', ''))}"
+            for paper in papers
+        ]
+        vectors = await self.kb.embed_texts([query, *documents])
+        q_emb = vectors[0]
+        document_embeddings = vectors[1:]
         scored: list[dict[str, Any]] = []
         from nanobot.agent.paper_kb import _cosine_similarity  # noqa: PLC2701
 
-        for paper in papers:
+        for paper, document_embedding in zip(papers, document_embeddings):
             title = str(paper.get("title", ""))
             abstract = str(paper.get("abstract", ""))
-            emb = 0.0
-            if q_emb:
-                emb_doc = await self.kb.embed_text(f"{title}\n{abstract}")
-                emb = _cosine_similarity(q_emb, emb_doc) if emb_doc else 0.0
+            emb = _cosine_similarity(q_emb, document_embedding) if q_emb else 0.0
             lexical = _heuristic_similarity(query, title, abstract)
-            score = 0.75 * emb + 0.25 * lexical
+            query_rrf = paper.get("query_rrf_score")
+            if query_rrf is None:
+                score = 0.75 * emb + 0.25 * lexical
+            else:
+                # Multi-query agreement is a useful retrieval prior, but
+                # semantic relevance remains the dominant coarse-rank signal.
+                rrf_prior = min(1.0, max(0.0, float(query_rrf)))
+                score = 0.65 * emb + 0.20 * lexical + 0.15 * rrf_prior
             scored.append({**paper, "similarity_score": round(score, 6)})
         scored.sort(key=lambda x: x.get("similarity_score", 0.0), reverse=True)
         logger.info("paper_similarity: query='{}' candidates={}", query, len(papers))
@@ -686,6 +673,7 @@ class PaperSimilarityTool(_PaperTool):
             {
                 "query": query,
                 "results": _trim_papers_for_payload(scored[:top_k]),
+                "embedding": self.kb.get_embedding_status(),
             },
             ensure_ascii=False,
         )
@@ -694,7 +682,6 @@ class PaperSimilarityTool(_PaperTool):
 @tool_parameters(
     tool_parameters_schema(
         query=StringSchema("Query text"),
-        candidate_set_id=StringSchema("Candidate set id returned by paper_search"),
         papers=ArraySchema(
             ObjectSchema(
                 properties={
@@ -733,7 +720,7 @@ class PaperRerankTool(_PaperTool):
         if not papers:
             return json.dumps(
                 {
-                    "error": "papers or candidate_set_id is required",
+                    "error": "papers is required",
                     "query": query,
                 },
                 ensure_ascii=False,
@@ -742,7 +729,19 @@ class PaperRerankTool(_PaperTool):
         source_prior = {"arxiv": 0.8, "semantic_scholar": 0.9, "pubmed": 1.0, "crossref": 0.7}
         ranked: list[dict[str, Any]] = []
         for p in papers:
-            sim = float(p.get("similarity_score", self.kb.rerank_similarity(query, f"Title: {p.get('title', '')}\nAbstract: {p.get('abstract', '')}")))
+            raw_similarity = p.get("similarity_score")
+            if raw_similarity is None:
+                document = f"Title: {p.get('title', '')}\nAbstract: {p.get('abstract', '')}"
+                try:
+                    raw_similarity = self.kb.rerank_similarity(query, document)
+                except Exception as exc:
+                    logger.debug("paper_rerank: cross-encoder unavailable, using lexical fallback: {}", exc)
+                    raw_similarity = _heuristic_similarity(
+                        query,
+                        str(p.get("title", "")),
+                        str(p.get("abstract", "")),
+                    )
+            sim = float(raw_similarity)
             year = int(p.get("year") or now_year)
             recency = max(0.0, 1.0 - (now_year - year) / 10.0)
             src = str(p.get("source", "arxiv")).lower()
@@ -1437,7 +1436,7 @@ Text excerpt:
 - If nothing to extract for a field, return []""".format(
         num_questions=num_questions,
         section=section,
-        text_excerpt=text if len(text) > 4096 else text,
+        text_excerpt=text[:4096] + ("..." if len(text) > 4096 else ""),
         paper_context=paper_context,
     )
     
@@ -1532,6 +1531,18 @@ Text excerpt:
 
 @tool_parameters(
     tool_parameters_schema(
+        paper=ObjectSchema(
+            properties={
+                "paper_id": StringSchema("paper id"),
+                "title": StringSchema("title"),
+                "url": StringSchema("paper url"),
+                "pdf_url": StringSchema("pdf url"),
+                "source": StringSchema("source"),
+                "year": IntegerSchema(description="year"),
+                "venue": StringSchema("venue"),
+            },
+            required=["title"],
+        ),
         papers=ArraySchema(
             ObjectSchema(
                 properties={
@@ -1552,6 +1563,7 @@ Text excerpt:
         parse_mode=StringSchema("parse mode", enum=["auto", "pdf", "text"]),
         concurrency=IntegerSchema(3, minimum=1, maximum=10),
         summarize=BooleanSchema(description="Summarize sections before upsert", default=True),
+        keep_pdf=BooleanSchema(description="Keep the downloaded PDF after successful parsing", default=False),
     )
 )
 class PaperIngestTool(_PaperTool):
@@ -1562,6 +1574,18 @@ class PaperIngestTool(_PaperTool):
         "After ingestion, you MUST call `kb_retrieve` to query the knowledge base for grounded evidence. "
         "Supports batch parallel ingestion with optional LLM-based summarization."
     )
+
+    def __init__(
+        self,
+        workspace: Path,
+        kb: PaperKnowledgeBase,
+        provider: LLMProvider | None = None,
+        model: str | None = None,
+        *,
+        mineru_api_token: str = "",
+    ) -> None:
+        super().__init__(workspace=workspace, kb=kb, provider=provider, model=model)
+        self.mineru_api_token = mineru_api_token
 
     @property
     def read_only(self) -> bool:
@@ -1632,7 +1656,7 @@ class PaperIngestTool(_PaperTool):
         parse_mode: str = "auto",
         summarize: bool = True,
         use_hypothetical: bool = True,
-        download_pdf: bool = False,
+        keep_pdf: bool = False,
     ) -> dict[str, Any]:
         """Internalize one paper into the knowledge base.
         
@@ -1645,20 +1669,25 @@ class PaperIngestTool(_PaperTool):
         Returns:
             {"status": "ok" | "error", "paper_id", "chunk_count", ...}
         """
-        if "pdf_url" in paper:
-            url = paper["pdf_url"]
-        elif "url" in paper:
-            url = paper["url"].replace("arxiv.org/abs/", "arxiv.org/pdf/") if "arxiv.org" in paper["url"] else paper["url"]
-        else:
-            url = ""
-        if not url or not "pdf" in url.lower():
+        url = str(paper.get("pdf_url") or paper.get("url") or "")
+        if not paper.get("pdf_url") and "arxiv.org" in url:
+            url = url.replace("arxiv.org/abs/", "arxiv.org/pdf/")
+        if not url:
             return {"status": "error", "error": "paper.url or paper.pdf_url is required", "paper": paper}
+
+        url_ok, url_error = validate_url_target(url)
+        if not url_ok:
+            return {"status": "error", "error": f"unsafe_url: {url_error}", "paper": paper}
 
         downloads_dir = self.workspace / "kb" / "downloads"
         downloads_dir.mkdir(parents=True, exist_ok=True)
         paper_id = str(paper.get("paper_id") or "paper")
-        local_pdf = downloads_dir / f"{paper_id}.pdf"
-        local_md = downloads_dir / f"{paper_id}.md"
+        safe_paper_id = _safe_paper_id(paper_id)
+        local_pdf = downloads_dir / f"{safe_paper_id}.pdf"
+        # Keep a .pdf suffix so both MinerU and the local extractor select the
+        # correct parser while the leading dot still marks the file temporary.
+        temp_pdf = downloads_dir / f".{safe_paper_id}.{uuid.uuid4().hex}.part.pdf"
+        local_md = downloads_dir / f"{safe_paper_id}.md"
         text_content = ""
         try:
             async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
@@ -1666,26 +1695,59 @@ class PaperIngestTool(_PaperTool):
                 resp = await client.get(url)
                 resp.raise_for_status()
             data = resp.content
-            if parse_mode in {"auto", "pdf"} and (url.endswith(".pdf") or b"%PDF" in data[:8]):
-                if download_pdf:
-                    local_pdf.write_bytes(data)
+            if len(data) > MAX_PAPER_DOWNLOAD_BYTES:
+                return {
+                    "status": "error",
+                    "error": f"paper exceeds {MAX_PAPER_DOWNLOAD_BYTES // (1024 * 1024)}MB limit",
+                    "paper_id": paper_id,
+                }
+
+            response_url = str(getattr(resp, "url", "") or "")
+            if response_url:
+                redirect_ok, redirect_error = validate_resolved_url(response_url)
+                if not redirect_ok:
+                    return {
+                        "status": "error",
+                        "error": f"unsafe_redirect: {redirect_error}",
+                        "paper_id": paper_id,
+                    }
+
+            headers = getattr(resp, "headers", {}) or {}
+            content_type = str(headers.get("content-type", "")).lower()
+            is_pdf = data.startswith(b"%PDF") or "application/pdf" in content_type
+            if parse_mode == "pdf" and not is_pdf:
+                return {"status": "error", "error": "expected_pdf_content", "paper_id": paper_id}
+
+            if parse_mode in {"auto", "pdf"} and is_pdf:
+                temp_pdf.write_bytes(data)
                 try:
-                    from langchain_mineru import MinerULoader
-                    loader = MinerULoader(source=url, mode="precision", token=MINERU_TOKEN)
-                    docs = loader.load()
-                    text_content = docs[0].page_content if docs else ""
-                except Exception:
-                    logger.warning("paper_ingest: failed to parse PDF through MinerULoader: {}", local_pdf)
-                    if download_pdf:
-                        extracted = extract_text(local_pdf)
-                        text_content = extracted if isinstance(extracted, str) else ""
-            if not text_content:
+                    if self.mineru_api_token:
+                        from langchain_mineru import MinerULoader
+
+                        loader = MinerULoader(
+                            source=str(temp_pdf),
+                            mode="precision",
+                            token=self.mineru_api_token,
+                        )
+                        docs = await asyncio.to_thread(loader.load)
+                        text_content = docs[0].page_content if docs else ""
+                except Exception as exc:
+                    logger.warning("paper_ingest: MinerU parse failed for {}: {}", paper_id, exc)
+
+                if not _valid_extracted_text(text_content):
+                    extracted = await asyncio.to_thread(extract_text, temp_pdf)
+                    text_content = extracted if isinstance(extracted, str) else ""
+
+                if keep_pdf and _valid_extracted_text(text_content):
+                    temp_pdf.replace(local_pdf)
+            elif parse_mode in {"auto", "text"}:
                 try:
-                    text_content = data.decode("utf-8", errors="replace")
-                except Exception:
+                    text_content = data.decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
                     text_content = ""
-            if not text_content.strip():
-                logger.warning("paper_ingest: no text content extracted for paper_id={} url={}", paper_id, url)
+
+            if not _valid_extracted_text(text_content):
+                logger.warning("paper_ingest: invalid extracted text for paper_id={} url={}", paper_id, url)
                 return {"status": "error", "error": "failed_to_parse_content", "paper_id": paper_id, "url": url}
 
             text_content = _remove_noisy_blocks(text_content)
@@ -1771,6 +1833,11 @@ class PaperIngestTool(_PaperTool):
                     "chunk_count": result.get("chunk_count"),
                     "question_count": result.get("question_count"),
                     "mode": "hypothetical",
+                    "storage_backend": result.get("storage_backend", "unknown"),
+                    "degraded": bool(result.get("degraded", False)),
+                    "embedding": result.get("embedding", {}),
+                    "lexical": result.get("lexical", {}),
+                    "degradation_reasons": result.get("degradation_reasons", []),
                     "local_file": str(local_md),
                     "next_step_hint": "After ingestion, call `kb_retrieve(query, top_k=...)` to retrieve relevant knowledge chunks.",
                 }
@@ -1790,22 +1857,33 @@ class PaperIngestTool(_PaperTool):
                     "paper_id": result.get("paper_id"),
                     "chunk_count": result.get("chunk_count"),
                     "mode": "traditional",
+                    "storage_backend": result.get("storage_backend", "jsonl"),
+                    "degraded": bool(result.get("degraded", False)),
+                    "embedding": result.get("embedding", {}),
+                    "lexical": result.get("lexical", {}),
                     "local_file": str(local_md),
                     "next_step_hint": "After ingestion, call `kb_retrieve(query, top_k=...)` to retrieve relevant knowledge chunks.",
                 }
         except Exception as exc:
             logger.warning("paper_ingest: failed to ingest paper_id={} url={} error={}", paper_id, url, exc)
             return {"status": "error", "error": str(exc), "paper_id": paper_id, "url": url}
+        finally:
+            with contextlib.suppress(OSError):
+                temp_pdf.unlink(missing_ok=True)
 
     async def execute(
         self,
+        paper: dict[str, Any] | None = None,
         papers: list[dict[str, Any]] | None = None,
         parse_mode: str = "auto",
         concurrency: int = 3,
         summarize: bool = True,
+        keep_pdf: bool = False,
         **kwargs: Any,
     ) -> str:
         targets: list[dict[str, Any]] = []
+        if isinstance(paper, dict):
+            targets.append(paper)
         if papers:
             targets.extend([p for p in papers if isinstance(p, dict)])
         if not targets:
@@ -1815,14 +1893,24 @@ class PaperIngestTool(_PaperTool):
             )
 
         if len(targets) == 1:
-            result = await self._ingest_one(targets[0], parse_mode=parse_mode, summarize=summarize)
+            result = await self._ingest_one(
+                targets[0],
+                parse_mode=parse_mode,
+                summarize=summarize,
+                keep_pdf=keep_pdf,
+            )
             return json.dumps(result, ensure_ascii=False)
 
         sem = asyncio.Semaphore(max(1, min(concurrency, 10)))
 
         async def _run_one(item: dict[str, Any]) -> dict[str, Any]:
             async with sem:
-                return await self._ingest_one(item, parse_mode=parse_mode, summarize=summarize)
+                return await self._ingest_one(
+                    item,
+                    parse_mode=parse_mode,
+                    summarize=summarize,
+                    keep_pdf=keep_pdf,
+                )
 
         batch = await asyncio.gather(*[_run_one(p) for p in targets])
         succeeded = [r for r in batch if r.get("status") == "ok"]
@@ -1847,7 +1935,7 @@ class PaperIngestTool(_PaperTool):
         prefer_distilled=BooleanSchema(description="Prefer distilled summary chunks", default=True),
         per_paper_limit=IntegerSchema(2, minimum=1, maximum=10),
         retrieval_mode=StringSchema(
-            "Retrieval mode: 'hypothetical' (search via hypothetical questions), 'traditional' (search parent text), 'hybrid' (both)",
+            "Retrieval mode: 'hypothetical' (question view), 'traditional' (parent chunks), 'hybrid' (parent + summary + question views)",
             enum=["hypothetical", "traditional", "hybrid"],
         ),
         required=["query"],
@@ -1860,7 +1948,7 @@ class KBRetrieveTool(_PaperTool):
         "Supports three retrieval modes: "
         "- 'hypothetical': Search via hypothetical question embeddings (HyDE approach, best for natural language queries) "
         "- 'traditional': Search via parent document embeddings directly "
-        "- 'hybrid': Combine both approaches for best recall"
+        "- 'hybrid': Combine parent, summary, and question views for best recall"
     )
 
     async def execute(
@@ -1872,9 +1960,21 @@ class KBRetrieveTool(_PaperTool):
         retrieval_mode: str = "hypothetical",
         **kwargs: Any,
     ) -> str:
-        # Use hypothetical question retrieval if enabled and available
-        if retrieval_mode in ("hypothetical", "hybrid") and self.kb.config.enable_hypothetical_retrieval:
-            search_mode = "hybrid" if retrieval_mode == "hybrid" else "hybrid"
+        search_modes = {
+            "hypothetical": "questions_only",
+            "traditional": "chunks_only",
+            "hybrid": "hybrid",
+        }
+        if retrieval_mode not in search_modes:
+            return json.dumps(
+                {"error": f"Unsupported retrieval_mode: {retrieval_mode}"},
+                ensure_ascii=False,
+            )
+
+        # When Chroma multi-view retrieval is enabled, all public modes use the
+        # same fusion path but activate different vector and FTS fields.
+        if self.kb.config.enable_hypothetical_retrieval:
+            search_mode = search_modes[retrieval_mode]
             results = await self.kb.retrieve_by_hypothetical_questions(
                 query,
                 top_k=top_k,
@@ -1882,9 +1982,10 @@ class KBRetrieveTool(_PaperTool):
                 search_mode=search_mode,
             )
             logger.info(
-                "kb_retrieve (hypothetical): query='{}' mode={} top_k={} per_paper_limit={} hits={}",
+                "kb_retrieve: query='{}' mode={} search_mode={} top_k={} per_paper_limit={} hits={}",
                 query,
                 retrieval_mode,
+                search_mode,
                 top_k,
                 per_paper_limit,
                 len(results),
@@ -1905,4 +2006,13 @@ class KBRetrieveTool(_PaperTool):
                 per_paper_limit,
                 len(results),
             )
-        return json.dumps({"query": query, "results": results}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "query": query,
+                "retrieval_mode": retrieval_mode,
+                "results": results,
+                "embedding": self.kb.get_embedding_status(),
+                "lexical": self.kb.get_lexical_status(),
+            },
+            ensure_ascii=False,
+        )
