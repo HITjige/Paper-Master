@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -502,6 +503,44 @@ def test_parent_chunk_dense_view_batches_multi_query_search(tmp_path: Path, monk
         [1.0, 0.0],
         [0.0, 1.0],
     ]
+
+
+def test_cross_encoder_pairs_are_batched_and_logits_are_normalized(
+    tmp_path: Path,
+    monkeypatch,
+):
+    class _FakeCrossEncoder:
+        def __init__(self):
+            self.calls = []
+
+        def predict(self, pairs):
+            self.calls.append(pairs)
+            return [-2.0, 2.0]
+
+    async def _direct_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr("nanobot.agent.paper_kb.asyncio.to_thread", _direct_to_thread)
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            enable_hypothetical_retrieval=False,
+            rerank_model="fake",
+        ),
+    )
+    kb.rerank_model = _FakeCrossEncoder()
+    try:
+        scores = asyncio.run(kb.rerank_pairs([
+            ("query", "negative"),
+            ("query", "positive"),
+        ]))
+    finally:
+        kb._lexical_index.close()
+
+    assert scores[0] == pytest.approx(1.0 / (1.0 + math.exp(2.0)))
+    assert scores[1] == pytest.approx(1.0 / (1.0 + math.exp(-2.0)))
+    assert len(kb.rerank_model.calls) == 1
 
 
 class TestMarkdownSemanticChunking:

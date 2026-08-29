@@ -89,6 +89,8 @@ class MultiAgentState(TypedDict, total=False):
     # === External Research ===
     external_papers: List[Dict[str, Any]]
     ingested_papers: List[str]     # List of paper_ids successfully ingested
+    external_search_top_k: int
+    external_rerank_top_k: int
     
     # === Research Phase Control (decoupled search & ingest) ===
     research_phase: str            # "search" | "select" | "ingest" | "complete"
@@ -209,6 +211,8 @@ def create_initial_state(
         "embedding_status": {},
         "external_papers": [],
         "ingested_papers": [],
+        "external_search_top_k": cfg.external_search_top_k,
+        "external_rerank_top_k": cfg.external_rerank_top_k,
         
         # Research Phase Control (decoupled search & ingest)
         "research_phase": "search",  # "search" | "select" | "ingest" | "complete"

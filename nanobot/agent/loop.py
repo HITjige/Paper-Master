@@ -281,6 +281,7 @@ class AgentLoop:
                     embedding_model=paper_cfg.embedding_model,
                     embedding_fallback=paper_cfg.embedding_fallback,
                     embedding_batch_size=paper_cfg.embedding_batch_size,
+                    rerank_model=paper_cfg.rerank_model,
                     rrf_k=paper_cfg.rrf_k,
                     dense_rrf_weight=paper_cfg.dense_rrf_weight,
                     sparse_rrf_weight=paper_cfg.sparse_rrf_weight,

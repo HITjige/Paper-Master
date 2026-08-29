@@ -81,3 +81,15 @@ def test_external_query_selection_prefers_non_cjk_translation_when_available():
         "Chinese academic paper retrieval",
     ]) == ["Chinese academic paper retrieval"]
     assert AgentNodes._select_external_queries(["中文论文检索"]) == ["中文论文检索"]
+
+
+def test_external_time_filters_normalize_exact_relative_and_structured_ranges():
+    assert AgentNodes._resolve_external_time_range(
+        ["2024"], "查找 2024 年论文", current_year=2026
+    ) == (2024, 2024)
+    assert AgentNodes._resolve_external_time_range(
+        ["last 2 years"], "latest papers", current_year=2026
+    ) == (2025, 2026)
+    assert AgentNodes._resolve_external_time_range(
+        [{"from_year": 2020, "to_year": 2023}], "papers", current_year=2026
+    ) == (2020, 2023)

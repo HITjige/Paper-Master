@@ -711,7 +711,7 @@ You are an expert academic search query optimizer. Your task is to analyze the u
 
 <rule id="time-filter">
 - ONLY output `time_filter` when the user explicitly specifies a time constraint (e.g., "2026年", "2024", "last 2 years").
-- Format: a year string like "2024" or "2026", or null if no time constraint.
+- Format as `{{"from_year": 2024, "to_year": 2026}}`; either boundary may be null. For a single exact year, set both boundaries to that year. For "last N years", resolve the inclusive range using the current year.
 - Do NOT embed time constraints into `rewritten_queries` — they belong in `time_filter` only.
 </rule>
 
@@ -733,7 +733,7 @@ You are an expert academic search query optimizer. Your task is to analyze the u
       "rewritten_queries": ["string — complete natural-language query for vector retrieval, IN ENGLISH"],
       "target_paper": {{"paper_id": "string or empty", "title": "string or empty"}},
       "keywords": ["string — core academic keywords for BM25 retrieval, IN ENGLISH"],
-      "time_filter": "string or null — year constraint like '2024'"
+      "time_filter": {{"from_year": "integer or null", "to_year": "integer or null"}} or null
     }}
   ]
 }}
@@ -798,19 +798,19 @@ Output:
       "rewritten_queries": ["EEG classification"],
       "target_paper": {{}},
       "keywords": ["EEG", "classification"],
-      "time_filter": "2026"
+      "time_filter": {{"from_year": 2026, "to_year": 2026}}
     }},
     {{
       "rewritten_queries": ["EEG signal classification deep learning methods"],
       "target_paper": {{}},
       "keywords": ["EEG", "classification", "deep learning"],
-      "time_filter": "2026"
+      "time_filter": {{"from_year": 2026, "to_year": 2026}}
     }},
     {{
       "rewritten_queries": ["EEG classification benchmark"],
       "target_paper": {{}},
       "keywords": ["EEG", "classification", "benchmark"],
-      "time_filter": "2026"
+      "time_filter": {{"from_year": 2026, "to_year": 2026}}
     }}
   ]
 }}

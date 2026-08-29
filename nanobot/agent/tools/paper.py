@@ -6,10 +6,13 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import random
 import re
+import time
 import uuid
 import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -36,6 +39,7 @@ if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
 MAX_PAPER_DOWNLOAD_BYTES = 50 * 1024 * 1024
+MAX_ARXIV_RESPONSE_BYTES = 10 * 1024 * 1024
 
 
 def _norm(text: str) -> str:
@@ -66,91 +70,244 @@ def _valid_extracted_text(text: str, *, min_chars: int = 100) -> bool:
     return replacement_ratio < 0.01 and printable_ratio > 0.90
 
 
-async def _parse_arxiv(query: str, keywords: list[str], max_results: int = 20) -> list[dict[str, Any]]:
-    query = f"all:\"{query}\""
-    if keywords:
-        keyword_set = " AND ".join([f'all:"{k}"' for k in keywords])
-        query += f" OR ({keyword_set})"
-    params = {
-        "search_query": query,
-        "start": 0,
-        "max_results": max_results,
-        "sortBy": "submittedDate",
-        "sortOrder": "descending"
-    }
-    query_string = urlencode(params)
-    url = (
-        f"https://export.arxiv.org/api/query?{query_string}"
+@dataclass(slots=True)
+class _ArxivSearchResult:
+    papers: list[dict[str, Any]]
+    status: str
+    query: str
+    sort_by: str
+    attempts: int = 1
+    latency_ms: int = 0
+    error: str = ""
+
+
+class _ArxivRateLimiter:
+    """Serialize request starts so concurrent queries share one rate limit."""
+
+    def __init__(self, min_interval_seconds: float = 3.0):
+        self.min_interval_seconds = max(0.0, min_interval_seconds)
+        self._lock = asyncio.Lock()
+        self._last_request_at = 0.0
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            delay = self.min_interval_seconds - (now - self._last_request_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last_request_at = time.monotonic()
+
+
+def _escape_arxiv_term(value: str) -> str:
+    """Remove query-language control characters while preserving term text."""
+    return _norm(re.sub(r'["\\()\[\]{}]', " ", str(value or "")))
+
+
+def _build_arxiv_query(
+    query: str,
+    keywords: list[str] | None = None,
+    *,
+    from_year: int | None = None,
+    to_year: int | None = None,
+) -> str:
+    """Build a field-aware arXiv query with an optional submitted-date range."""
+    clean_query = _escape_arxiv_term(query)
+    arxiv_id = re.fullmatch(
+        r"(?:arxiv:)?((?:\d{4}\.\d{4,5}|[a-z.-]+/\d{7})(?:v\d+)?)",
+        clean_query,
+        flags=re.IGNORECASE,
     )
-    # arXiv rate-limit policy: max 1 request per 3 seconds.
-    # Exponential backoff with jitter to be a good citizen.
+    if arxiv_id:
+        search_query = f"id:{arxiv_id.group(1)}"
+    else:
+        clauses: list[str] = []
+        if clean_query:
+            clauses.append(f'(ti:"{clean_query}" OR abs:"{clean_query}")')
+        keyword_clauses = []
+        for keyword in keywords or []:
+            clean_keyword = _escape_arxiv_term(keyword)
+            if clean_keyword:
+                keyword_clauses.append(
+                    f'(ti:"{clean_keyword}" OR abs:"{clean_keyword}")'
+                )
+        if keyword_clauses:
+            clauses.append("(" + " AND ".join(keyword_clauses) + ")")
+        search_query = " OR ".join(clauses) or "all:*"
+
+    if from_year is not None or to_year is not None:
+        lower = max(1991, int(from_year or 1991))
+        upper = min(2100, int(to_year or datetime.now().year))
+        if lower > upper:
+            lower, upper = upper, lower
+        search_query = (
+            f"({search_query}) AND "
+            f"submittedDate:[{lower}01010000 TO {upper}12312359]"
+        )
+    return search_query
+
+
+async def _parse_arxiv(
+    query: str,
+    keywords: list[str] | None = None,
+    max_results: int = 20,
+    *,
+    sort_by: str = "relevance",
+    from_year: int | None = None,
+    to_year: int | None = None,
+    start: int = 0,
+    client: httpx.AsyncClient | None = None,
+    rate_limiter: _ArxivRateLimiter | None = None,
+) -> _ArxivSearchResult:
+    """Search arXiv with connection reuse, shared throttling and diagnostics."""
+    if client is None:
+        async with httpx.AsyncClient(
+            timeout=20.0,
+            headers={"User-Agent": "nanobot-paper-search/1.0"},
+        ) as owned_client:
+            return await _parse_arxiv(
+                query,
+                keywords,
+                max_results,
+                sort_by=sort_by,
+                from_year=from_year,
+                to_year=to_year,
+                start=start,
+                client=owned_client,
+                rate_limiter=rate_limiter or _ArxivRateLimiter(),
+            )
+
+    normalized_sort = "submittedDate" if sort_by == "submittedDate" else "relevance"
+    search_query = _build_arxiv_query(
+        query,
+        keywords,
+        from_year=from_year,
+        to_year=to_year,
+    )
+    params = {
+        "search_query": search_query,
+        "start": max(0, int(start)),
+        "max_results": max(1, min(100, int(max_results))),
+        "sortBy": normalized_sort,
+        "sortOrder": "descending",
+    }
+    url = f"https://export.arxiv.org/api/query?{urlencode(params)}"
+    limiter = rate_limiter or _ArxivRateLimiter()
     max_retries = 5
-    base_delay = 3.0
+    started_at = time.monotonic()
+    last_error = ""
 
     for attempt in range(1, max_retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.get(url)
-                if resp.status_code == 429:
-                    raise httpx.HTTPStatusError(
-                        f"429 Too Many Requests (attempt {attempt}/{max_retries})",
-                        request=resp.request,
-                        response=resp,
-                    )
-                resp.raise_for_status()
+            await limiter.wait()
+            response = await client.get(url)
+            if len(response.content) > MAX_ARXIV_RESPONSE_BYTES:
+                raise ValueError("arXiv response exceeded size limit")
+            response.raise_for_status()
 
-            ns = {"atom": "http://www.w3.org/2005/Atom"}
-            root = ET.fromstring(resp.text)
-            results: list[dict[str, Any]] = []
-            for entry in root.findall("atom:entry", ns):
-                paper_id = _norm((entry.findtext("atom:id", "", ns)).split("/")[-1])
-                title = _norm(entry.findtext("atom:title", "", ns))
-                summary = _norm(entry.findtext("atom:summary", "", ns))
-                published = _norm(entry.findtext("atom:published", "", ns))
-                year = None
-                if published:
-                    try:
-                        year = int(published[:4])
-                    except ValueError:
-                        year = None
-                authors = [(_norm(a.findtext("atom:name", "", ns))) for a in entry.findall("atom:author", ns)]
+            namespaces = {
+                "atom": "http://www.w3.org/2005/Atom",
+                "arxiv": "http://arxiv.org/schemas/atom",
+            }
+            root = ET.fromstring(response.text)
+            papers: list[dict[str, Any]] = []
+            for entry in root.findall("atom:entry", namespaces):
+                entry_url = _norm(entry.findtext("atom:id", "", namespaces))
+                paper_id = _norm(entry_url.split("/")[-1])
+                title = _norm(entry.findtext("atom:title", "", namespaces))
+                abstract = _norm(entry.findtext("atom:summary", "", namespaces))
+                published = _norm(entry.findtext("atom:published", "", namespaces))
+                updated = _norm(entry.findtext("atom:updated", "", namespaces))
+                try:
+                    year = int(published[:4]) if published else None
+                except ValueError:
+                    year = None
+                authors = [
+                    _norm(author.findtext("atom:name", "", namespaces))
+                    for author in entry.findall("atom:author", namespaces)
+                ]
                 pdf_url = ""
-                for link in entry.findall("atom:link", ns):
+                for link in entry.findall("atom:link", namespaces):
                     if link.attrib.get("title") == "pdf":
                         pdf_url = link.attrib.get("href", "")
                         break
-                results.append(
-                    {
-                        "paper_id": paper_id,
-                        "title": title,
-                        "abstract": summary,
-                        "url": entry.findtext("atom:id", "", ns),
-                        "pdf_url": pdf_url,
-                        "source": "arxiv",
-                        "published": published,
-                        "year": year,
-                        "authors": [a for a in authors if a],
-                    }
-                )
-            return results
+                categories = [
+                    category.attrib.get("term", "")
+                    for category in entry.findall("atom:category", namespaces)
+                    if category.attrib.get("term")
+                ]
+                primary = entry.find("arxiv:primary_category", namespaces)
+                papers.append({
+                    "paper_id": paper_id,
+                    "title": title,
+                    "abstract": abstract,
+                    "url": entry_url,
+                    "pdf_url": pdf_url,
+                    "source": "arxiv",
+                    "published": published,
+                    "updated": updated,
+                    "year": year,
+                    "authors": [author for author in authors if author],
+                    "categories": categories,
+                    "primary_category": primary.attrib.get("term", "") if primary is not None else "",
+                    "doi": _norm(entry.findtext("arxiv:doi", "", namespaces)),
+                    "journal_ref": _norm(entry.findtext("arxiv:journal_ref", "", namespaces)),
+                    "comment": _norm(entry.findtext("arxiv:comment", "", namespaces)),
+                })
+            return _ArxivSearchResult(
+                papers=papers,
+                status="ok",
+                query=query,
+                sort_by=normalized_sort,
+                attempts=attempt,
+                latency_ms=int((time.monotonic() - started_at) * 1000),
+            )
+        except ET.ParseError as exc:
+            last_error = f"parse_error: {exc}"
+            break
+        except (httpx.HTTPError, ValueError) as exc:
+            last_error = str(exc)
+            status_code = (
+                exc.response.status_code
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None
+                else None
+            )
+            retryable = (
+                status_code in {429, 500, 502, 503, 504}
+                or isinstance(exc, httpx.RequestError)
+            )
+            if not retryable or attempt >= max_retries:
+                break
+            retry_after = 0.0
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                try:
+                    retry_after = float(exc.response.headers.get("Retry-After", "0") or 0)
+                except ValueError:
+                    retry_after = 0.0
+            delay = max(retry_after, min(30.0, 2.0 ** (attempt - 1)))
+            delay += random.uniform(0.0, 0.5)
+            logger.warning(
+                "arXiv request failed (attempt {}/{}), retrying in {:.1f}s: {}",
+                attempt,
+                max_retries,
+                delay,
+                exc,
+            )
+            await asyncio.sleep(delay)
 
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 429 and attempt < max_retries:
-                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1.0)
-                logger.warning(
-                    "arXiv 429 rate-limited (attempt {}/{}), retrying in {:.1f}s",
-                    attempt, max_retries, delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-            logger.warning("arXiv search failed (HTTP {}): {}", exc.response.status_code, exc)
-            return []
-        except Exception as exc:
-            logger.warning("arXiv search failed: {}", exc)
-            return []
-
-    logger.warning("arXiv search exhausted retries for query='{}'", query[:60])
-    return []
+    if last_error.startswith("parse_error:"):
+        status = "parse_error"
+    else:
+        status = "rate_limited" if "429" in last_error else "request_error"
+    logger.warning("arXiv search failed for query='{}': {}", query[:60], last_error)
+    return _ArxivSearchResult(
+        papers=[],
+        status=status,
+        query=query,
+        sort_by=normalized_sort,
+        attempts=attempt,
+        latency_ms=int((time.monotonic() - started_at) * 1000),
+        error=last_error,
+    )
 
 
 def _strip_front_matter(text: str) -> str:
@@ -363,19 +520,25 @@ async def _generate_candidate_queries(
         return result[:num_queries + 1]
 
 
+def _canonical_paper_id(value: Any) -> str:
+    paper_id = re.sub(r"^arxiv:", "", str(value or "").strip(), flags=re.IGNORECASE)
+    versioned_arxiv = re.fullmatch(
+        r"(?P<base>(?:\d{4}\.\d{4,5}|[a-z.-]+/\d{7}))v\d+",
+        paper_id,
+        flags=re.IGNORECASE,
+    )
+    if versioned_arxiv:
+        paper_id = versioned_arxiv.group("base")
+    return paper_id.casefold()
+
+
 def _paper_fusion_key(paper: dict[str, Any]) -> str:
     """Build a canonical identity for cross-query result fusion."""
-    paper_id = str(paper.get("paper_id", "") or paper.get("id", "")).strip()
-    if paper_id:
-        canonical_id = re.sub(r"^arxiv:", "", paper_id, flags=re.IGNORECASE)
-        versioned_arxiv = re.fullmatch(
-            r"(?P<base>(?:\d{4}\.\d{4,5}|[a-z.-]+/\d{7}))v\d+",
-            canonical_id,
-            flags=re.IGNORECASE,
-        )
-        if versioned_arxiv:
-            canonical_id = versioned_arxiv.group("base")
-        return f"id:{canonical_id.casefold()}"
+    canonical_id = _canonical_paper_id(
+        paper.get("paper_id", "") or paper.get("id", "")
+    )
+    if canonical_id:
+        return f"id:{canonical_id}"
     title = _norm(str(paper.get("title", ""))).casefold()
     return "title:" + hashlib.sha256(title.encode("utf-8")).hexdigest()
 
@@ -385,6 +548,8 @@ def _rrf_fuse_paper_rankings(
     queries: list[str] | None = None,
     *,
     k: int = 60,
+    ranking_weights: list[float] | None = None,
+    ranking_labels: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Fuse external query rankings while retaining rank provenance."""
     records: dict[str, dict[str, Any]] = {}
@@ -392,6 +557,13 @@ def _rrf_fuse_paper_rankings(
     matches: dict[str, list[dict[str, Any]]] = {}
 
     for query_index, ranking in enumerate(rankings):
+        ranking_weight = (
+            max(0.0, float(ranking_weights[query_index]))
+            if ranking_weights and query_index < len(ranking_weights)
+            else 1.0
+        )
+        if ranking_weight <= 0:
+            continue
         seen_in_ranking: set[str] = set()
         for rank, paper in enumerate(ranking, 1):
             key = _paper_fusion_key(paper)
@@ -399,13 +571,15 @@ def _rrf_fuse_paper_rankings(
                 continue
             seen_in_ranking.add(key)
             records.setdefault(key, dict(paper))
-            scores[key] = scores.get(key, 0.0) + 1.0 / (max(1, k) + rank)
+            scores[key] = scores.get(key, 0.0) + ranking_weight / (max(1, k) + rank)
             match: dict[str, Any] = {
                 "query_index": query_index,
                 "rank": rank,
             }
             if queries and query_index < len(queries):
                 match["query"] = str(queries[query_index])[:200]
+            if ranking_labels and query_index < len(ranking_labels):
+                match["route"] = ranking_labels[query_index]
             matches.setdefault(key, []).append(match)
 
     max_score = max(scores.values(), default=1.0)
@@ -419,6 +593,63 @@ def _rrf_fuse_paper_rankings(
         fused.append(paper)
     fused.sort(key=lambda paper: paper.get("query_rrf_raw_score", 0.0), reverse=True)
     return fused
+
+
+def _paper_in_time_range(
+    paper: dict[str, Any],
+    from_year: int | None,
+    to_year: int | None,
+) -> bool:
+    if from_year is None and to_year is None:
+        return True
+    try:
+        year = int(paper.get("year"))
+    except (TypeError, ValueError):
+        return False
+    return (from_year is None or year >= from_year) and (to_year is None or year <= to_year)
+
+
+def _select_external_candidate_pool(
+    fused: list[dict[str, Any]],
+    rankings: list[list[dict[str, Any]]],
+    *,
+    budget: int,
+    quota_per_ranking: int = 2,
+) -> list[dict[str, Any]]:
+    """Guarantee minimal route coverage, then fill the pool by fused rank."""
+    budget = max(1, budget)
+    fused_by_key = {_paper_fusion_key(paper): paper for paper in fused}
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ranking in rankings:
+        added = 0
+        for paper in ranking:
+            key = _paper_fusion_key(paper)
+            if key in seen or key not in fused_by_key:
+                continue
+            selected.append(fused_by_key[key])
+            seen.add(key)
+            added += 1
+            if len(selected) >= budget or added >= quota_per_ranking:
+                break
+        if len(selected) >= budget:
+            return selected
+    for paper in fused:
+        key = _paper_fusion_key(paper)
+        if key not in seen:
+            selected.append(paper)
+            seen.add(key)
+            if len(selected) >= budget:
+                break
+    return selected
+
+
+def _query_requests_recency(query: str) -> bool:
+    return bool(re.search(
+        r"(?:最新|近期|最近|近年|newest|latest|recent|state[ -]of[ -]the[ -]art|\bSOTA\b)",
+        query,
+        flags=re.IGNORECASE,
+    ))
 
 
 def _extract_keywords_from_query(query: str, top_n: int = 8) -> list[str]:
@@ -473,6 +704,22 @@ class _PaperTool(Tool):
         search_topk=IntegerSchema(60, minimum=1, maximum=100),
         recall_top_k=IntegerSchema(20, minimum=1, maximum=50),
         rerank_top_k=IntegerSchema(5, minimum=1, maximum=20),
+        candidate_queries=ArraySchema(
+            StringSchema("English search query"),
+            description="Optional prepared query variants",
+            max_items=10,
+        ),
+        exclude_paper_ids=ArraySchema(
+            StringSchema("paper id"),
+            description="Already ingested arXiv IDs to exclude before ranking",
+            max_items=500,
+        ),
+        from_year=IntegerSchema(description="Optional inclusive start year", minimum=1991, maximum=2100),
+        to_year=IntegerSchema(description="Optional inclusive end year", minimum=1991, maximum=2100),
+        sort_mode=StringSchema(
+            "Search mode: relevance, balanced relevance+recency, or auto",
+            enum=["auto", "relevance", "balanced", "recent"],
+        ),
         required=["query"],
     )
 )
@@ -485,6 +732,18 @@ class PaperSearchTool(_PaperTool):
         "Include complete retrieval process including paper_similarity and paper_rerank."
     )
 
+    def __init__(
+        self,
+        workspace: Path,
+        kb: PaperKnowledgeBase,
+        provider: LLMProvider | None = None,
+        model: str | None = None,
+    ):
+        super().__init__(workspace=workspace, kb=kb, provider=provider, model=model)
+        self._search_cache: dict[
+            tuple[Any, ...], tuple[float, _ArxivSearchResult]
+        ] = {}
+
     async def execute(
         self,
         query: str,
@@ -495,6 +754,10 @@ class PaperSearchTool(_PaperTool):
         num_candidate_queries: int = 3,
         candidate_queries: list[str] | None = None,
         keywords: list[list[str]] | None = None,
+        exclude_paper_ids: list[str] | None = None,
+        from_year: int | None = None,
+        to_year: int | None = None,
+        sort_mode: str = "auto",
         **kwargs: Any,
     ) -> str:
         if source != "arxiv":
@@ -529,56 +792,184 @@ class PaperSearchTool(_PaperTool):
             )
             logger.info("paper_search: original='{}' candidates={}", query[:50], search_queries)
         
-        # Step 2: Concurrent retrieval for each candidate query
-        per_query_topk = max(search_topk // len(search_queries), 10)
-        
-        async def _search_one(q: str, i: int) -> list[dict[str, Any]]:
-            kw = keyword_by_query.get(q.casefold()) or _extract_keywords_from_query(q)
-            # Stagger concurrent requests to reduce arXiv 429 rate-limiting
-            await asyncio.sleep(3.0 * i)
-            return await _parse_arxiv(q, kw, max_results=per_query_topk)
-        
-        results_per_query = await asyncio.gather(
-            *[_search_one(q, i) for i, q in enumerate(search_queries)]
+        normalized_sort_mode = sort_mode if sort_mode in {
+            "relevance", "balanced", "recent"
+        } else "auto"
+        prefer_recent = (
+            normalized_sort_mode in {"balanced", "recent"}
+            or (normalized_sort_mode == "auto" and _query_requests_recency(query))
         )
-        
-        # Step 3: Preserve each query's rank and fuse duplicate papers with RRF.
-        all_papers = _rrf_fuse_paper_rankings(results_per_query, search_queries)
-        
+        sort_routes = (
+            [("relevance", 0.6), ("submittedDate", 0.4)]
+            if prefer_recent
+            else [("relevance", 1.0)]
+        )
+        route_specs = [
+            (search_query, sort_by, weight)
+            for search_query in search_queries
+            for sort_by, weight in sort_routes
+        ]
+        per_route_topk = max(
+            5,
+            min(100, math.ceil(max(1, search_topk) / max(1, len(route_specs)))),
+        )
+        excluded_ids = {
+            _canonical_paper_id(paper_id)
+            for paper_id in exclude_paper_ids or []
+            if _canonical_paper_id(paper_id)
+        }
+        limiter = _ArxivRateLimiter()
+        cache_ttl_seconds = 15 * 60
+
+        async with httpx.AsyncClient(
+            timeout=20.0,
+            headers={"User-Agent": "nanobot-paper-search/1.0"},
+        ) as client:
+            async def _search_one_route(
+                search_query: str,
+                sort_by: str,
+            ) -> _ArxivSearchResult:
+                keyword_key = re.sub(r"\s+", " ", search_query).strip().casefold()
+                route_keywords = keyword_by_query.get(keyword_key) or _extract_keywords_from_query(search_query)
+                cache_key = (
+                    keyword_key,
+                    tuple(route_keywords),
+                    sort_by,
+                    from_year,
+                    to_year,
+                    per_route_topk,
+                )
+                cached = self._search_cache.get(cache_key)
+                if cached and cached[0] > time.monotonic():
+                    return cached[1]
+                route_result = await _parse_arxiv(
+                    search_query,
+                    route_keywords,
+                    max_results=per_route_topk,
+                    sort_by=sort_by,
+                    from_year=from_year,
+                    to_year=to_year,
+                    client=client,
+                    rate_limiter=limiter,
+                )
+                # Keep compatibility with light-weight injected test/search adapters.
+                if isinstance(route_result, list):
+                    route_result = _ArxivSearchResult(
+                        papers=route_result,
+                        status="ok",
+                        query=search_query,
+                        sort_by=sort_by,
+                    )
+                if route_result.status == "ok":
+                    self._search_cache[cache_key] = (
+                        time.monotonic() + cache_ttl_seconds,
+                        route_result,
+                    )
+                    if len(self._search_cache) > 256:
+                        now = time.monotonic()
+                        self._search_cache = {
+                            key: value
+                            for key, value in self._search_cache.items()
+                            if value[0] > now
+                        }
+                return route_result
+
+            route_results = await asyncio.gather(*[
+                _search_one_route(search_query, sort_by)
+                for search_query, sort_by, _weight in route_specs
+            ])
+
+        raw_total = sum(len(result.papers) for result in route_results)
+        excluded_total = 0
+        results_per_route: list[list[dict[str, Any]]] = []
+        for result in route_results:
+            filtered_ranking = []
+            for paper in result.papers:
+                if _canonical_paper_id(paper.get("paper_id")) in excluded_ids:
+                    excluded_total += 1
+                    continue
+                if not _paper_in_time_range(paper, from_year, to_year):
+                    continue
+                filtered_ranking.append(paper)
+            results_per_route.append(filtered_ranking)
+
+        route_queries = [spec[0] for spec in route_specs]
+        route_weights = [spec[2] for spec in route_specs]
+        route_labels = [spec[1] for spec in route_specs]
+        fused_papers = _rrf_fuse_paper_rankings(
+            results_per_route,
+            route_queries,
+            ranking_weights=route_weights,
+            ranking_labels=route_labels,
+        )
+        deduped_total = len(fused_papers)
+        all_papers = _select_external_candidate_pool(
+            fused_papers,
+            results_per_route,
+            budget=max(1, search_topk),
+        ) if fused_papers else []
+
+        failed_routes = [result for result in route_results if result.status != "ok"]
+        successful_routes = [result for result in route_results if result.status == "ok"]
+        if failed_routes and successful_routes:
+            search_status = "partial"
+        elif failed_routes:
+            search_status = "error"
+        else:
+            search_status = "ok"
+        route_diagnostics = [
+            {
+                **{key: value for key, value in asdict(result).items() if key != "papers"},
+                "result_count": len(result.papers),
+            }
+            for result in route_results
+        ]
+
         if not all_papers:
-            logger.info("paper_search: query='{}' source={} results=0", query, source)
+            reason = "search_failed" if search_status == "error" else "no_results"
+            logger.info("paper_search: query='{}' source={} results=0 status={}", query, source, search_status)
             return json.dumps(
                 {
                     "query": query,
-                    "candidate_queries": candidate_queries,
+                    "candidate_queries": search_queries,
                     "results": [],
-                    "reason": "no_results",
+                    "reason": reason,
+                    "search_status": search_status,
+                    "route_diagnostics": route_diagnostics,
                     "embedding": self.kb.get_embedding_status(),
-                    "workflow_hint": "Broaden query and retry. Do not conclude no research exists from a single search.",
+                    "workflow_hint": "Broaden query and retry only when the search completed successfully with no results.",
                 },
                 ensure_ascii=False,
             )
-        
+
         logger.info(
-            "paper_search: query='{}' candidates={} raw_total={} deduped_total={}",
+            "paper_search: query='{}' routes={} raw_total={} deduped_total={} excluded={}",
             query[:50],
-            candidate_queries,
-            sum(len(r) for r in results_per_query),
-            len(all_papers),
+            len(route_specs),
+            raw_total,
+            deduped_total,
+            excluded_total,
         )
-        
-        # Step 4: Similarity scoring (coarse ranking)
+
+        # Step 4: all prepared queries participate in the batched semantic coarse rank.
         sim_tool = PaperSimilarityTool(workspace=self.workspace, kb=self.kb)
-        sim_payload = json.loads(
-            await sim_tool.execute(query=query, papers=all_papers, top_k=recall_top_k)
-        )
+        sim_payload = json.loads(await sim_tool.execute(
+            query=query,
+            queries=search_queries,
+            papers=all_papers,
+            top_k=recall_top_k,
+        ))
         candidates = sim_payload.get("results", []) if isinstance(sim_payload, dict) else []
-        
-        # Step 5: Final reranking
+
+        # Step 5: use the configured Cross-Encoder in one batch, if available.
         rerank_tool = PaperRerankTool(workspace=self.workspace, kb=self.kb)
-        rerank_payload = json.loads(
-            await rerank_tool.execute(query=query, papers=candidates, top_k=rerank_top_k)
-        )
+        rerank_payload = json.loads(await rerank_tool.execute(
+            query=query,
+            queries=search_queries,
+            papers=candidates,
+            top_k=rerank_top_k,
+            prefer_recent=prefer_recent,
+        ))
         ranked = rerank_payload.get("results", []) if isinstance(rerank_payload, dict) else all_papers
         next_step = "Use ranked results directly; call paper_ingest for deep internalization."
         
@@ -588,10 +979,15 @@ class PaperSearchTool(_PaperTool):
                 "candidate_queries": search_queries,
                 "keywords_used": keywords or [_extract_keywords_from_query(query)],
                 "source": source,
+                "sort_mode": "balanced" if prefer_recent else "relevance",
                 "next_step": next_step,
                 "result_nonempty": len(all_papers) > 0,
-                "raw_total": sum(len(r) for r in results_per_query),
-                "deduped_total": len(all_papers),
+                "search_status": search_status,
+                "route_diagnostics": route_diagnostics,
+                "raw_total": raw_total,
+                "excluded_total": excluded_total,
+                "deduped_total": deduped_total,
+                "candidate_pool_total": len(all_papers),
                 "total": len(ranked),
                 "results": _trim_papers_for_payload(ranked),
                 "embedding": self.kb.get_embedding_status(),
@@ -602,6 +998,11 @@ class PaperSearchTool(_PaperTool):
 @tool_parameters(
     tool_parameters_schema(
         query=StringSchema("Query text"),
+        queries=ArraySchema(
+            StringSchema("query variant"),
+            description="Optional prepared query variants used for multi-query scoring",
+            max_items=10,
+        ),
         papers=ArraySchema(
             ObjectSchema(
                 properties={
@@ -630,6 +1031,7 @@ class PaperSimilarityTool(_PaperTool):
     async def execute(
         self,
         query: str,
+        queries: list[str] | None = None,
         papers: list[dict[str, Any]] | None = None,
         top_k: int = 10,
         **kwargs: Any,
@@ -643,35 +1045,80 @@ class PaperSimilarityTool(_PaperTool):
                 },
                 ensure_ascii=False,
             )
+        query_variants: list[str] = []
+        seen_queries: set[str] = set()
+        for query_variant in [query, *(queries or [])]:
+            normalized_query = re.sub(r"\s+", " ", str(query_variant or "")).strip()
+            query_key = normalized_query.casefold()
+            if normalized_query and query_key not in seen_queries:
+                seen_queries.add(query_key)
+                query_variants.append(normalized_query)
         documents = [
             f"{str(paper.get('title', ''))}\n{str(paper.get('abstract', ''))}"
             for paper in papers
         ]
-        vectors = await self.kb.embed_texts([query, *documents])
-        q_emb = vectors[0]
-        document_embeddings = vectors[1:]
+        vectors = await self.kb.embed_texts([*query_variants, *documents])
+        query_embeddings = vectors[:len(query_variants)]
+        document_embeddings = vectors[len(query_variants):]
         scored: list[dict[str, Any]] = []
         from nanobot.agent.paper_kb import _cosine_similarity  # noqa: PLC2701
 
         for paper, document_embedding in zip(papers, document_embeddings):
             title = str(paper.get("title", ""))
             abstract = str(paper.get("abstract", ""))
-            emb = _cosine_similarity(q_emb, document_embedding) if q_emb else 0.0
-            lexical = _heuristic_similarity(query, title, abstract)
-            query_rrf = paper.get("query_rrf_score")
-            if query_rrf is None:
-                score = 0.75 * emb + 0.25 * lexical
+            semantic_scores = [
+                _cosine_similarity(query_embedding, document_embedding)
+                if query_embedding and document_embedding else 0.0
+                for query_embedding in query_embeddings
+            ]
+            core_semantic = semantic_scores[0] if semantic_scores else 0.0
+            max_semantic = max(semantic_scores, default=0.0)
+            semantic_relevance = 0.7 * max_semantic + 0.3 * core_semantic
+            lexical_scores = [
+                _heuristic_similarity(query_variant, title, abstract)
+                for query_variant in query_variants
+            ]
+            lexical_relevance = max(lexical_scores, default=0.0)
+            coarse_relevance = 0.85 * semantic_relevance + 0.15 * lexical_relevance
+            rrf_prior = min(1.0, max(0.0, float(paper.get("query_rrf_score", 0.0))))
+            matched_queries = {
+                str(match.get("query", "")).casefold()
+                for match in paper.get("query_matches", [])
+                if match.get("query")
+            }
+            retrieval_query_count = max(1, len(queries or [query]))
+            coverage = min(1.0, len(matched_queries) / retrieval_query_count)
+            if paper.get("query_rrf_score") is None:
+                similarity_score = coarse_relevance
             else:
-                # Multi-query agreement is a useful retrieval prior, but
-                # semantic relevance remains the dominant coarse-rank signal.
-                rrf_prior = min(1.0, max(0.0, float(query_rrf)))
-                score = 0.65 * emb + 0.20 * lexical + 0.15 * rrf_prior
-            scored.append({**paper, "similarity_score": round(score, 6)})
+                similarity_score = (
+                    0.85 * coarse_relevance
+                    + 0.10 * rrf_prior
+                    + 0.05 * coverage
+                )
+            best_query_index = (
+                max(range(len(semantic_scores)), key=semantic_scores.__getitem__)
+                if semantic_scores else 0
+            )
+            scored.append({
+                **paper,
+                "similarity_score": round(similarity_score, 6),
+                "coarse_relevance_score": round(coarse_relevance, 6),
+                "query_similarity_core": round(core_semantic, 6),
+                "query_similarity_max": round(max_semantic, 6),
+                "query_coverage_score": round(coverage, 6),
+                "matched_query": (
+                    query_variants[best_query_index]
+                    if query_variants and best_query_index < len(query_variants)
+                    else query
+                ),
+            })
         scored.sort(key=lambda x: x.get("similarity_score", 0.0), reverse=True)
         logger.info("paper_similarity: query='{}' candidates={}", query, len(papers))
         return json.dumps(
             {
                 "query": query,
+                "queries": query_variants,
                 "results": _trim_papers_for_payload(scored[:top_k]),
                 "embedding": self.kb.get_embedding_status(),
             },
@@ -682,6 +1129,11 @@ class PaperSimilarityTool(_PaperTool):
 @tool_parameters(
     tool_parameters_schema(
         query=StringSchema("Query text"),
+        queries=ArraySchema(
+            StringSchema("query variant"),
+            description="Optional prepared query variants used by the reranker",
+            max_items=10,
+        ),
         papers=ArraySchema(
             ObjectSchema(
                 properties={
@@ -699,21 +1151,28 @@ class PaperSimilarityTool(_PaperTool):
             max_items=300,
         ),
         top_k=IntegerSchema(10, minimum=1, maximum=100),
+        prefer_recent=BooleanSchema(
+            description="Apply a small recency weight in final ranking",
+            default=False,
+        ),
         required=["query"],
     )
 )
 class PaperRerankTool(_PaperTool):
     name = "paper_rerank"
     description = (
-        "Final ranking stage for paper candidates using similarity, recency, and source priors. "
+        "Final ranking stage for paper candidates using semantic relevance, query coverage, "
+        "retrieval consensus, and optional recency. "
         "Use this output for conclusions instead of raw paper_search output."
     )
 
     async def execute(
         self,
         query: str,
+        queries: list[str] | None = None,
         papers: list[dict[str, Any]] | None = None,
         top_k: int = 5,
+        prefer_recent: bool = False,
         **kwargs: Any,
     ) -> str:
         papers = papers or []
@@ -725,34 +1184,78 @@ class PaperRerankTool(_PaperTool):
                 },
                 ensure_ascii=False,
             )
-        now_year = datetime.utcnow().year
-        source_prior = {"arxiv": 0.8, "semantic_scholar": 0.9, "pubmed": 1.0, "crossref": 0.7}
+        query_variants: list[str] = []
+        seen_queries: set[str] = set()
+        for query_variant in [query, *(queries or [])]:
+            normalized_query = re.sub(r"\s+", " ", str(query_variant or "")).strip()
+            query_key = normalized_query.casefold()
+            if normalized_query and query_key not in seen_queries:
+                seen_queries.add(query_key)
+                query_variants.append(normalized_query)
+
+        cross_encoder_scores: list[float] | None = None
+        reranker_name = "coarse_fallback"
+        if self.kb.config.rerank_model and query_variants:
+            pairs = [
+                (
+                    query_variant,
+                    f"Title: {paper.get('title', '')}\nAbstract: {paper.get('abstract', '')}",
+                )
+                for paper in papers
+                for query_variant in query_variants
+            ]
+            try:
+                pair_scores = await self.kb.rerank_pairs(pairs)
+                query_count = len(query_variants)
+                cross_encoder_scores = [
+                    max(pair_scores[index:index + query_count], default=0.0)
+                    for index in range(0, len(pair_scores), query_count)
+                ]
+                reranker_name = "cross_encoder"
+            except Exception as exc:
+                logger.warning("paper_rerank: batch cross-encoder failed, using coarse scores: {}", exc)
+
+        now_year = datetime.now().year
         ranked: list[dict[str, Any]] = []
-        for p in papers:
-            raw_similarity = p.get("similarity_score")
-            if raw_similarity is None:
-                document = f"Title: {p.get('title', '')}\nAbstract: {p.get('abstract', '')}"
-                try:
-                    raw_similarity = self.kb.rerank_similarity(query, document)
-                except Exception as exc:
-                    logger.debug("paper_rerank: cross-encoder unavailable, using lexical fallback: {}", exc)
-                    raw_similarity = _heuristic_similarity(
-                        query,
-                        str(p.get("title", "")),
-                        str(p.get("abstract", "")),
-                    )
-            sim = float(raw_similarity)
-            year = int(p.get("year") or now_year)
-            recency = max(0.0, 1.0 - (now_year - year) / 10.0)
-            src = str(p.get("source", "arxiv")).lower()
-            prior = source_prior.get(src, 0.6)
-            score = 0.6 * sim + 0.25 * recency + 0.15 * prior
-            ranked.append({**p, "rerank_score": round(score, 6)})
+        for paper_index, paper in enumerate(papers):
+            relevance = (
+                cross_encoder_scores[paper_index]
+                if cross_encoder_scores and paper_index < len(cross_encoder_scores)
+                else float(paper.get("coarse_relevance_score", paper.get("similarity_score", 0.0)))
+            )
+            try:
+                year = int(paper.get("year"))
+                recency = min(1.0, max(0.0, 1.0 - (now_year - year) / 10.0))
+            except (TypeError, ValueError):
+                recency = 0.5
+            has_rrf = paper.get("query_rrf_score") is not None
+            has_coverage = paper.get("query_coverage_score") is not None
+            rrf_prior = min(1.0, max(0.0, float(paper.get("query_rrf_score", 0.0))))
+            coverage = min(1.0, max(0.0, float(paper.get("query_coverage_score", 0.0))))
+            recency_weight = 0.15 if prefer_recent else 0.0
+            rrf_weight = 0.10 if has_rrf else 0.0
+            coverage_weight = 0.05 if has_coverage else 0.0
+            relevance_weight = 1.0 - recency_weight - rrf_weight - coverage_weight
+            score = (
+                relevance_weight * relevance
+                + rrf_weight * rrf_prior
+                + coverage_weight * coverage
+                + recency_weight * recency
+            )
+            ranked.append({
+                **paper,
+                "rerank_score": round(score, 6),
+                "rerank_relevance_score": round(relevance, 6),
+                "recency_score": round(recency, 6),
+                "reranker": reranker_name,
+            })
         ranked.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
         logger.info("paper_rerank: query='{}' candidates={} top_k={}", query, len(papers), top_k)
         return json.dumps(
             {
                 "query": query,
+                "queries": query_variants,
+                "reranker": reranker_name,
                 "results": _trim_papers_for_payload(ranked[:top_k]),
                 "total": len(ranked),
             },

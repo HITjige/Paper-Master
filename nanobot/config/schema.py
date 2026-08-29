@@ -232,6 +232,7 @@ class PaperToolsConfig(Base):
     embedding_api_base: str = "https://api.openai.com/v1"
     embedding_fallback: Literal["hash", "error"] = "hash"
     embedding_batch_size: int = Field(default=64, ge=1, le=256)
+    rerank_model: str = ""
     rrf_k: int = Field(default=60, ge=1, le=1000)
     dense_rrf_weight: float = Field(default=0.5, ge=0.0, le=1.0)
     sparse_rrf_weight: float = Field(default=0.5, ge=0.0, le=1.0)

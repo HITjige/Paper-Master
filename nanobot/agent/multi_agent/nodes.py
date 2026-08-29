@@ -10,6 +10,7 @@ import inspect
 import json
 import json_repair
 import re
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from loguru import logger
@@ -304,6 +305,63 @@ class AgentNodes:
             if not re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", query)
         ]
         return non_cjk_queries or queries
+
+    @staticmethod
+    def _resolve_external_time_range(
+        time_filters: list[Any],
+        user_query: str,
+        *,
+        current_year: int | None = None,
+    ) -> tuple[int | None, int | None]:
+        """Normalize LLM time filters into an inclusive year range."""
+        now_year = current_year or datetime.now().year
+        lower_bounds: list[int] = []
+        upper_bounds: list[int] = []
+        combined_text = " ".join([user_query, *[str(value) for value in time_filters]])
+
+        for value in time_filters:
+            if isinstance(value, dict):
+                try:
+                    if value.get("from_year") is not None:
+                        lower_bounds.append(int(value["from_year"]))
+                    if value.get("to_year") is not None:
+                        upper_bounds.append(int(value["to_year"]))
+                except (TypeError, ValueError):
+                    continue
+                continue
+
+            text = str(value or "").strip().lower()
+            if not text:
+                continue
+            last_years = re.search(r"(?:last|past|近|最近)\s*(\d+)\s*(?:years?|年)", text)
+            if last_years:
+                count = max(1, int(last_years.group(1)))
+                lower_bounds.append(now_year - count + 1)
+                upper_bounds.append(now_year)
+                continue
+            years = [int(year) for year in re.findall(r"(?:19|20)\d{2}", text)]
+            if len(years) >= 2:
+                lower_bounds.append(min(years))
+                upper_bounds.append(max(years))
+            elif years:
+                year = years[0]
+                if re.search(r"(?:since|after|from|以来|之后|以后|起)", combined_text, re.IGNORECASE):
+                    lower_bounds.append(year)
+                elif re.search(r"(?:before|until|以前|之前|截至)", combined_text, re.IGNORECASE):
+                    upper_bounds.append(year)
+                else:
+                    lower_bounds.append(year)
+                    upper_bounds.append(year)
+
+        lower = min(lower_bounds) if lower_bounds else None
+        upper = max(upper_bounds) if upper_bounds else None
+        if lower is not None:
+            lower = max(1991, min(2100, lower))
+        if upper is not None:
+            upper = max(1991, min(2100, upper))
+        if lower is not None and upper is not None and lower > upper:
+            lower, upper = upper, lower
+        return lower, upper
 
     @staticmethod
     def _should_trigger_llm_rewrite(
@@ -893,7 +951,16 @@ class AgentNodes:
                     
                     # time_filter
                     time_filter = sq.get("time_filter")
-                    if time_filter:
+                    if isinstance(time_filter, dict):
+                        normalized_time_filter: dict[str, int] = {}
+                        for boundary in ("from_year", "to_year"):
+                            try:
+                                if time_filter.get(boundary) is not None:
+                                    normalized_time_filter[boundary] = int(time_filter[boundary])
+                            except (TypeError, ValueError):
+                                continue
+                        time_filter = normalized_time_filter or None
+                    elif time_filter:
                         time_filter = str(time_filter).strip()
                     else:
                         time_filter = None
@@ -1464,6 +1531,10 @@ class AgentNodes:
         
         user_query = state.get("user_query", "")
         already_ingested = set(state.get("ingested_papers", []))
+        try:
+            already_ingested.update(self.kb.load_docs_meta().keys())
+        except Exception as exc:
+            logger.debug("Research Agent: failed to load persistent KB IDs for exclusion: {}", exc)
         
         try:
             search_tool = self.tools.get("paper_search")
@@ -1484,7 +1555,7 @@ class AgentNodes:
             # ---- Extract keywords and time_filter from sub_queries_detail ----
             sub_queries_detail = state.get("sub_queries_detail", [])
             keywords_by_query: dict[str, list[str]] = {}
-            time_filters: list[str] = []
+            time_filters: list[Any] = []
             if sub_queries_detail and isinstance(sub_queries_detail, list):
                 for sq in sub_queries_detail:
                     if isinstance(sq, dict):
@@ -1500,9 +1571,14 @@ class AgentNodes:
                                 if key and normalized_keywords:
                                     keywords_by_query[key] = normalized_keywords
                         tf = sq.get("time_filter")
-                        if tf and str(tf).strip():
+                        if isinstance(tf, dict) and tf:
+                            time_filters.append(tf)
+                        elif tf and str(tf).strip():
                             time_filters.append(str(tf).strip())
-            time_filter = time_filters[0] if time_filters else None
+            from_year, to_year = self._resolve_external_time_range(
+                time_filters,
+                user_query,
+            )
             
             if keywords_by_query:
                 logger.info(
@@ -1532,58 +1608,83 @@ class AgentNodes:
                 len(search_queries),
                 [q[:50] for q in search_queries],
             )
+            external_search_top_k = min(
+                100,
+                max(1, int(state.get("external_search_top_k", 60) or 60)),
+            )
+            external_recall_top_k = min(50, max(20, self.ingest_limit * 5))
+            external_rerank_top_k = min(
+                20,
+                max(
+                    int(state.get("external_rerank_top_k", 5) or 5),
+                    max(10, self.ingest_limit * 3),
+                ),
+            )
             sr = await search_tool.execute(
                 query=user_query,
                 candidate_queries=search_queries,
                 keywords=aligned_keywords if any(aligned_keywords) else None,
+                exclude_paper_ids=sorted(already_ingested),
+                from_year=from_year,
+                to_year=to_year,
+                sort_mode="auto",
                 source="arxiv",
-                search_topk=60,
-                recall_top_k=20,
-                rerank_top_k=max(10, self.ingest_limit * 3),
+                search_topk=external_search_top_k,
+                recall_top_k=external_recall_top_k,
+                rerank_top_k=external_rerank_top_k,
             )
             search_data = json.loads(sr)
             all_papers = search_data.get("results", [])
             
             # Fallback to original query if multi-query returns nothing
-            if not all_papers and len(search_queries) > 1:
+            if (
+                not all_papers
+                and len(search_queries) > 1
+                and search_data.get("search_status") == "ok"
+            ):
                 logger.warning("Research Agent: Multi-query search returned 0 results, falling back")
+                fallback_query = min(search_queries, key=len)
                 fallback_sr = await search_tool.execute(
                     query=user_query,
-                    candidate_queries=[user_query],
+                    candidate_queries=[fallback_query],
+                    exclude_paper_ids=sorted(already_ingested),
+                    from_year=from_year,
+                    to_year=to_year,
+                    sort_mode="auto",
                     source="arxiv",
-                    search_topk=60,
-                    recall_top_k=20,
-                    rerank_top_k=self.ingest_limit * 2,
+                    search_topk=external_search_top_k,
+                    recall_top_k=min(20, external_recall_top_k),
+                    rerank_top_k=min(
+                        external_rerank_top_k,
+                        max(5, self.ingest_limit * 2),
+                    ),
                 )
                 fallback_data = json.loads(fallback_sr)
+                search_data = fallback_data
                 all_papers = fallback_data.get("results", [])
                 state["rewrite_fallback_used"] = True
             
-            # Filter out already ingested papers
-            if already_ingested:
-                all_papers = [p for p in all_papers if str(p.get("paper_id", "")) not in already_ingested]
-            
-            # Apply time filter
-            if time_filter:
-                try:
-                    filter_year = int(time_filter)
-                    before = len(all_papers)
-                    all_papers = [p for p in all_papers if p.get("year") and int(p.get("year", 0)) >= filter_year]
-                    logger.info(
-                        "Research Agent: time_filter={} filtered {} -> {} papers",
-                        filter_year, before, len(all_papers),
-                    )
-                except (ValueError, TypeError):
-                    logger.warning("Research Agent: Invalid time_filter '{}', skipping", time_filter)
-            
             if not all_papers:
-                logger.warning("Research Agent: No papers found")
+                search_status = str(search_data.get("search_status", "ok"))
+                logger.warning(
+                    "Research Agent: No papers found (external status={})",
+                    search_status,
+                )
+                if search_status in {"error", "partial"}:
+                    state["error_message"] = (
+                        "arXiv search was unavailable or only partially completed; "
+                        "an empty result is not evidence that no relevant papers exist."
+                    )
                 state["papers_for_selection"] = []
                 state["external_papers"] = []
                 state["search_completed"] = True
                 state["external_search_completed"] = True
                 state["research_phase"] = "complete"
-                await self._emit_progress("❌ 未找到相关论文")
+                await self._emit_progress(
+                    "⚠️ arXiv 检索未完整完成，请稍后重试"
+                    if search_status in {"error", "partial"}
+                    else "❌ 未找到相关论文"
+                )
                 return state
             
             # Store results and wait for user selection

@@ -12,6 +12,9 @@ from nanobot.agent.tools.paper import (
     PaperRerankTool,
     PaperSearchTool,
     PaperSimilarityTool,
+    _ArxivRateLimiter,
+    _build_arxiv_query,
+    _parse_arxiv,
     _rrf_fuse_paper_rankings,
 )
 
@@ -21,7 +24,7 @@ async def test_paper_search_returns_ranked_results(tmp_path: Path, monkeypatch):
     kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
     tool = PaperSearchTool(workspace=tmp_path, kb=kb)
 
-    async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20):
+    async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20, **kwargs):
         return [
             {
                 "paper_id": "a1",
@@ -74,6 +77,152 @@ def test_external_multi_query_rrf_rewards_cross_query_agreement():
     ]
 
 
+def test_arxiv_query_builder_uses_fields_exact_id_and_date_range():
+    query = _build_arxiv_query(
+        'RAG") OR all:*',
+        ["scientific QA", "retrieval"],
+        from_year=2024,
+        to_year=2026,
+    )
+    assert 'ti:"RAG OR all:*"' in query
+    assert 'abs:"scientific QA"' in query
+    assert "submittedDate:[202401010000 TO 202612312359]" in query
+    assert _build_arxiv_query("arxiv:2401.12345v2") == "id:2401.12345v2"
+
+
+def test_arxiv_parser_returns_structured_metadata_and_diagnostics():
+    atom = b'''<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom"
+          xmlns:arxiv="http://arxiv.org/schemas/atom">
+      <entry>
+        <id>https://arxiv.org/abs/2401.12345v2</id>
+        <updated>2026-01-03T00:00:00Z</updated>
+        <published>2024-01-02T00:00:00Z</published>
+        <title>Scientific RAG</title>
+        <summary>Retrieval for scientific QA.</summary>
+        <author><name>Alice</name></author>
+        <category term="cs.IR"/>
+        <arxiv:primary_category term="cs.IR"/>
+        <arxiv:doi>10.1000/example</arxiv:doi>
+        <link title="pdf" href="https://arxiv.org/pdf/2401.12345v2"/>
+      </entry>
+    </feed>'''
+
+    class _Response:
+        content = atom
+        text = atom.decode()
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        async def get(self, url):
+            self.url = url
+            return _Response()
+
+    client = _Client()
+    result = asyncio.run(_parse_arxiv(
+        "scientific RAG",
+        ["retrieval"],
+        client=client,
+        rate_limiter=_ArxivRateLimiter(0),
+    ))
+
+    assert result.status == "ok"
+    assert result.papers[0]["paper_id"] == "2401.12345v2"
+    assert result.papers[0]["primary_category"] == "cs.IR"
+    assert result.papers[0]["doi"] == "10.1000/example"
+    assert "sortBy=relevance" in client.url
+
+
+def test_external_search_filters_before_ranking_and_uses_balanced_routes(
+    tmp_path: Path,
+    monkeypatch,
+):
+    calls = []
+
+    async def _fake_parse_arxiv(query, keywords=None, max_results=20, **kwargs):
+        calls.append(kwargs)
+        if kwargs["sort_by"] == "relevance":
+            return [
+                {"paper_id": "2401.00001v1", "title": "already", "abstract": "x", "year": 2024},
+                {"paper_id": "2001.00001v1", "title": "old", "abstract": "x", "year": 2020},
+                {"paper_id": "2402.00001v1", "title": "relevant", "abstract": "RAG", "year": 2024},
+            ]
+        return [
+            {"paper_id": "2501.00001v1", "title": "recent", "abstract": "RAG", "year": 2025},
+        ]
+
+    monkeypatch.setattr("nanobot.agent.tools.paper._parse_arxiv", _fake_parse_arxiv)
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    tool = PaperSearchTool(workspace=tmp_path, kb=kb)
+    payload = json.loads(asyncio.run(tool.execute(
+        query="latest RAG",
+        candidate_queries=["retrieval augmented generation"],
+        exclude_paper_ids=["2401.00001v3"],
+        from_year=2024,
+        to_year=2025,
+        sort_mode="balanced",
+        search_topk=10,
+        recall_top_k=10,
+        rerank_top_k=10,
+    )))
+
+    assert {call["sort_by"] for call in calls} == {"relevance", "submittedDate"}
+    assert {paper["paper_id"] for paper in payload["results"]} == {
+        "2402.00001v1",
+        "2501.00001v1",
+    }
+    assert payload["excluded_total"] == 1
+    assert payload["sort_mode"] == "balanced"
+
+
+def test_multi_query_similarity_uses_translated_variant(tmp_path: Path):
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    kb.embed_texts = AsyncMock(return_value=[
+        [0.0, 0.0],  # Chinese source query (lexical/hash-style mismatch)
+        [1.0, 0.0],  # English rewrite
+        [1.0, 0.0],  # Relevant paper
+        [0.0, 1.0],  # Unrelated paper
+    ])
+    tool = PaperSimilarityTool(workspace=tmp_path, kb=kb)
+    payload = json.loads(asyncio.run(tool.execute(
+        query="论文检索",
+        queries=["academic paper retrieval"],
+        papers=[
+            {"paper_id": "p1", "title": "Academic paper retrieval", "abstract": "RAG"},
+            {"paper_id": "p2", "title": "Image classification", "abstract": "vision"},
+        ],
+        top_k=2,
+    )))
+
+    assert payload["results"][0]["paper_id"] == "p1"
+    assert payload["results"][0]["matched_query"] == "academic paper retrieval"
+    kb.embed_texts.assert_awaited_once()
+
+
+def test_rerank_uses_configured_cross_encoder_in_one_batch(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(rerank_model="fake-cross-encoder")
+        rerank_pairs = AsyncMock(return_value=[0.1, 0.9, 0.8, 0.2])
+
+    kb = _FakeKB()
+    tool = PaperRerankTool(workspace=tmp_path, kb=kb)
+    payload = json.loads(asyncio.run(tool.execute(
+        query="中文问题",
+        queries=["english query"],
+        papers=[
+            {"paper_id": "p1", "title": "one", "abstract": "a", "year": 2024},
+            {"paper_id": "p2", "title": "two", "abstract": "b", "year": 2024},
+        ],
+        top_k=2,
+    )))
+
+    assert payload["reranker"] == "cross_encoder"
+    assert payload["results"][0]["paper_id"] == "p1"
+    assert len(kb.rerank_pairs.await_args.args[0]) == 4
+
+
 def test_kb_retrieve_modes_map_to_distinct_multi_view_searches(tmp_path: Path):
     class _FakeKB:
         config = PaperKbConfig(enable_hypothetical_retrieval=True)
@@ -117,7 +266,7 @@ async def test_similarity_and_rerank_accept_stateless_candidates(tmp_path: Path,
     sim_tool = PaperSimilarityTool(workspace=tmp_path, kb=kb)
     rerank_tool = PaperRerankTool(workspace=tmp_path, kb=kb)
 
-    async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20):
+    async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20, **kwargs):
         return [
             {
                 "paper_id": "b1",
@@ -162,7 +311,7 @@ async def test_paper_search_pipeline_mode(tmp_path: Path, monkeypatch):
     kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
     tool = PaperSearchTool(workspace=tmp_path, kb=kb)
 
-    async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20):
+    async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20, **kwargs):
         return [
             {
                 "paper_id": "c1",

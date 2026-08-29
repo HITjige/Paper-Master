@@ -716,6 +716,7 @@ class PaperKnowledgeBase:
         self.rerank_model = None
         self._jsonl_lock = asyncio.Lock()
         self._embedding_model_lock = asyncio.Lock()
+        self._rerank_model_lock = asyncio.Lock()
         self._embedding_backend = self._resolve_embedding_backend()
         self._embedding_last_error = ""
         self._embedding_dimension: int | None = (
@@ -1142,6 +1143,39 @@ class PaperKnowledgeBase:
         score = self.rerank_model.predict([(query, doc)])[0]
 
         return score
+
+    async def rerank_pairs(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Run the configured Cross-Encoder once for a batch of query/document pairs."""
+        if not pairs:
+            return []
+        if not self.config.rerank_model:
+            raise RuntimeError("No cross-encoder rerank model is configured")
+        if self.rerank_model is None:
+            async with self._rerank_model_lock:
+                if self.rerank_model is None:
+                    from sentence_transformers import CrossEncoder
+
+                    self.rerank_model = await asyncio.to_thread(
+                        CrossEncoder,
+                        self.config.rerank_model,
+                    )
+        raw_scores = await asyncio.to_thread(self.rerank_model.predict, pairs)
+        values = raw_scores.tolist() if hasattr(raw_scores, "tolist") else list(raw_scores)
+        normalized: list[float] = []
+        for raw_score in values:
+            score = float(raw_score)
+            if not math.isfinite(score):
+                score = 0.0
+            elif not 0.0 <= score <= 1.0:
+                # Cross-Encoders commonly return logits; map them to a stable
+                # relevance range before mixing with RRF/recency features.
+                score = 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, score))))
+            normalized.append(score)
+        if len(normalized) != len(pairs):
+            raise RuntimeError(
+                f"Cross-encoder returned {len(normalized)} scores for {len(pairs)} pairs"
+            )
+        return normalized
 
     def split_into_chunks(self, text: str) -> list[str]:
         clean = text.strip()
