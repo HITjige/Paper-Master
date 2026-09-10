@@ -221,6 +221,8 @@ class GitHubCopilotProvider(OpenAICompatProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, object] | None = None,
+        extra_body: dict[str, object] | None = None,
+        response_format: dict[str, object] | None = None,
     ):
         await self._refresh_client_api_key()
         return await super().chat(
@@ -231,6 +233,8 @@ class GitHubCopilotProvider(OpenAICompatProvider):
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,
+            extra_body=extra_body,
+            response_format=response_format,
         )
 
     async def chat_stream(

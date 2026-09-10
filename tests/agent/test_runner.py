@@ -28,6 +28,75 @@ def _make_injection_callback(queue: asyncio.Queue):
     return inject_cb
 
 
+def test_runner_retries_with_tools_after_empty_post_ingest_response(tmp_path):
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock()
+    calls: list[dict] = []
+
+    async def chat_with_retry(*, messages, tools=None, **kwargs):
+        calls.append({"messages": messages, "tools": tools})
+        if len(calls) == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(
+                    id="ingest-1",
+                    name="paper_ingest",
+                    arguments={"paper": {"paper_id": "atm-1"}},
+                )],
+                usage={},
+            )
+        if len(calls) == 2:
+            return LLMResponse(
+                content=None,
+                tool_calls=[],
+                reasoning_content="unfinished internal reasoning",
+                usage={},
+            )
+        if len(calls) == 3:
+            return LLMResponse(
+                content=None,
+                tool_calls=[ToolCallRequest(
+                    id="kb-1",
+                    name="kb_retrieve",
+                    arguments={"query": "ATM performance"},
+                )],
+                usage={},
+            )
+        return LLMResponse(content="grounded final answer", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tool_definitions = [
+        {"type": "function", "function": {"name": "paper_ingest"}},
+        {"type": "function", "function": {"name": "kb_retrieve"}},
+    ]
+    tools.get_definitions.return_value = tool_definitions
+    tools.execute = AsyncMock(side_effect=[
+        '{"status":"ok","paper_id":"atm-1"}',
+        '{"results":[{"paper_id":"atm-1","text":"evidence"}]}',
+    ])
+
+    result = asyncio.run(AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "Explain ATM performance"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=5,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        workspace=tmp_path,
+        session_key="test:post-tool-empty",
+    )))
+
+    assert result.final_content == "grounded final answer"
+    assert len(calls) == 4
+    assert calls[2]["tools"] == tool_definitions
+    assert "call kb_retrieve" in calls[2]["messages"][-1]["content"]
+    assert [call.args[0] for call in tools.execute.await_args_list] == [
+        "paper_ingest",
+        "kb_retrieve",
+    ]
+
+
 def _make_loop(tmp_path):
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
@@ -519,8 +588,10 @@ async def test_runner_uses_specific_message_after_empty_finalization_retry():
     from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
     provider = MagicMock()
+    calls: list[dict] = []
 
     async def chat_with_retry(*, messages, **kwargs):
+        calls.append({"messages": messages, **kwargs})
         return LLMResponse(content=None, tool_calls=[], usage={})
 
     provider.chat_with_retry = chat_with_retry
@@ -538,6 +609,8 @@ async def test_runner_uses_specific_message_after_empty_finalization_retry():
 
     assert result.final_content == EMPTY_FINAL_RESPONSE_MESSAGE
     assert result.stop_reason == "empty_final_response"
+    assert calls[-1]["tools"] is None
+    assert calls[-1]["disable_thinking"] is True
 
 
 @pytest.mark.asyncio

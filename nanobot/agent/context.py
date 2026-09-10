@@ -7,8 +7,10 @@ from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any
 
+from nanobot.agent.context_budget import ContextBudget, ContextBudgetManager
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.config.schema import MemoryConfig
 from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
 from nanobot.utils.prompt_templates import render_template
 
@@ -26,46 +28,146 @@ class ContextBuilder:
         workspace: Path,
         timezone: str | None = None,
         disabled_skills: list[str] | None = None,
+        context_window_tokens: int = 65_536,
+        max_completion_tokens: int = 8192,
+        context_block_limit: int | None = None,
+        memory_config: MemoryConfig | None = None,
     ):
         self.workspace = workspace
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
+        self.memory_config = memory_config or MemoryConfig()
+        self.context_budget = ContextBudgetManager(ContextBudget(
+            context_window_tokens=context_window_tokens,
+            output_reserve_tokens=max_completion_tokens,
+            context_block_limit=context_block_limit,
+        ))
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
         self,
         skill_names: list[str] | None = None,
         channel: str | None = None,
+        memory_query: str = "",
+        memory_scope: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity(channel=channel)]
+        system_cap = max(128, int(
+            self.context_budget.budget.prompt_tokens
+            * self.memory_config.system_prompt_max_ratio
+        ))
+        identity = self.context_budget.truncate_text(
+            self._get_identity(channel=channel),
+            system_cap,
+        )
+        parts = [identity] if identity else []
+        current_tokens = self.context_budget.text_tokens(identity)
+        remaining = max(0, system_cap - current_tokens)
+
+        def _append_optional(
+            title: str | None,
+            content: str,
+            configured_cap: int | None = None,
+        ) -> None:
+            """Append one section without exceeding the shared system budget."""
+            nonlocal remaining
+            if not content or remaining <= 0:
+                return
+            prefix = f"# {title}\n\n" if title else ""
+            separator = "\n\n---\n\n" if parts else ""
+            overhead = self.context_budget.text_tokens(separator + prefix)
+            allowed = remaining - overhead
+            if configured_cap is not None:
+                allowed = min(configured_cap, allowed)
+            if allowed <= 0:
+                return
+            bounded = self.context_budget.truncate_text(content, allowed)
+            if not bounded:
+                return
+            section = prefix + bounded
+            before = self.context_budget.text_tokens("\n\n---\n\n".join(parts))
+            candidate = "\n\n---\n\n".join([*parts, section])
+            delta = max(0, self.context_budget.text_tokens(candidate) - before)
+            if delta > remaining:
+                bounded = self.context_budget.truncate_text(
+                    content,
+                    max(0, allowed - (delta - remaining) - 4),
+                )
+                if not bounded:
+                    return
+                section = prefix + bounded
+                candidate = "\n\n---\n\n".join([*parts, section])
+                delta = max(0, self.context_budget.text_tokens(candidate) - before)
+                if delta > remaining:
+                    return
+            parts.append(section)
+            remaining = max(0, remaining - delta)
 
         bootstrap = self._load_bootstrap_files()
-        if bootstrap:
-            parts.append(bootstrap)
-
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
-            parts.append(f"# Memory\n\n{memory}")
+        _append_optional(None, bootstrap)
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
-            if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+            _append_optional(
+                "Active Skills",
+                self.skills.load_skills_for_context(always_skills),
+            )
 
         skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
         if skills_summary:
-            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+            _append_optional(
+                None,
+                render_template("agent/skills_section.md", skills_summary=skills_summary),
+            )
 
-        entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
+        scopes = self._memory_scopes(memory_scope)
+        if self.memory_config.structured_enabled and memory_query.strip():
+            records = self.memory.search_memory_records(
+                memory_query,
+                scopes=scopes,
+                top_k=self.memory_config.structured_top_k,
+                min_confidence=self.memory_config.min_confidence,
+            )
+            _append_optional(
+                "Relevant Memory",
+                self.memory.render_memory_records(records),
+                self.memory_config.retrieved_memory_max_tokens,
+            )
+
+        memory = self.memory.get_memory_context()
+        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+            _append_optional(
+                "Memory",
+                memory,
+                self.memory_config.pinned_memory_max_tokens,
+            )
+
+        entries = self.memory.read_unprocessed_history(
+            since_cursor=self.memory.get_last_dream_cursor(),
+            scopes=scopes,
+        )
         if entries:
             capped = entries[-self._MAX_RECENT_HISTORY:]
-            parts.append("# Recent History\n\n" + "\n".join(
-                f"- [{e['timestamp']}] {e['content']}" for e in capped
+            recent_lines = [
+                f"- [{entry['timestamp']}] {entry['content']}"
+                for entry in capped
+            ]
+            recent = "\n".join(self.context_budget.take_recent_texts(
+                recent_lines,
+                min(self.memory_config.recent_history_max_tokens, remaining),
             ))
+            _append_optional(
+                "Recent History",
+                recent,
+                self.memory_config.recent_history_max_tokens,
+            )
 
         return "\n\n---\n\n".join(parts)
+
+    def _memory_scopes(self, memory_scope: str | None) -> set[str] | None:
+        if self.memory_config.scope_mode == "workspace":
+            return None
+        return {memory_scope} if memory_scope else set()
 
     def _get_identity(self, channel: str | None = None) -> str:
         """Get the core identity section."""
@@ -152,8 +254,21 @@ class ContextBuilder:
             merged = f"{runtime_ctx}\n\n{user_content}"
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
+        memory_scope = (
+            f"{channel}:{chat_id}"
+            if channel and chat_id
+            else None
+        )
         messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel)},
+            {
+                "role": "system",
+                "content": self.build_system_prompt(
+                    skill_names,
+                    channel=channel,
+                    memory_query=current_message,
+                    memory_scope=memory_scope,
+                ),
+            },
             *history,
         ]
         if messages[-1].get("role") == current_role:

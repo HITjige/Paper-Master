@@ -80,3 +80,37 @@ class TestResolveConfig:
 
         saved = json.loads(config_path.read_text(encoding="utf-8"))
         assert saved["channels"]["telegram"]["token"] == "${MY_TOKEN}"
+
+    @pytest.mark.parametrize(
+        "config_key",
+        ["mineruApiToken", "mineru_api_token", "MINERU_API_TOKEN"],
+    )
+    def test_resolves_mineru_token_from_paper_config(
+        self,
+        tmp_path,
+        monkeypatch,
+        config_key,
+    ):
+        monkeypatch.setenv("TEST_MINERU_TOKEN", "mineru-secret")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "tools": {
+                        "paper": {
+                            config_key: "${TEST_MINERU_TOKEN}",
+                            "mineruLanguage": "ch",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        resolved = resolve_config_env_vars(load_config(config_path))
+
+        assert resolved.tools.paper.mineru_api_token == "mineru-secret"
+        assert resolved.tools.paper.mineru_language == "ch"
+        serialized = resolved.model_dump(mode="json", by_alias=True)
+        assert serialized["tools"]["paper"]["mineruApiToken"] == "mineru-secret"
+        assert "MINERU_API_TOKEN" not in serialized["tools"]["paper"]

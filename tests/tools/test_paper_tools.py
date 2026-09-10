@@ -14,9 +14,37 @@ from nanobot.agent.tools.paper import (
     PaperSimilarityTool,
     _ArxivRateLimiter,
     _build_arxiv_query,
+    _deduplicate_papers_by_identity,
+    _extract_arxiv_ids,
     _parse_arxiv,
     _rrf_fuse_paper_rankings,
+    _select_diverse_papers,
+    _valid_extracted_text,
 )
+
+
+def test_pdf_page_markers_alone_are_not_valid_extracted_text():
+    markers = "\n".join(f"--- Page {page} ---" for page in range(1, 30))
+    assert _valid_extracted_text(markers) is False
+
+
+def test_uploaded_front_matter_extracts_deterministic_identifiers(tmp_path: Path):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, enable_hypothetical_retrieval=False),
+    )
+    tool = PaperIngestTool(workspace=tmp_path, kb=kb)
+    paper = {"metadata_provenance": {"title": "filename"}}
+
+    tool._enrich_deterministic_identifiers(
+        paper,
+        "arXiv: 2405.01234v2\nDOI: 10.1145/1234567.7654321",
+    )
+
+    assert paper["arxiv_id"] == "2405.01234v2"
+    assert paper["doi"] == "10.1145/1234567.7654321"
+    assert paper["year"] == 2024
+    assert paper["metadata_provenance"]["year"] == "arxiv_id"
 
 
 @pytest.mark.asyncio
@@ -77,6 +105,44 @@ def test_external_multi_query_rrf_rewards_cross_query_agreement():
     ]
 
 
+def test_external_paper_identity_dedup_handles_versions_doi_and_title():
+    deduped = _deduplicate_papers_by_identity([
+        {"paper_id": "2401.12345v1", "title": "First title"},
+        {"paper_id": "2401.12345v2", "title": "First title revised"},
+        {"paper_id": "a", "doi": "10.1000/shared", "title": "DOI copy one"},
+        {"paper_id": "b", "doi": "https://doi.org/10.1000/shared", "title": "DOI copy two"},
+        {"paper_id": "c", "title": "Exactly Repeated Paper Title"},
+        {"paper_id": "d", "title": "Exactly repeated-paper title!"},
+    ])
+
+    assert [paper["paper_id"] for paper in deduped] == ["2401.12345v1", "a", "c"]
+
+
+def test_external_paper_mmr_adds_diversity_only_within_new_candidates():
+    selected = _select_diverse_papers([
+        {
+            "paper_id": "p1",
+            "title": "Agent reinforcement learning framework",
+            "abstract": "modular agent reinforcement learning",
+            "rerank_score": 1.0,
+        },
+        {
+            "paper_id": "p2",
+            "title": "Agent reinforcement learning framework variant",
+            "abstract": "modular agent reinforcement learning",
+            "rerank_score": 0.99,
+        },
+        {
+            "paper_id": "p3",
+            "title": "Reinforcement learning evaluation benchmark",
+            "abstract": "datasets metrics evaluation",
+            "rerank_score": 0.90,
+        },
+    ], top_k=2)
+
+    assert [paper["paper_id"] for paper in selected] == ["p1", "p3"]
+
+
 def test_arxiv_query_builder_uses_fields_exact_id_and_date_range():
     query = _build_arxiv_query(
         'RAG") OR all:*',
@@ -88,6 +154,12 @@ def test_arxiv_query_builder_uses_fields_exact_id_and_date_range():
     assert 'abs:"scientific QA"' in query
     assert "submittedDate:[202401010000 TO 202612312359]" in query
     assert _build_arxiv_query("arxiv:2401.12345v2") == "id:2401.12345v2"
+
+
+def test_arxiv_ids_are_extracted_from_wrapped_queries_and_urls():
+    assert _extract_arxiv_ids(
+        "去外部搜索2511.14460v2这篇论文：https://arxiv.org/abs/2401.12345"
+    ) == ["2511.14460v2", "2401.12345"]
 
 
 def test_arxiv_parser_returns_structured_metadata_and_diagnostics():
@@ -133,6 +205,76 @@ def test_arxiv_parser_returns_structured_metadata_and_diagnostics():
     assert result.papers[0]["primary_category"] == "cs.IR"
     assert result.papers[0]["doi"] == "10.1000/example"
     assert "sortBy=relevance" in client.url
+
+
+def test_arxiv_parser_uses_id_list_for_exact_lookup():
+    atom = b'''<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom"></feed>'''
+
+    class _Response:
+        content = atom
+        text = atom.decode()
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        async def get(self, url):
+            self.url = url
+            return _Response()
+
+    client = _Client()
+    asyncio.run(_parse_arxiv(
+        "ignored semantic query",
+        paper_ids=["2511.14460v2"],
+        from_year=2020,
+        to_year=2021,
+        client=client,
+        rate_limiter=_ArxivRateLimiter(0),
+    ))
+
+    assert "id_list=2511.14460v2" in client.url
+    assert "search_query=" not in client.url
+    assert "submittedDate" not in client.url
+
+
+def test_exact_id_search_bypasses_exclusion_and_semantic_rerank(
+    tmp_path: Path,
+    monkeypatch,
+):
+    calls = []
+
+    async def _fake_parse_arxiv(query, keywords=None, max_results=20, **kwargs):
+        calls.append((query, kwargs))
+        return [{
+            "paper_id": "2511.14460v2",
+            "title": "Agent-R1",
+            "abstract": "A unified agentic reinforcement learning framework.",
+            "url": "https://arxiv.org/abs/2511.14460v2",
+            "source": "arxiv",
+            "year": 2025,
+        }]
+
+    monkeypatch.setattr("nanobot.agent.tools.paper._parse_arxiv", _fake_parse_arxiv)
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    tool = PaperSearchTool(workspace=tmp_path, kb=kb)
+    payload = json.loads(asyncio.run(tool.execute(
+        query="去外部搜索2511.14460v2这篇论文",
+        candidate_queries=[
+            "Agent-R1 unified modular framework Agentic RL paper 2511.14460v2",
+            "Agentic reinforcement learning modular framework",
+        ],
+        exclude_paper_ids=["2511.14460v1"],
+        from_year=2020,
+        to_year=2021,
+    )))
+
+    assert payload["sort_mode"] == "exact_id"
+    assert payload["explicit_paper_ids"] == ["2511.14460v2"]
+    assert [paper["paper_id"] for paper in payload["results"]] == ["2511.14460v2"]
+    assert payload["results"][0]["identity_match"] is True
+    assert calls[0][1]["paper_ids"] == ["2511.14460v2"]
+    assert calls[0][1]["from_year"] is None
 
 
 def test_external_search_filters_before_ranking_and_uses_balanced_routes(
@@ -257,6 +399,45 @@ def test_kb_retrieve_modes_map_to_distinct_multi_view_searches(tmp_path: Path):
         )
 
     assert kb.retrieve.await_count == 0
+
+
+def test_kb_retrieve_default_is_hybrid_and_omits_internal_embeddings(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=True)
+
+        def __init__(self):
+            self.retrieve_by_hypothetical_questions = AsyncMock(return_value=[{
+                "chunk_id": f"p1:{index}",
+                "paper_id": "p1",
+                "paper_title": "ATM",
+                "section": "Experiments",
+                "text": "performance evidence " * 500,
+                "embedding": [0.01] * 1024,
+                "score": 0.9 - index * 0.01,
+                "linked_assets": [{
+                    "key": f"table-{index}",
+                    "type": "table",
+                    "caption": "Quantitative performance table",
+                    "content": "<table>metric values</table>" * 200,
+                }],
+            } for index in range(10)])
+
+        def get_embedding_status(self):
+            return {"backend": "test", "degraded": False}
+
+        def get_lexical_status(self):
+            return {"backend": "test", "document_count": 10, "degraded": False}
+
+    kb = _FakeKB()
+    tool = KBRetrieveTool(workspace=tmp_path, kb=kb)
+    raw = asyncio.run(tool.execute(query="ATM 模型性能和实验指标"))
+    payload = json.loads(raw)
+
+    assert payload["retrieval_mode"] == "hybrid"
+    assert kb.retrieve_by_hypothetical_questions.await_args.kwargs["search_mode"] == "hybrid"
+    assert len(raw) <= tool._MAX_MODEL_PAYLOAD_CHARS
+    assert all("embedding" not in result for result in payload["results"])
+    assert payload["returned_hits"] <= payload["total_hits"]
 
 
 @pytest.mark.asyncio
@@ -513,7 +694,7 @@ async def test_paper_ingest_pdf_uses_local_extractor_without_mineru(tmp_path: Pa
     monkeypatch.setattr("nanobot.agent.tools.paper.httpx.AsyncClient", _FakeClient)
     monkeypatch.setattr("nanobot.agent.tools.paper.validate_url_target", lambda url: (True, ""))
     monkeypatch.setattr("nanobot.agent.tools.paper.validate_resolved_url", lambda url: (True, ""))
-    monkeypatch.setattr("nanobot.agent.tools.paper.extract_text", _fake_extract_text)
+    monkeypatch.setattr(ingest, "_extract_pdf_text", _fake_extract_text)
 
     result = json.loads(await ingest.execute(
         paper={

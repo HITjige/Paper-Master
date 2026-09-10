@@ -37,7 +37,7 @@ class SkillsLoader:
             return []
         entries: list[dict[str, str]] = []
         for skill_dir in base.iterdir():
-            if not skill_dir.is_dir():
+            if not skill_dir.is_dir() or skill_dir.name.startswith("."):
                 continue
             skill_file = skill_dir / "SKILL.md"
             if not skill_file.exists():

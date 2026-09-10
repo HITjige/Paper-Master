@@ -3,25 +3,48 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import re
+import sqlite3
+import tempfile
+import threading
+import uuid
 import weakref
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
-from nanobot.utils.prompt_templates import render_template
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think
-
+from nanobot.agent.context_budget import ContextBudget
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.skill_lifecycle import SkillCandidateManager
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.utils.gitstore import GitStore
+from nanobot.utils.helpers import (
+    ensure_dir,
+    estimate_message_tokens,
+    estimate_prompt_tokens_chain,
+    strip_think,
+)
+from nanobot.utils.prompt_templates import render_template
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import Session, SessionManager
+
+
+_HISTORY_LOCKS: dict[str, threading.RLock] = {}
+_HISTORY_LOCKS_GUARD = threading.Lock()
+
+
+def _shared_history_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _HISTORY_LOCKS_GUARD:
+        return _HISTORY_LOCKS.setdefault(key, threading.RLock())
 
 
 # ---------------------------------------------------------------------------
@@ -45,17 +68,23 @@ class MemoryStore:
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
+        self.history_lock_file = self.memory_dir / ".history.lock"
+        self.structured_db = self.memory_dir / "memory.sqlite3"
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
         self.soul_file = workspace / "SOUL.md"
         self.user_file = workspace / "USER.md"
         # 游标文件（用于标记处理到哪一条了）
         self._cursor_file = self.memory_dir / ".cursor"
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
+        self._history_lock = _shared_history_lock(self.history_file)
+        self._structured_lock = _shared_history_lock(self.structured_db)
+        self._fts_available = False
         # 把 MEMORY.md 和 USER.md 交给内置的微型 Git 客户端托管，防止这些重要文件被意外改乱。
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md",
         ])
         self._maybe_migrate_legacy_history()
+        self._init_structured_store()
 
     @property
     def git(self) -> GitStore:
@@ -69,6 +98,120 @@ class MemoryStore:
             return path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return ""
+
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as output:
+                temp_name = output.name
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temp_name, path)
+            try:
+                directory_fd = os.open(
+                    path.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                # File fsync + atomic replace is still the best available
+                # fallback on platforms that cannot fsync directories.
+                pass
+        finally:
+            if temp_name:
+                Path(temp_name).unlink(missing_ok=True)
+
+    @contextmanager
+    def _history_write_guard(self):
+        """Serialize history/cursor mutations in-process and across POSIX workers."""
+        with self._history_lock:
+            lock_handle = self.history_lock_file.open("a+", encoding="utf-8")
+            try:
+                try:
+                    import fcntl
+
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                except (ImportError, OSError):
+                    pass
+                yield
+            finally:
+                try:
+                    import fcntl
+
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                except (ImportError, OSError):
+                    pass
+                lock_handle.close()
+
+    def _connect_structured(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.structured_db, timeout=10.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        return connection
+
+    def _init_structured_store(self) -> None:
+        with self._structured_lock, self._connect_structured() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_records (
+                    id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    subject TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.7,
+                    evidence_json TEXT NOT NULL DEFAULT '[]',
+                    source_cursor INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    valid_from TEXT,
+                    expires_at TEXT,
+                    supersedes TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    content_hash TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_identity
+                ON memory_records(scope, kind, content_hash)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_scope_status
+                ON memory_records(scope, status)
+                """
+            )
+            try:
+                connection.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                        id UNINDEXED,
+                        subject,
+                        content,
+                        tokenize='unicode61'
+                    )
+                    """
+                )
+                self._fts_available = True
+            except sqlite3.OperationalError:
+                logger.warning("SQLite FTS5 unavailable; structured memory uses lexical fallback")
 
     def _maybe_migrate_legacy_history(self) -> None:
         """One-time upgrade from legacy HISTORY.md to history.jsonl.
@@ -95,10 +238,10 @@ class MemoryStore:
             if entries:
                 self._write_entries(entries)
                 last_cursor = entries[-1]["cursor"]
-                self._cursor_file.write_text(str(last_cursor), encoding="utf-8")
+                self._atomic_write_text(self._cursor_file, str(last_cursor))
                 # Default to "already processed" so upgrades do not replay the
                 # user's entire historical archive into Dream on first start.
-                self._dream_cursor_file.write_text(str(last_cursor), encoding="utf-8")
+                self._atomic_write_text(self._dream_cursor_file, str(last_cursor))
 
             backup_path = self._next_legacy_backup_path()
             self.legacy_history_file.replace(backup_path)
@@ -197,7 +340,7 @@ class MemoryStore:
         return self.read_file(self.memory_file)
 
     def write_memory(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+        self._atomic_write_text(self.memory_file, content)
 
     # -- SOUL.md -------------------------------------------------------------
 
@@ -205,7 +348,7 @@ class MemoryStore:
         return self.read_file(self.soul_file)
 
     def write_soul(self, content: str) -> None:
-        self.soul_file.write_text(content, encoding="utf-8")
+        self._atomic_write_text(self.soul_file, content)
 
     # -- USER.md -------------------------------------------------------------
 
@@ -213,7 +356,7 @@ class MemoryStore:
         return self.read_file(self.user_file)
 
     def write_user(self, content: str) -> None:
-        self.user_file.write_text(content, encoding="utf-8")
+        self._atomic_write_text(self.user_file, content)
 
     # -- context injection (used by context.py) ------------------------------
 
@@ -221,17 +364,397 @@ class MemoryStore:
         long_term = self.read_memory()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 
+    # -- structured long-term memory ---------------------------------------
+
+    @staticmethod
+    def _memory_tokens(text: str) -> set[str]:
+        lowered = text.lower()
+        tokens = set(re.findall(r"[a-z0-9][a-z0-9_.:/-]{1,}", lowered))
+        for run in re.findall(r"[\u3400-\u9fff]+", lowered):
+            if len(run) == 1:
+                tokens.add(run)
+            else:
+                tokens.update(run[index:index + 2] for index in range(len(run) - 1))
+        return tokens
+
+    def upsert_memory_record(
+        self,
+        *,
+        scope: str,
+        kind: str,
+        content: str,
+        subject: str = "",
+        confidence: float = 0.7,
+        evidence: list[dict[str, Any]] | None = None,
+        source_cursor: int | None = None,
+        valid_from: str | None = None,
+        expires_at: str | None = None,
+        supersedes: str | None = None,
+        status: str = "active",
+    ) -> str:
+        """Idempotently store a scoped memory record with provenance."""
+        with self._structured_lock, self._connect_structured() as connection:
+            return self._upsert_memory_record(
+                connection,
+                scope=scope,
+                kind=kind,
+                content=content,
+                subject=subject,
+                confidence=confidence,
+                evidence=evidence,
+                source_cursor=source_cursor,
+                valid_from=valid_from,
+                expires_at=expires_at,
+                supersedes=supersedes,
+                status=status,
+            )
+
+    def _upsert_memory_record(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        scope: str,
+        kind: str,
+        content: str,
+        subject: str = "",
+        confidence: float = 0.7,
+        evidence: list[dict[str, Any]] | None = None,
+        source_cursor: int | None = None,
+        valid_from: str | None = None,
+        expires_at: str | None = None,
+        supersedes: str | None = None,
+        status: str = "active",
+    ) -> str:
+        """Upsert one record using the caller's transaction."""
+        normalized = re.sub(r"\s+", " ", content).strip()
+        if not normalized:
+            raise ValueError("Structured memory content cannot be empty")
+        normalized_scope = scope.strip() or "workspace"
+        normalized_kind = kind.strip().lower() or "fact"
+        content_hash = hashlib.sha256(normalized.casefold().encode("utf-8")).hexdigest()
+        now = datetime.now().astimezone().isoformat()
+        record_id = f"mem_{uuid.uuid4().hex}"
+        evidence_json = json.dumps(evidence or [], ensure_ascii=False)
+        bounded_confidence = min(1.0, max(0.0, float(confidence)))
+        existing = connection.execute(
+            """
+            SELECT id, created_at FROM memory_records
+            WHERE scope = ? AND kind = ? AND content_hash = ?
+            """,
+            (normalized_scope, normalized_kind, content_hash),
+        ).fetchone()
+        if existing is not None:
+            record_id = str(existing["id"])
+            created_at = str(existing["created_at"])
+        else:
+            created_at = now
+        normalized_subject = subject.strip()
+        if normalized_subject and not supersedes:
+            previous_subject = connection.execute(
+                """
+                SELECT id FROM memory_records
+                WHERE scope = ? AND kind = ? AND subject = ?
+                  AND status = 'active' AND content_hash != ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (
+                    normalized_scope,
+                    normalized_kind,
+                    normalized_subject,
+                    content_hash,
+                ),
+            ).fetchone()
+            if previous_subject is not None:
+                supersedes = str(previous_subject["id"])
+        connection.execute(
+            """
+            INSERT INTO memory_records(
+                id, scope, kind, subject, content, confidence,
+                evidence_json, source_cursor, created_at, updated_at,
+                valid_from, expires_at, supersedes, status, content_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope, kind, content_hash) DO UPDATE SET
+                subject = excluded.subject,
+                confidence = MAX(memory_records.confidence, excluded.confidence),
+                evidence_json = excluded.evidence_json,
+                source_cursor = COALESCE(excluded.source_cursor, memory_records.source_cursor),
+                updated_at = excluded.updated_at,
+                valid_from = COALESCE(excluded.valid_from, memory_records.valid_from),
+                expires_at = excluded.expires_at,
+                supersedes = COALESCE(excluded.supersedes, memory_records.supersedes),
+                status = excluded.status
+            """,
+            (
+                record_id,
+                normalized_scope,
+                normalized_kind,
+                normalized_subject,
+                normalized,
+                bounded_confidence,
+                evidence_json,
+                source_cursor,
+                created_at,
+                now,
+                valid_from,
+                expires_at,
+                supersedes,
+                status,
+                content_hash,
+            ),
+        )
+        if self._fts_available:
+            connection.execute("DELETE FROM memory_fts WHERE id = ?", (record_id,))
+            connection.execute(
+                "INSERT INTO memory_fts(id, subject, content) VALUES (?, ?, ?)",
+                (record_id, normalized_subject, normalized),
+            )
+        if supersedes:
+            connection.execute(
+                "UPDATE memory_records SET status = 'superseded', updated_at = ? WHERE id = ?",
+                (now, supersedes),
+            )
+        if normalized_subject:
+            connection.execute(
+                """
+                UPDATE memory_records
+                SET status = 'superseded', updated_at = ?
+                WHERE scope = ? AND kind = ? AND subject = ?
+                  AND id != ? AND status = 'active'
+                """,
+                (
+                    now,
+                    normalized_scope,
+                    normalized_kind,
+                    normalized_subject,
+                    record_id,
+                ),
+            )
+        return record_id
+
+    def apply_memory_proposals(
+        self,
+        proposals: list[dict[str, Any]],
+        *,
+        scope: str,
+        evidence: list[dict[str, Any]] | None = None,
+        source_cursor: int | None = None,
+    ) -> list[str]:
+        """Atomically apply one Dream batch, including removals and corrections."""
+        changed_ids: list[str] = []
+        normalized_scope = scope.strip() or "workspace"
+        with self._structured_lock, self._connect_structured() as connection:
+            for proposal in proposals:
+                action = str(proposal.get("action", "upsert")).strip().lower()
+                kind = str(proposal.get("kind", "fact")).strip().lower() or "fact"
+                if action == "remove":
+                    clauses = ["scope = ?", "status = 'active'"]
+                    parameters: list[Any] = [normalized_scope]
+                    subject = str(proposal.get("subject", "")).strip()
+                    old_content = re.sub(
+                        r"\s+",
+                        " ",
+                        str(proposal.get("old_content", "") or proposal.get("content", "")),
+                    ).strip()
+                    if subject:
+                        clauses.extend(["kind = ?", "subject = ?"])
+                        parameters.extend([kind, subject])
+                    elif old_content:
+                        content_hash = hashlib.sha256(
+                            old_content.casefold().encode("utf-8")
+                        ).hexdigest()
+                        clauses.append("content_hash = ?")
+                        parameters.append(content_hash)
+                    else:
+                        continue
+                    matched = connection.execute(
+                        f"SELECT id FROM memory_records WHERE {' AND '.join(clauses)}",
+                        parameters,
+                    ).fetchall()
+                    matched_ids = [str(row["id"]) for row in matched]
+                    if not matched_ids:
+                        continue
+                    now = datetime.now().astimezone().isoformat()
+                    placeholders = ",".join("?" for _ in matched_ids)
+                    connection.execute(
+                        f"UPDATE memory_records SET status = 'invalidated', updated_at = ? "
+                        f"WHERE id IN ({placeholders})",
+                        [now, *matched_ids],
+                    )
+                    if self._fts_available:
+                        connection.execute(
+                            f"DELETE FROM memory_fts WHERE id IN ({placeholders})",
+                            matched_ids,
+                        )
+                    changed_ids.extend(matched_ids)
+                    continue
+                if action != "upsert":
+                    continue
+                changed_ids.append(self._upsert_memory_record(
+                    connection,
+                    scope=normalized_scope,
+                    kind=kind,
+                    subject=str(proposal.get("subject", "")),
+                    content=str(proposal.get("content", "")),
+                    confidence=float(proposal.get("confidence", 0.7)),
+                    evidence=evidence,
+                    source_cursor=source_cursor,
+                    valid_from=proposal.get("valid_from"),
+                    expires_at=proposal.get("expires_at"),
+                ))
+        return changed_ids
+
+    def search_memory_records(
+        self,
+        query: str,
+        *,
+        scopes: set[str] | None = None,
+        top_k: int = 8,
+        min_confidence: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        """Retrieve scoped memories using FTS/BM25, overlap, confidence and recency."""
+        if top_k <= 0:
+            return []
+        if scopes is not None and not scopes:
+            return []
+        now = datetime.now().astimezone()
+        scope_values = sorted(scopes) if scopes is not None else []
+        parameters: list[Any] = []
+        scope_clause = ""
+        if scope_values:
+            placeholders = ",".join("?" for _ in scope_values)
+            scope_clause = f"AND scope IN ({placeholders})"
+            parameters.extend(scope_values)
+        parameters.append(float(min_confidence))
+        sql = f"""
+            SELECT * FROM memory_records
+            WHERE status = 'active'
+              {scope_clause}
+              AND confidence >= ?
+        """
+        with self._structured_lock, self._connect_structured() as connection:
+            rows = [dict(row) for row in connection.execute(sql, parameters).fetchall()]
+            fts_scores: dict[str, float] = {}
+            if self._fts_available and query.strip():
+                terms = re.findall(r"[\w\u3400-\u9fff]+", query.lower())[:12]
+                expression = " OR ".join(
+                    f'"{term.replace(chr(34), chr(34) * 2)}"'
+                    for term in terms
+                    if term
+                )
+                if expression:
+                    try:
+                        matches = connection.execute(
+                            "SELECT id, bm25(memory_fts) AS rank FROM memory_fts WHERE memory_fts MATCH ?",
+                            (expression,),
+                        ).fetchall()
+                        raw_scores = {
+                            str(row["id"]): max(0.0, -float(row["rank"]))
+                            for row in matches
+                        }
+                        max_raw_score = max(raw_scores.values(), default=0.0)
+                        if max_raw_score > 0:
+                            fts_scores = {
+                                record_id: score / max_raw_score
+                                for record_id, score in raw_scores.items()
+                            }
+                    except sqlite3.OperationalError:
+                        pass
+
+        query_tokens = self._memory_tokens(query)
+        ranked: list[dict[str, Any]] = []
+        for row in rows:
+            valid_from = row.get("valid_from")
+            if valid_from:
+                try:
+                    if datetime.fromisoformat(str(valid_from)) > now:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            expires_at = row.get("expires_at")
+            if expires_at:
+                try:
+                    if datetime.fromisoformat(str(expires_at)) <= now:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            row_tokens = self._memory_tokens(
+                f"{row.get('subject', '')} {row.get('content', '')}"
+            )
+            overlap = (
+                len(query_tokens & row_tokens) / max(1, len(query_tokens))
+                if query_tokens
+                else 0.0
+            )
+            try:
+                updated = datetime.fromisoformat(str(row.get("updated_at")))
+                age_days = max(0.0, (now - updated).total_seconds() / 86400.0)
+                recency = 1.0 / (1.0 + age_days / 30.0)
+            except (TypeError, ValueError):
+                recency = 0.5
+            kind_boost = 1.0 if row.get("kind") in {"preference", "constraint"} else 0.0
+            score = (
+                0.45 * fts_scores.get(str(row["id"]), 0.0)
+                + 0.30 * overlap
+                + 0.15 * float(row.get("confidence", 0.0))
+                + 0.07 * recency
+                + 0.03 * kind_boost
+            )
+            if query_tokens and not (
+                fts_scores.get(str(row["id"]), 0.0) > 0.0 or overlap > 0.0
+            ):
+                continue
+            row["score"] = round(score, 6)
+            try:
+                row["evidence"] = json.loads(row.pop("evidence_json", "[]"))
+            except json.JSONDecodeError:
+                row["evidence"] = []
+            ranked.append(row)
+        ranked.sort(key=lambda item: item["score"], reverse=True)
+        return ranked[:top_k]
+
+    @staticmethod
+    def render_memory_records(records: list[dict[str, Any]]) -> str:
+        lines = []
+        for record in records:
+            kind = str(record.get("kind", "fact")).upper()
+            subject = str(record.get("subject", "")).strip()
+            prefix = f"{subject}: " if subject else ""
+            lines.append(
+                f"- [{kind}] {prefix}{record.get('content', '')} "
+                f"(confidence={float(record.get('confidence', 0.0)):.2f})"
+            )
+        return "\n".join(lines)
+
     # -- history.jsonl — append-only, JSONL format ---------------------------
 
-    def append_history(self, entry: str) -> int:
+    def append_history(
+        self,
+        entry: str,
+        *,
+        session_key: str | None = None,
+        kind: str = "conversation_summary",
+        evidence: dict[str, Any] | None = None,
+    ) -> int:
         """Append *entry* to history.jsonl and return its auto-incrementing cursor."""
-        cursor = self._next_cursor()
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        record = {"cursor": cursor, "timestamp": ts, "content": strip_think(entry.rstrip()) or entry.rstrip()}
-        with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self._cursor_file.write_text(str(cursor), encoding="utf-8")
-        return cursor
+        with self._history_write_guard():
+            cursor = self._next_cursor()
+            record = {
+                "event_id": f"hist_{uuid.uuid4().hex}",
+                "cursor": cursor,
+                "timestamp": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"),
+                "timezone": datetime.now().astimezone().strftime("%z"),
+                "content": strip_think(entry.rstrip()) or entry.rstrip(),
+                "kind": kind,
+                "scope": session_key or "workspace",
+                "evidence": evidence or {},
+            }
+            with open(self.history_file, "a", encoding="utf-8") as output:
+                output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                output.flush()
+                os.fsync(output.fileno())
+            self._atomic_write_text(self._cursor_file, str(cursor))
+            return cursor
 
     def _next_cursor(self) -> int:
         """Read the current cursor counter and return next value."""
@@ -246,19 +769,36 @@ class MemoryStore:
             return last["cursor"] + 1
         return 1
 
-    def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
+    def read_unprocessed_history(
+        self,
+        since_cursor: int,
+        *,
+        scopes: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Return history entries with cursor > *since_cursor*."""
-        return [e for e in self._read_entries() if e.get("cursor", 0) > since_cursor]
+        return [
+            entry
+            for entry in self._read_entries()
+            if entry.get("cursor", 0) > since_cursor
+            and (scopes is None or str(entry.get("scope", "workspace")) in scopes)
+        ]
 
-    def compact_history(self) -> None:
-        """Drop oldest entries if the file exceeds *max_history_entries*."""
+    def compact_history(self, processed_cursor: int | None = None) -> None:
+        """Bound processed history without ever deleting unprocessed entries."""
         if self.max_history_entries <= 0:
             return
-        entries = self._read_entries()
-        if len(entries) <= self.max_history_entries:
-            return
-        kept = entries[-self.max_history_entries:]
-        self._write_entries(kept)
+        with self._history_write_guard():
+            entries = self._read_entries()
+            cursor = (
+                self.get_last_dream_cursor()
+                if processed_cursor is None
+                else max(0, int(processed_cursor))
+            )
+            processed = [entry for entry in entries if entry.get("cursor", 0) <= cursor]
+            unprocessed = [entry for entry in entries if entry.get("cursor", 0) > cursor]
+            kept = [*processed[-self.max_history_entries:], *unprocessed]
+            if kept != entries:
+                self._write_entries(kept)
 
     # -- JSONL helpers -------------------------------------------------------
 
@@ -300,9 +840,11 @@ class MemoryStore:
 
     def _write_entries(self, entries: list[dict[str, Any]]) -> None:
         """Overwrite history.jsonl with the given entries."""
-        with open(self.history_file, "w", encoding="utf-8") as f:
-            for entry in entries:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        content = "".join(
+            json.dumps(entry, ensure_ascii=False) + "\n"
+            for entry in entries
+        )
+        self._atomic_write_text(self.history_file, content)
 
     # -- dream cursor --------------------------------------------------------
 
@@ -315,7 +857,11 @@ class MemoryStore:
         return 0
 
     def set_last_dream_cursor(self, cursor: int) -> None:
-        self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
+        candidate = max(0, int(cursor))
+        with self._history_write_guard():
+            current = self.get_last_dream_cursor()
+            if candidate > current:
+                self._atomic_write_text(self._dream_cursor_file, str(candidate))
 
     # -- message formatting utility ------------------------------------------
 
@@ -335,15 +881,47 @@ class MemoryStore:
             )
         return "\n".join(lines)
 
-    def raw_archive(self, messages: list[dict]) -> None:
-        """Fallback: dump raw messages to history.jsonl without LLM summarization."""
+    def raw_archive(
+        self,
+        messages: list[dict],
+        *,
+        session_key: str | None = None,
+    ) -> str:
+        """Persist raw evidence as an artifact and return a bounded checkpoint."""
+        artifact_dir = ensure_dir(self.memory_dir / "raw_history")
+        artifact_id = uuid.uuid4().hex
+        artifact_path = artifact_dir / f"{artifact_id}.json"
+        payload = json.dumps(messages, ensure_ascii=False, indent=2)
+        self._atomic_write_text(artifact_path, payload)
+        latest_user = next((
+            str(message.get("content", ""))
+            for message in reversed(messages)
+            if message.get("role") == "user" and message.get("content")
+        ), "")
+        latest_assistant = next((
+            str(message.get("content", ""))
+            for message in reversed(messages)
+            if message.get("role") == "assistant" and message.get("content")
+        ), "")
+        checkpoint = (
+            "[DEGRADED CHECKPOINT]\n"
+            f"- Raw evidence: memory/raw_history/{artifact_path.name}\n"
+            f"- Messages: {len(messages)}\n"
+            f"- Latest user request: {latest_user[:1200]}\n"
+            f"- Latest assistant state: {latest_assistant[:1200]}"
+        )
         self.append_history(
-            f"[RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
+            checkpoint,
+            session_key=session_key,
+            kind="degraded_checkpoint",
+            evidence={"artifact": str(artifact_path.relative_to(self.workspace))},
         )
         logger.warning(
-            "Memory consolidation degraded: raw-archived {} messages", len(messages)
+            "Memory consolidation degraded: raw-archived {} messages to {}",
+            len(messages),
+            artifact_path,
         )
+        return checkpoint
 
 
 
@@ -466,7 +1044,49 @@ class Consolidator:
             self._get_tool_definitions(),
         )
 
-    async def archive(self, messages: list[dict]) -> str | None:
+    @staticmethod
+    def _normalize_working_checkpoint(raw: str) -> str:
+        """Render structured summaries while accepting legacy plain text."""
+        text = strip_think(raw or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        try:
+            payload = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return text or "(nothing)"
+        if not isinstance(payload, dict):
+            return text or "(nothing)"
+        sections = ["# Working Checkpoint"]
+        summary = str(payload.get("summary", "")).strip()
+        if summary:
+            sections.append(f"## Summary\n{summary[:3000]}")
+        field_titles = {
+            "active_goals": "Active Goals",
+            "constraints": "Constraints",
+            "decisions": "Decisions",
+            "completed": "Completed",
+            "open_items": "Open Items",
+            "artifacts": "Artifacts",
+            "memory_candidates": "Memory Candidates",
+        }
+        for field, title in field_titles.items():
+            values = payload.get(field, [])
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, list):
+                continue
+            normalized = [str(value).strip()[:1000] for value in values if str(value).strip()]
+            if normalized:
+                sections.append(f"## {title}\n" + "\n".join(f"- {value}" for value in normalized[:20]))
+        return "\n\n".join(sections) if len(sections) > 1 else "(nothing)"
+
+    async def archive(
+        self,
+        messages: list[dict],
+        *,
+        session_key: str | None = None,
+    ) -> str | None:
         """Summarize messages via LLM and append to history.jsonl.
 
         Returns the summary text on success, None if nothing to archive.
@@ -495,14 +1115,17 @@ class Consolidator:
             )
             if response.finish_reason == "error":
                 raise RuntimeError(f"LLM returned error: {response.content}")
-            summary = response.content or "[no summary]"
-            self.store.append_history(summary)
+            summary = self._normalize_working_checkpoint(response.content or "")
+            self.store.append_history(
+                summary,
+                session_key=session_key,
+                kind="working_checkpoint",
+                evidence={"message_count": len(messages)},
+            )
             return summary
         except Exception:
-            # 如果大模型 API 此时宕机/超时，作为灾备，直接原样写入流水账，不丢数据
-            logger.warning("Consolidation LLM call failed, raw-dumping to history")
-            self.store.raw_archive(messages)
-            return None
+            logger.warning("Consolidation LLM call failed, persisting bounded checkpoint")
+            return self.store.raw_archive(messages, session_key=session_key)
 
     async def maybe_consolidate_by_tokens(
         self,
@@ -523,7 +1146,11 @@ class Consolidator:
         async with lock:
             # 算出我们真正的 "剩余 Token 预算"
             # 模型能吃的极限 - 模型生成回答所需的预留 - 我们的估算安全垫
-            budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+            budget = ContextBudget(
+                context_window_tokens=self.context_window_tokens,
+                output_reserve_tokens=self.max_completion_tokens,
+                safety_buffer_tokens=self._SAFETY_BUFFER,
+            ).prompt_tokens
             target = budget // 2
             try:
                 estimated, source = self.estimate_session_prompt_tokens(
@@ -547,7 +1174,7 @@ class Consolidator:
                 )
                 return
 
-            last_summary = None
+            round_summaries: list[str] = []
             for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
                 if estimated <= target:
                     break
@@ -586,9 +1213,9 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                summary = await self.archive(chunk)
+                summary = await self.archive(chunk, session_key=session.key)
                 if summary:
-                    last_summary = summary
+                    round_summaries.append(summary)
                 else:
                     break
                 session.last_consolidated = end_idx
@@ -608,9 +1235,20 @@ class Consolidator:
             # Persist the last summary to session metadata so it can be injected
             # into the runtime context on the next prepare_session() call, aligning
             # the summary injection strategy with AutoCompact._archive().
-            if last_summary and last_summary != "(nothing)":
+            usable_summaries = [
+                summary for summary in round_summaries if summary != "(nothing)"
+            ]
+            if usable_summaries:
+                selected: list[str] = []
+                selected_chars = 0
+                for summary in reversed(usable_summaries):
+                    if selected and selected_chars + len(summary) > 16_000:
+                        break
+                    selected.append(summary)
+                    selected_chars += len(summary)
+                checkpoint = "\n\n---\n\n".join(reversed(selected))
                 session.metadata["_last_summary"] = {
-                    "text": last_summary,
+                    "text": checkpoint,
                     "last_active": session.updated_at.isoformat(),
                 }
                 self.sessions.save(session)
@@ -629,11 +1267,13 @@ _STALE_THRESHOLD_DAYS = 14
 
 
 class Dream:
-    """Two-phase memory processor: analyze history.jsonl, then edit files via AgentRunner.
+    """Two-phase memory processor with reviewable Skill discovery.
 
     Phase 1 produces an analysis summary (plain LLM call).
     Phase 2 delegates to AgentRunner with read_file / edit_file tools so the
     LLM can make targeted, incremental edits instead of replacing entire files.
+    Skill proposals are rendered and staged separately by deterministic
+    lifecycle code; Dream never writes active Skill files directly.
     
     将用户的历史对话流水账转化为结构化的长期知识、技能或用户画像，整个过程分为两个阶段：分析（Phase 1）与编辑落盘（Phase 2）
     """
@@ -647,6 +1287,7 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
+        skill_candidates: SkillCandidateManager | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -658,21 +1299,17 @@ class Dream:
         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
+        self.skill_candidates = skill_candidates
         self._runner = AgentRunner(provider)
+        self._run_lock = asyncio.Lock()
         self._tools = self._build_tools()
 
     # -- tool registry -------------------------------------------------------
 
     def _build_tools(self) -> ToolRegistry:
-        """Build a minimal tool registry for the Dream agent.
-        
-        赋予了 Dream 代理操作文件系统的能力：
-
-        读文件工具 (ReadFileTool): 允许读取工作区和内置技能目录的文件。
-        编辑文件工具 (EditFileTool): 允许修改现有文件（利用这个对长期记忆文件进行增删改查）。
-        写文件工具 (WriteFileTool): 专门限制了只能在 skills 目录下创建新文件（为了让大模型在发现重复性工作流时，能够自我总结并生成新的 SKILL.md）。"""
+        """Build tools restricted to the three human-readable memory views."""
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
-        from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
+        from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool
 
         tools = ToolRegistry()
         workspace = self.store.workspace
@@ -683,12 +1320,25 @@ class Dream:
             allowed_dir=workspace,
             extra_allowed_dirs=extra_read,
         ))
-        tools.register(EditFileTool(workspace=workspace, allowed_dir=workspace))
-        # write_file resolves relative paths from workspace root, but can only
-        # write under skills/ so the prompt can safely use skills/<name>/SKILL.md.
-        skills_dir = workspace / "skills"
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        tools.register(WriteFileTool(workspace=workspace, allowed_dir=skills_dir))
+        allowed_memory_files = {
+            (workspace / "SOUL.md").resolve(),
+            (workspace / "USER.md").resolve(),
+            (workspace / "memory" / "MEMORY.md").resolve(),
+        }
+
+        class _MemoryOnlyEditFileTool(EditFileTool):
+            async def execute(self, path: str | None = None, **kwargs: Any) -> str:
+                if not path:
+                    return "Error: Unknown path"
+                try:
+                    resolved = self._resolve(path)
+                except PermissionError as exc:
+                    return f"Error: {exc}"
+                if resolved not in allowed_memory_files:
+                    return "Error: Dream may only edit SOUL.md, USER.md, and memory/MEMORY.md"
+                return await super().execute(path=path, **kwargs)
+
+        tools.register(_MemoryOnlyEditFileTool(workspace=workspace, allowed_dir=workspace))
         return tools
 
     # -- skill listing --------------------------------------------------------
@@ -772,15 +1422,121 @@ class Dream:
         return result
 
     async def run(self) -> bool:
-        """Process unprocessed history entries. Returns True if work was done."""
-        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+        """Run one Dream transaction; concurrent manual/cron runs serialize."""
+        async with self._run_lock:
+            return await self._run_once()
 
+    @staticmethod
+    def _analysis_memory_candidates(analysis: str) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        raw = analysis.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            proposals = payload.get("proposals", [])
+            if isinstance(proposals, list):
+                for proposal in proposals:
+                    if not isinstance(proposal, dict):
+                        continue
+                    action = str(proposal.get("action", "upsert")).strip().lower()
+                    if action not in {"upsert", "remove"}:
+                        continue
+                    target = str(proposal.get("target", "MEMORY")).lower()
+                    content = str(proposal.get("content", "")).strip()
+                    old_content = str(proposal.get("old_content", "")).strip()
+                    subject = str(proposal.get("subject", "")).strip()
+                    if target not in {"user", "memory", "soul"}:
+                        continue
+                    if action == "upsert" and not content:
+                        continue
+                    if action == "remove" and not (subject or old_content or content):
+                        continue
+                    try:
+                        confidence = float(proposal.get("confidence", 0.8))
+                    except (TypeError, ValueError):
+                        confidence = 0.8
+                    candidates.append({
+                        "action": action,
+                        "target": target,
+                        "kind": str(proposal.get("kind", "")).strip().lower(),
+                        "subject": subject,
+                        "content": content,
+                        "old_content": old_content,
+                        "confidence": min(1.0, max(0.0, confidence)),
+                        "valid_from": proposal.get("valid_from"),
+                        "expires_at": proposal.get("expires_at"),
+                    })
+        for line in analysis.splitlines():
+            match = re.match(r"^\[(USER|MEMORY|SOUL)\]\s*(.+)$", line.strip())
+            if not match:
+                continue
+            content = match.group(2).strip()
+            if content:
+                candidates.append({
+                    "action": "upsert",
+                    "target": match.group(1).lower(),
+                    "kind": "",
+                    "subject": "",
+                    "content": content,
+                    "old_content": "",
+                    "confidence": 0.8,
+                    "valid_from": None,
+                    "expires_at": None,
+                })
+        return candidates
+
+    @staticmethod
+    def _analysis_skill_candidates(analysis: str) -> list[dict[str, Any]]:
+        """Return only structured Skill proposals from Phase 1 JSON."""
+        raw = analysis.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, dict) or not isinstance(payload.get("skills"), list):
+            return []
+        return [item for item in payload["skills"] if isinstance(item, dict)]
+
+    @staticmethod
+    def _analysis_is_skip(analysis: str) -> bool:
+        raw = analysis.strip()
+        if raw.upper() == "[SKIP]":
+            return True
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        return bool(
+            isinstance(payload, dict)
+            and not payload.get("proposals")
+        )
+
+    async def _run_once(self) -> bool:
+        """Process unprocessed history entries. Returns True if work was done."""
         last_cursor = self.store.get_last_dream_cursor()
         entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
         if not entries:
             return False
 
-        batch = entries[: self.max_batch_size]
+        first_scope = str(entries[0].get("scope", "workspace"))
+        batch: list[dict[str, Any]] = []
+        for entry in entries:
+            if str(entry.get("scope", "workspace")) != first_scope:
+                break
+            batch.append(entry)
+            if len(batch) >= self.max_batch_size:
+                break
         logger.info(
             "Dream: processing {} entries (cursor {}→{}), batch={}",
             len(entries), last_cursor, batch[-1]["cursor"], len(batch),
@@ -810,9 +1566,21 @@ class Dream:
             f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
         )
 
-        # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
+        # Give Phase 1 the catalog summary so it can reject duplicates before
+        # proposing a candidate. Full Skill files remain progressively loaded.
+        existing_skills = self._list_existing_skills()
+        if self.skill_candidates is not None:
+            existing_skills.extend(
+                f"{candidate.get('name', '')} [draft] — "
+                f"{candidate.get('description', '')}"
+                for candidate in self.skill_candidates.list_candidates(status="draft")
+            )
+        skills_section = (
+            "\n\n## Existing Skill Catalog\n"
+            + ("\n".join(f"- {skill}" for skill in existing_skills) or "(empty)")
+        )
         phase1_prompt = (
-            f"## Conversation History\n{history_text}\n\n{file_context}"
+            f"## Conversation History\n{history_text}\n\n{file_context}{skills_section}"
         )
 
         # Phase 1 不调用任何文件工具，单纯让大模型（结合 agent/dream_phase1.md 的系统提示词）做阅读理解。
@@ -835,56 +1603,89 @@ class Dream:
                 tools=None,
                 tool_choice=None,
             )
+            if phase1_response.finish_reason == "error":
+                raise RuntimeError(f"Dream Phase 1 returned an error: {phase1_response.content}")
             analysis = phase1_response.content or ""
             logger.debug("Dream Phase 1 analysis ({} chars): {}", len(analysis), analysis[:500])
         except Exception:
             logger.exception("Dream Phase 1 failed")
             return False
 
-        # Phase 2: Delegate to AgentRunner with read_file / edit_file
-        # 把 Phase 1 生成的纯文本分析报告 analysis，加上当前文件上下文和已有技能列表 skills_section，一起送入 Phase 2。
-        # 根据前一步的分析报告，实际调用 edit_file / write_file 工具来落实对底层文件的修改。
-        existing_skills = self._list_existing_skills()
-        skills_section = ""
-        if existing_skills:
-            skills_section = (
-                "\n\n## Existing Skills\n"
-                + "\n".join(f"- {s}" for s in existing_skills)
-            )
-        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}{skills_section}"
+        # Phase 2 applies memory proposals only. Skill proposals are staged by
+        # SkillCandidateManager after the memory transaction succeeds.
+        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}"
 
         tools = self._tools
-        skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
                 "content": render_template(
                     "agent/dream_phase2.md",
                     strip=True,
-                    skill_creator_path=str(skill_creator_path),
                 ),
             },
             {"role": "user", "content": phase2_prompt},
         ]
 
-        try:
-            result = await self._runner.run(AgentRunSpec(
-                initial_messages=messages,
-                tools=tools,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                max_tool_result_chars=self.max_tool_result_chars,
-                fail_on_tool_error=False,
-            ))
-            logger.debug(
-                "Dream Phase 2 complete: stop_reason={}, tool_events={}",
-                result.stop_reason, len(result.tool_events),
+        managed_paths = (
+            self.store.soul_file,
+            self.store.user_file,
+            self.store.memory_file,
+        )
+        snapshots = {
+            path: path.read_bytes() if path.exists() else None
+            for path in managed_paths
+        }
+        explicit_skip = self._analysis_is_skip(analysis)
+        result = None
+        if not explicit_skip:
+            try:
+                result = await self._runner.run(AgentRunSpec(
+                    initial_messages=messages,
+                    tools=tools,
+                    model=self.model,
+                    max_iterations=self.max_iterations,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    fail_on_tool_error=False,
+                ))
+                logger.debug(
+                    "Dream Phase 2 complete: stop_reason={}, tool_events={}",
+                    result.stop_reason, len(result.tool_events),
+                )
+                for ev in (result.tool_events or []):
+                    logger.info(
+                        "Dream tool_event: name={}, status={}, detail={}",
+                        ev.get("name"),
+                        ev.get("status"),
+                        ev.get("detail", "")[:200],
+                    )
+            except Exception:
+                logger.exception("Dream Phase 2 failed")
+
+        failed_events = [
+            event
+            for event in (result.tool_events if result else [])
+            if event.get("status") != "ok"
+        ]
+        phase2_succeeded = explicit_skip or bool(
+            result and result.stop_reason == "completed" and not failed_events
+        )
+        if not phase2_succeeded:
+            for path, snapshot in snapshots.items():
+                if snapshot is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    self.store._atomic_write_text(
+                        path,
+                        snapshot.decode("utf-8", errors="replace"),
+                    )
+            reason = result.stop_reason if result else "exception"
+            logger.warning(
+                "Dream incomplete ({}); restored memory files and retained cursor {}",
+                reason,
+                last_cursor,
             )
-            for ev in (result.tool_events or []):
-                logger.info("Dream tool_event: name={}, status={}, detail={}", ev.get("name"), ev.get("status"), ev.get("detail", "")[:200])
-        except Exception:
-            logger.exception("Dream Phase 2 failed")
-            result = None
+            return False
 
         # Build changelog from tool events
         changelog: list[str] = []
@@ -893,24 +1694,66 @@ class Dream:
                 if event["status"] == "ok":
                     changelog.append(f"{event['name']}: {event['detail']}")
 
-        # Advance cursor — always, to avoid re-processing Phase 1
         new_cursor = batch[-1]["cursor"]
-        self.store.set_last_dream_cursor(new_cursor)
-        self.store.compact_history()
-
-        if result and result.stop_reason == "completed":
-            logger.info(
-                "Dream done: {} change(s), cursor advanced to {}",
-                len(changelog), new_cursor,
+        batch_scopes = {
+            str(entry.get("scope", "workspace")) for entry in batch
+        }
+        record_scope = batch_scopes.pop() if len(batch_scopes) == 1 else "workspace"
+        evidence = [
+            {
+                "event_id": entry.get("event_id"),
+                "cursor": entry.get("cursor"),
+                "scope": entry.get("scope", "workspace"),
+            }
+            for entry in batch
+        ]
+        try:
+            proposals = self._analysis_memory_candidates(analysis)
+            for candidate in proposals:
+                file_kind = candidate["target"]
+                candidate["kind"] = candidate["kind"] or {
+                    "user": "preference",
+                    "memory": "fact",
+                    "soul": "behavior",
+                }[file_kind]
+            self.store.apply_memory_proposals(
+                proposals,
+                scope=record_scope,
+                evidence=evidence,
+                source_cursor=new_cursor,
             )
-        else:
-            reason = result.stop_reason if result else "exception"
-            logger.warning(
-                "Dream incomplete ({}): cursor advanced to {}",
-                reason, new_cursor,
-            )
 
-        # Git auto-commit (only when there are actual changes)
+            if self.skill_candidates is not None:
+                for proposal in self._analysis_skill_candidates(analysis):
+                    try:
+                        staged = self.skill_candidates.stage(
+                            proposal,
+                            source="dream",
+                            evidence=evidence,
+                        )
+                        logger.info(
+                            "Dream staged Skill candidate {} ({})",
+                            staged["candidate_id"],
+                            staged["name"],
+                        )
+                    except (OSError, ValueError):
+                        # A malformed optional Skill must not roll back an
+                        # otherwise valid memory consolidation transaction.
+                        logger.exception("Dream rejected an invalid Skill proposal")
+        except Exception:
+            logger.exception("Dream structured-memory commit failed; retaining cursor")
+            for path, snapshot in snapshots.items():
+                if snapshot is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    self.store._atomic_write_text(
+                        path,
+                        snapshot.decode("utf-8", errors="replace"),
+                    )
+            return False
+
+        # Version the human-readable views after both stores have accepted the
+        # update, then advance the cursor as the final commit marker.
         if changelog and self.store.git.is_initialized():
             ts = batch[-1]["timestamp"]
             summary = f"dream: {ts}, {len(changelog)} change(s)"
@@ -918,5 +1761,12 @@ class Dream:
             sha = self.store.git.auto_commit(commit_msg)
             if sha:
                 logger.info("Dream commit: {}", sha)
+
+        self.store.set_last_dream_cursor(new_cursor)
+        self.store.compact_history(processed_cursor=new_cursor)
+        logger.info(
+            "Dream done: {} change(s), cursor advanced to {}",
+            len(changelog), new_cursor,
+        )
 
         return True

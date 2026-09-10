@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
 import inspect
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.context_budget import ContextBudget, ContextBudgetManager
 from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, ToolCallRequest
 from nanobot.utils.helpers import (
@@ -22,10 +22,12 @@ from nanobot.utils.helpers import (
     maybe_persist_tool_result,
     truncate_text,
 )
+from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
     build_finalization_retry_message,
     build_length_recovery_message,
+    build_post_tool_continuation_message,
     ensure_nonempty_tool_result,
     is_blank_text,
     repeated_external_lookup_error,
@@ -74,6 +76,7 @@ class AgentRunSpec:
     retry_wait_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
+    skill_activation_callback: Any | None = None
 
 
 @dataclass(slots=True)
@@ -238,6 +241,7 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+        post_tool_continuation_message: dict[str, str] | None = None
 
         for iteration in range(spec.max_iterations):
             try:
@@ -253,6 +257,15 @@ class AgentRunner:
                 # Snipping may have created new orphans; clean them up.
                 messages_for_model = self._drop_orphan_tool_results(messages_for_model)
                 messages_for_model = self._backfill_missing_tool_results(messages_for_model)
+                if post_tool_continuation_message is not None:
+                    # This is a request-only recovery hint. Do not append it to
+                    # ``messages`` or it would be persisted as if the user had
+                    # sent it.
+                    messages_for_model = [
+                        *messages_for_model,
+                        post_tool_continuation_message,
+                    ]
+                    post_tool_continuation_message = None
             except Exception as exc:
                 logger.warning(
                     "Context governance failed on turn {} for {}: {}; applying minimal repair",
@@ -373,34 +386,65 @@ class AgentRunner:
             clean = hook.finalize_content(context, response.content)
             if response.finish_reason != "error" and is_blank_text(clean):
                 empty_content_retries += 1
-                if empty_content_retries < _MAX_EMPTY_RETRIES:
+                reasoning_chars = len(response.reasoning_content or "")
+                trailing_tool_names = self._trailing_tool_names(messages)
+                if trailing_tool_names and empty_content_retries < _MAX_EMPTY_RETRIES:
                     logger.warning(
-                        "Empty response on turn {} for {} ({}/{}); retrying",
+                        "Empty response after tool result on turn {} for {} "
+                        "(finish_reason={}, reasoning_chars={}, tool_calls={}); "
+                        "retrying with tools enabled (tools={})",
+                        iteration,
+                        spec.session_key or "default",
+                        response.finish_reason,
+                        reasoning_chars,
+                        len(response.tool_calls),
+                        ",".join(trailing_tool_names),
+                    )
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=True)
+                    post_tool_continuation_message = build_post_tool_continuation_message(
+                        trailing_tool_names
+                    )
+                    await hook.after_iteration(context)
+                    continue
+                elif empty_content_retries < _MAX_EMPTY_RETRIES:
+                    logger.warning(
+                        "Empty response on turn {} for {} ({}/{}; finish_reason={}, "
+                        "reasoning_chars={}, tool_calls={}); retrying",
                         iteration,
                         spec.session_key or "default",
                         empty_content_retries,
                         _MAX_EMPTY_RETRIES,
+                        response.finish_reason,
+                        reasoning_chars,
+                        len(response.tool_calls),
                     )
                     if hook.wants_streaming():
-                        await hook.on_stream_end(context, resuming=False)
+                        await hook.on_stream_end(context, resuming=True)
                     await hook.after_iteration(context)
                     continue
-                logger.warning(
-                    "Empty response on turn {} for {} after {} retries; attempting finalization",
-                    iteration,
-                    spec.session_key or "default",
-                    empty_content_retries,
-                )
-                if hook.wants_streaming():
-                    await hook.on_stream_end(context, resuming=False)
-                response = await self._request_finalization_retry(spec, messages_for_model)
-                retry_usage = self._usage_dict(response.usage)
-                self._accumulate_usage(usage, retry_usage)
-                raw_usage = self._merge_usage(raw_usage, retry_usage)
-                context.response = response
-                context.usage = dict(raw_usage)
-                context.tool_calls = list(response.tool_calls)
-                clean = hook.finalize_content(context, response.content)
+                else:
+                    logger.warning(
+                        "Empty response on turn {} for {} after {} retries "
+                        "(finish_reason={}, reasoning_chars={}, tool_calls={}); "
+                        "attempting finalization",
+                        iteration,
+                        spec.session_key or "default",
+                        empty_content_retries,
+                        response.finish_reason,
+                        reasoning_chars,
+                        len(response.tool_calls),
+                    )
+                    response = await self._request_finalization_retry(spec, messages_for_model)
+                    retry_usage = self._usage_dict(response.usage)
+                    self._accumulate_usage(usage, retry_usage)
+                    raw_usage = self._merge_usage(raw_usage, retry_usage)
+                    context.response = response
+                    context.usage = dict(raw_usage)
+                    context.tool_calls = list(response.tool_calls)
+                    clean = hook.finalize_content(context, response.content)
+                    if hook.wants_streaming() and not is_blank_text(clean):
+                        await hook.on_stream(context, clean or "")
 
             if response.finish_reason == "length" and not is_blank_text(clean):
                 length_recovery_count += 1
@@ -593,7 +637,24 @@ class AgentRunner:
         retry_messages = list(messages)
         retry_messages.append(build_finalization_retry_message())
         kwargs = self._build_request_kwargs(spec, retry_messages, tools=None)
+        # Finalization is deliberately short and tool-free. For local Qwen
+        # models, disabling thinking prevents another reasoning-only response
+        # from consuming the visible-answer phase.
+        kwargs["disable_thinking"] = True
         return await self.provider.chat_with_retry(**kwargs)
+
+    @staticmethod
+    def _trailing_tool_names(messages: list[dict[str, Any]]) -> list[str]:
+        """Return tool names in the latest consecutive tool-result block."""
+        names: list[str] = []
+        for message in reversed(messages):
+            if message.get("role") != "tool":
+                break
+            name = str(message.get("name") or "").strip()
+            if name:
+                names.append(name)
+        names.reverse()
+        return names
 
     @staticmethod
     def _usage_dict(usage: dict[str, Any] | None) -> dict[str, int]:
@@ -710,6 +771,18 @@ class AgentRunner:
             if spec.fail_on_tool_error:
                 return result + _HINT, event, RuntimeError(result)
             return result + _HINT, event, None
+
+        if tool_call.name == "read_file" and spec.skill_activation_callback is not None:
+            path = params.get("path") if isinstance(params, dict) else None
+            if path:
+                try:
+                    callback_result = spec.skill_activation_callback(path)
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+                except Exception:
+                    # Telemetry must never make an otherwise successful tool
+                    # call fail or change the model-visible result.
+                    logger.exception("skill_activation_callback failed for {}", path)
 
         detail = "" if result is None else str(result)
         detail = detail.replace("\n", " ").strip()
@@ -903,9 +976,12 @@ class AgentRunner:
         max_output = spec.max_tokens if isinstance(spec.max_tokens, int) else (
             provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
         )
-        budget = spec.context_block_limit or (
-            spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
-        )
+        budget = ContextBudget(
+            context_window_tokens=spec.context_window_tokens,
+            output_reserve_tokens=max_output,
+            safety_buffer_tokens=_SNIP_SAFETY_BUFFER,
+            context_block_limit=spec.context_block_limit,
+        ).prompt_tokens
         if budget <= 0:
             return messages
 
@@ -924,11 +1000,31 @@ class AgentRunner:
             return messages
 
         system_tokens = sum(estimate_message_tokens(msg) for msg in system_messages)
-        remaining_budget = max(128, budget - system_tokens)
+        tool_tokens = estimate_prompt_tokens_chain(
+            self.provider,
+            spec.model,
+            [],
+            spec.tools.get_definitions(),
+        )[0]
+        remaining_budget = max(128, budget - system_tokens - tool_tokens)
         kept: list[dict[str, Any]] = []
         kept_tokens = 0
         for message in reversed(non_system):
             msg_tokens = estimate_message_tokens(message)
+            if (
+                not kept
+                and msg_tokens > remaining_budget
+                and isinstance(message.get("content"), str)
+            ):
+                truncated = dict(message)
+                truncated["content"] = ContextBudgetManager.truncate_text(
+                    str(message["content"]),
+                    max(64, remaining_budget - 8),
+                    keep_tail=True,
+                )
+                kept.append(truncated)
+                kept_tokens = estimate_message_tokens(truncated)
+                break
             if kept and kept_tokens + msg_tokens > remaining_budget:
                 break
             kept.append(message)
@@ -984,4 +1080,3 @@ class AgentRunner:
         if current:
             batches.append(current)
         return batches
-

@@ -484,10 +484,14 @@ class WebSocketChannel(BaseChannel):
 
     def _check_api_token(self, request: WsRequest) -> bool:
         """Validate a request against the API token pool (multi-use, TTL-bound)."""
-        self._purge_expired_api_tokens()
         token = _bearer_token(request.headers) or _query_first(
             _parse_query(request.path), "token"
         )
+        return self.validate_api_token(token)
+
+    def validate_api_token(self, token: str) -> bool:
+        """Validate a WebUI REST token without consuming it."""
+        self._purge_expired_api_tokens()
         if not token:
             return False
         expiry = self._api_tokens.get(token)

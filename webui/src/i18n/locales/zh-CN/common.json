@@ -92,6 +92,10 @@
     "recent": "最近论文",
     "refresh": "刷新统计",
     "uploading": "正在上传 {fileName}{extra}…",
-    "clearHistory": "清除历史"
+    "clearHistory": "清除历史",
+    "deletePaper": "删除论文",
+    "deletePaperDescription": "该论文的元数据、文档块、检索索引及受管理的本地文件都会被删除，且无法撤销。",
+    "deletingPaper": "正在删除…",
+    "deleteFailed": "删除论文失败"
   }
 }

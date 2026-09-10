@@ -243,6 +243,26 @@ nanobot gateway
 
 支持 pdf 论文上传，自主构建知识库
 
+### Embedding 索引迁移
+
+Chroma 向量索引会记录 embedding 后端、模型指纹、归一化方式和维度。
+更换 embedding 模型后先检查索引状态：
+
+```bash
+nanobot paper index-status
+```
+
+如果返回 `reindex_required: true`，停止正在使用该工作区的 gateway，
+再执行可回滚重建：
+
+```bash
+nanobot paper reindex
+```
+
+重建会先创建临时 Collection、重新批量 embedding 并核对记录数，验证通过后
+才切换正式 Collection；旧索引默认保留为 `__backup_*` Collection。确认新索引
+工作正常后，可在下一次重建时使用 `--drop-backup`。
+
 ## 🔧 核心工具
 
 | 类别 | 工具 |

@@ -16,7 +16,15 @@ EMPTY_FINAL_RESPONSE_MESSAGE = (
 )
 
 FINALIZATION_RETRY_PROMPT = (
-    "Please provide your response to the user based on the conversation above."
+    "Provide the final response to the user now using the conversation and any "
+    "successful tool results above. Do not call another tool, emit tool-call markup, "
+    "or describe internal steps. Give a direct, evidence-grounded answer."
+)
+
+POST_TOOL_CONTINUATION_PROMPT = (
+    "The previous tool call completed but your response was empty. Continue the "
+    "user's task using the tool result. You still have access to tools: call the "
+    "next required tool, or provide the final answer if no more tool is needed."
 )
 
 LENGTH_RECOVERY_PROMPT = (
@@ -53,6 +61,20 @@ def is_blank_text(content: str | None) -> bool:
 def build_finalization_retry_message() -> dict[str, str]:
     """A short no-tools-allowed prompt for final answer recovery."""
     return {"role": "user", "content": FINALIZATION_RETRY_PROMPT}
+
+
+def build_post_tool_continuation_message(
+    tool_names: list[str] | tuple[str, ...],
+) -> dict[str, str]:
+    """Prompt a tool-capable retry after a reasoning-only/empty response."""
+    names = ", ".join(dict.fromkeys(str(name) for name in tool_names if name))
+    suffix = f" Latest completed tool(s): {names}." if names else ""
+    if "paper_ingest" in tool_names:
+        suffix += (
+            " If paper_ingest succeeded, call kb_retrieve with the original user's "
+            "question before writing an evidence-grounded answer."
+        )
+    return {"role": "user", "content": POST_TOOL_CONTINUATION_PROMPT + suffix}
 
 
 def build_length_recovery_message() -> dict[str, str]:

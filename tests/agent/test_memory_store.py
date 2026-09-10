@@ -102,17 +102,21 @@ class TestHistoryWithCursor:
         cursor = store.append_history("new event")
         assert cursor == 1
 
-    def test_compact_history_drops_oldest(self, tmp_path):
+    def test_compact_history_drops_only_old_processed_entries(self, tmp_path):
         store = MemoryStore(tmp_path, max_history_entries=2)
         store.append_history("event 1")
         store.append_history("event 2")
         store.append_history("event 3")
         store.append_history("event 4")
         store.append_history("event 5")
+        store.set_last_dream_cursor(3)
         store.compact_history()
         entries = store.read_unprocessed_history(since_cursor=0)
-        assert len(entries) == 2
-        assert entries[0]["cursor"] in {4, 5}
+        assert [entry["cursor"] for entry in entries] == [2, 3, 4, 5]
+        assert [
+            entry["cursor"]
+            for entry in store.read_unprocessed_history(since_cursor=3)
+        ] == [4, 5]
 
 
 class TestDreamCursor:
@@ -127,6 +131,50 @@ class TestDreamCursor:
         store.set_last_dream_cursor(3)
         store2 = MemoryStore(store.workspace)
         assert store2.get_last_dream_cursor() == 3
+
+
+class TestStructuredMemory:
+    def test_upsert_is_idempotent_and_search_is_scoped(self, store):
+        first = store.upsert_memory_record(
+            scope="cli:alice",
+            kind="preference",
+            content="User prefers dark mode for development tools",
+            confidence=0.8,
+            evidence=[{"cursor": 1}],
+        )
+        second = store.upsert_memory_record(
+            scope="cli:alice",
+            kind="preference",
+            content="User prefers dark mode for development tools",
+            confidence=0.9,
+            evidence=[{"cursor": 2}],
+        )
+        store.upsert_memory_record(
+            scope="cli:bob",
+            kind="preference",
+            content="User prefers a light theme",
+        )
+
+        assert first == second
+        results = store.search_memory_records(
+            "dark development theme",
+            scopes={"cli:alice"},
+            top_k=5,
+        )
+        assert len(results) == 1
+        assert results[0]["scope"] == "cli:alice"
+        assert results[0]["confidence"] == 0.9
+        assert results[0]["evidence"] == [{"cursor": 2}]
+
+    def test_expired_memory_is_not_retrieved(self, store):
+        store.upsert_memory_record(
+            scope="workspace",
+            kind="event",
+            content="Temporary release freeze",
+            expires_at="2000-01-01T00:00:00+00:00",
+        )
+
+        assert store.search_memory_records("release freeze", scopes=None) == []
 
 
 class TestLegacyHistoryMigration:

@@ -11,7 +11,9 @@ import re
 import sqlite3
 import tempfile
 import threading
+import uuid
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +21,14 @@ from typing import Any
 
 import httpx
 from loguru import logger
+
+
+_VECTOR_INDEX_SCHEMA_VERSION = 1
+_VECTOR_COLLECTION_NAMES = (
+    "paper_chunks",
+    "paper_summaries",
+    "paper_questions",
+)
 
 # ---------------------------------------------------------------------------
 # Persistent BM25 sparse retrieval
@@ -527,6 +537,7 @@ def _merge_chunk_doc(chunk: dict[str, Any], meta: dict[str, Any], score: float) 
     return {
         "chunk_id": chunk.get("chunk_id"),
         "paper_id": chunk.get("paper_id"),
+        "chunk_index": chunk.get("chunk_index"),
         "score": round(float(score), 5),
         "text": chunk.get("text", ""),
         "title": meta.get("title", ""),
@@ -534,12 +545,49 @@ def _merge_chunk_doc(chunk: dict[str, Any], meta: dict[str, Any], score: float) 
         "source": meta.get("source", ""),
         "year": meta.get("year"),
         "section": chunk.get("section", ""),
+        "heading_level": chunk.get("heading_level"),
+        "heading_path": chunk.get("heading_path", ""),
+        "page_start": chunk.get("page_start"),
+        "page_end": chunk.get("page_end"),
         "kind": chunk.get("kind", ""),
         "keywords": chunk.get("keywords", []),
         "claims": chunk.get("claims", []),
         "limitations": chunk.get("limitations", []),
         "linked_assets": chunk.get("linked_assets", []),
     }
+
+
+def _public_retrieval_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove internal ranking vectors before results enter an LLM prompt."""
+    public_results: list[dict[str, Any]] = []
+    for result in results:
+        item = dict(result)
+        item.pop("embedding", None)
+        compact_assets: list[dict[str, Any]] = []
+        for asset in (item.get("linked_assets") or [])[:2]:
+            if not isinstance(asset, dict):
+                continue
+            compact_asset = {
+                key: asset[key]
+                for key in ("key", "type")
+                if key in asset and asset[key] not in (None, "")
+            }
+            caption = str(asset.get("caption", ""))
+            if caption:
+                compact_asset["caption"] = caption[:800]
+            # Figure content normally duplicates its caption. Table content is
+            # useful evidence for metric questions, but still needs a hard cap.
+            content = str(asset.get("content", ""))
+            if content and str(asset.get("type", "")).lower() == "table":
+                compact_asset["content"] = content[:2400]
+            if compact_asset:
+                compact_assets.append(compact_asset)
+        if compact_assets:
+            item["linked_assets"] = compact_assets
+        else:
+            item.pop("linked_assets", None)
+        public_results.append(item)
+    return public_results
 
 
 def _select_diverse(
@@ -669,10 +717,16 @@ class PaperKbConfig:
     enabled: bool = True
     embedding_api_key: str = ""
     embedding_api_base: str = "https://api.openai.com/v1"
-    embedding_model: str = "text-embedding-3-small"
+    embedding_model: str = "/data1/project/models/bge-m3/snapshots/model"
     embedding_fallback: str = "hash"
     embedding_batch_size: int = 64
-    rerank_model: str = ""
+    rerank_model: str = "/data1/project/models/Qwen3-Reranker-0.6B"
+    rerank_score_mode: str = "logit"
+    retrieval_relevance_filter_enabled: bool = True
+    retrieval_min_relevance_score: float = 0.5
+    retrieval_rerank_candidate_count: int = 30
+    retrieval_relevance_fail_closed: bool = True
+    metadata_concurrency: int = 4
     retrieval_top_k: int = 5
     max_chunk_chars: int = 4096
     min_chunk_chars: int = 300
@@ -715,8 +769,12 @@ class PaperKnowledgeBase:
         self.embedding_model = None
         self.rerank_model = None
         self._jsonl_lock = asyncio.Lock()
+        self._assets_lock = asyncio.Lock()
+        self._paper_locks: dict[str, asyncio.Lock] = {}
+        self._paper_locks_guard = asyncio.Lock()
         self._embedding_model_lock = asyncio.Lock()
         self._rerank_model_lock = asyncio.Lock()
+        self._vector_index_lock = asyncio.Lock()
         self._embedding_backend = self._resolve_embedding_backend()
         self._embedding_last_error = ""
         self._embedding_dimension: int | None = (
@@ -733,6 +791,17 @@ class PaperKnowledgeBase:
         self._summary_collection = None
         self._question_collection = None
         self._chunk_collection = None
+        self._vector_index_status: dict[str, Any] = {
+            "backend": "chroma",
+            "compatible": None,
+            "verified": False,
+            "reindex_required": False,
+            "reason": "not_checked",
+            "expected_dimension": self._embedding_dimension,
+            "collection_dimensions": {},
+            "collection_counts": {},
+        }
+        self._vector_index_warning_reason = ""
         self._lexical_index: _SQLiteBM25Index | None = None
         self._lexical_last_error = ""
         self._init_lexical_index()
@@ -768,6 +837,127 @@ class PaperKnowledgeBase:
             })
         return rows
 
+    @staticmethod
+    def _metadata_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if not value:
+            return []
+        try:
+            parsed = json.loads(str(value))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    @staticmethod
+    def _collection_pages(
+        collection: Any,
+        *,
+        batch_size: int = 500,
+    ) -> Iterable[dict[str, Any]]:
+        total = int(collection.count())
+        for offset in range(0, total, max(1, batch_size)):
+            yield collection.get(
+                limit=max(1, batch_size),
+                offset=offset,
+                include=["documents", "metadatas"],
+            )
+
+    def _lexical_rows_from_chroma(self) -> list[dict[str, Any]]:
+        """Materialize one sparse-index row per canonical Chroma parent chunk."""
+        if self._chunk_collection is None:
+            return []
+        rows_by_chunk: dict[str, dict[str, Any]] = {}
+        for payload in self._collection_pages(self._chunk_collection):
+            ids = list(payload.get("ids") or [])
+            documents = list(payload.get("documents") or [])
+            metadatas = list(payload.get("metadatas") or [])
+            for index, raw_id in enumerate(ids):
+                chunk_id = str(raw_id)
+                metadata = (
+                    metadatas[index]
+                    if index < len(metadatas) and isinstance(metadatas[index], dict)
+                    else {}
+                )
+                rows_by_chunk[chunk_id] = {
+                    "chunk_id": chunk_id,
+                    "paper_id": str(metadata.get("paper_id", "")),
+                    "title": str(metadata.get("paper_title", "")),
+                    "keywords": self._metadata_list(metadata.get("keywords", "[]")),
+                    "summary": "",
+                    "questions": [],
+                    "body": str(documents[index] if index < len(documents) else ""),
+                }
+
+        if self._summary_collection is not None:
+            for payload in self._collection_pages(self._summary_collection):
+                documents = list(payload.get("documents") or [])
+                metadatas = list(payload.get("metadatas") or [])
+                for index, metadata in enumerate(metadatas):
+                    if not isinstance(metadata, dict):
+                        continue
+                    chunk_id = str(metadata.get("chunk_id", ""))
+                    row = rows_by_chunk.get(chunk_id)
+                    if row is not None and index < len(documents):
+                        row["summary"] = str(documents[index] or "")
+
+        if self._question_collection is not None:
+            for payload in self._collection_pages(self._question_collection):
+                documents = list(payload.get("documents") or [])
+                metadatas = list(payload.get("metadatas") or [])
+                for index, metadata in enumerate(metadatas):
+                    if not isinstance(metadata, dict):
+                        continue
+                    chunk_id = str(metadata.get("chunk_id", ""))
+                    row = rows_by_chunk.get(chunk_id)
+                    if row is not None and index < len(documents):
+                        row["questions"].append(str(documents[index] or ""))
+        return list(rows_by_chunk.values())
+
+    def rebuild_lexical_index_from_chroma(self) -> dict[str, Any]:
+        """Rebuild SQLite FTS5 from Chroma without requiring legacy chunks.jsonl."""
+        if self._lexical_index is None:
+            raise RuntimeError("SQLite FTS5 index is unavailable")
+        if self._chunk_collection is None:
+            raise RuntimeError("Chroma parent collection is unavailable")
+        rows = self._lexical_rows_from_chroma()
+        expected = int(self._chunk_collection.count())
+        if len(rows) != expected:
+            raise RuntimeError(
+                f"Chroma lexical snapshot incomplete: expected {expected}, got {len(rows)}"
+            )
+        self._lexical_index.rebuild(
+            rows,
+            source_mtime_ns=self._chunks_source_mtime_ns(),
+        )
+        self._lexical_last_error = ""
+        status = self.get_lexical_status()
+        if status.get("document_count") != expected:
+            raise RuntimeError(
+                "SQLite FTS5 rebuild count mismatch: "
+                f"expected {expected}, got {status.get('document_count')}"
+            )
+        logger.info("SQLite FTS5 index rebuilt from Chroma: {} parent chunks", expected)
+        return status
+
+    def _repair_lexical_index_from_chroma_if_needed(self) -> None:
+        if self._lexical_index is None or self._chunk_collection is None:
+            return
+        expected = int(self._chunk_collection.count())
+        current = int(self._lexical_index.count())
+        if expected <= 0 or current == expected:
+            return
+        logger.warning(
+            "SQLite FTS5/Chroma count mismatch (fts={}, chunks={}); rebuilding sparse index",
+            current,
+            expected,
+        )
+        try:
+            self.rebuild_lexical_index_from_chroma()
+        except Exception as exc:
+            self._lexical_last_error = str(exc)
+            logger.warning("SQLite FTS5 repair from Chroma failed: {}", exc)
+
     def _init_lexical_index(self) -> None:
         """Open the persistent sparse index and repair it from canonical JSONL."""
         try:
@@ -801,6 +991,309 @@ class PaperKnowledgeBase:
                 exc,
             )
 
+    def _embedding_identity(self) -> dict[str, Any]:
+        """Return a credential-free identity for vectors produced by this KB."""
+        model = self.config.embedding_model
+        model_config_hashes: dict[str, str] = {}
+        if self._embedding_backend == "local_sentence_transformer" and model:
+            model_path = Path(model).expanduser()
+            try:
+                model = str(model_path.resolve())
+            except OSError:
+                model = str(model_path)
+            for filename in (
+                "config.json",
+                "modules.json",
+                "sentence_bert_config.json",
+            ):
+                config_path = model_path / filename
+                try:
+                    model_config_hashes[filename] = hashlib.sha256(
+                        config_path.read_bytes()
+                    ).hexdigest()
+                except OSError:
+                    continue
+        elif self._embedding_backend == "hash_lexical":
+            model = "hash-lexical-256"
+
+        return {
+            "backend": self._embedding_backend,
+            "model": model,
+            "api_base": (
+                self.config.embedding_api_base.rstrip("/")
+                if self._embedding_backend == "openai_compatible_api"
+                else ""
+            ),
+            "normalize_embeddings": True,
+            "model_config_hashes": model_config_hashes,
+        }
+
+    def _embedding_fingerprint(self) -> str:
+        payload = json.dumps(
+            self._embedding_identity(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _vector_collection_metadata(
+        self,
+        *,
+        dimension: int | None = None,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "hnsw:space": "cosine",
+            "nanobot:index_schema": _VECTOR_INDEX_SCHEMA_VERSION,
+            "nanobot:embedding_fingerprint": self._embedding_fingerprint(),
+            "nanobot:embedding_backend": self._embedding_backend,
+            "nanobot:embedding_model": str(
+                self._embedding_identity().get("model") or ""
+            ),
+            "nanobot:normalized": True,
+        }
+        if dimension is not None:
+            metadata["nanobot:embedding_dimension"] = int(dimension)
+        return metadata
+
+    @staticmethod
+    def _is_real_chroma_collection(collection: Any) -> bool:
+        module = getattr(type(collection), "__module__", "")
+        return module.startswith("chromadb.")
+
+    @staticmethod
+    def _collection_vector_info(collection: Any) -> tuple[int, int | None]:
+        """Return ``(count, dimension)`` without relying on Chroma internals."""
+        count = int(collection.count())
+        metadata = getattr(collection, "metadata", None) or {}
+        metadata_dimension = metadata.get("nanobot:embedding_dimension")
+        try:
+            dimension = int(metadata_dimension) if metadata_dimension is not None else None
+        except (TypeError, ValueError):
+            dimension = None
+        if not count or dimension is not None:
+            return count, dimension
+
+        payload = collection.get(limit=1, include=["embeddings"])
+        embeddings = payload.get("embeddings") if payload else None
+        if embeddings is not None and len(embeddings):
+            first = embeddings[0]
+            if first is not None:
+                dimension = len(first)
+        return count, dimension
+
+    def _refresh_vector_index_status(
+        self,
+        *,
+        expected_dimension: int | None,
+    ) -> dict[str, Any]:
+        collections = {
+            "paper_chunks": self._chunk_collection,
+            "paper_summaries": self._summary_collection,
+            "paper_questions": self._question_collection,
+        }
+        if self._chroma_client is None or not any(collections.values()):
+            status = {
+                "backend": "chroma",
+                "compatible": False,
+                "verified": False,
+                "reindex_required": False,
+                "reason": "chroma_unavailable",
+                "expected_dimension": expected_dimension,
+                "collection_dimensions": {},
+                "collection_counts": {},
+                "embedding_fingerprint": self._embedding_fingerprint(),
+            }
+            self._vector_index_status = status
+            return status
+
+        dimensions: dict[str, int | None] = {}
+        counts: dict[str, int] = {}
+        missing_fingerprints: list[str] = []
+        fingerprint_mismatches: list[str] = []
+        inspection_errors: list[str] = []
+        expected_fingerprint = self._embedding_fingerprint()
+
+        for name, collection in collections.items():
+            if collection is None:
+                counts[name] = 0
+                dimensions[name] = None
+                continue
+            # Unit-test adapters are intentionally not subjected to persistent
+            # Chroma metadata checks.
+            if not self._is_real_chroma_collection(collection):
+                counts[name] = 0
+                dimensions[name] = expected_dimension
+                continue
+            try:
+                count, dimension = self._collection_vector_info(collection)
+            except Exception as exc:
+                counts[name] = 0
+                dimensions[name] = None
+                inspection_errors.append(f"{name}: {exc}")
+                continue
+            counts[name] = count
+            dimensions[name] = dimension
+            if count:
+                metadata = getattr(collection, "metadata", None) or {}
+                fingerprint = metadata.get("nanobot:embedding_fingerprint")
+                if not fingerprint:
+                    missing_fingerprints.append(name)
+                elif str(fingerprint) != expected_fingerprint:
+                    fingerprint_mismatches.append(name)
+
+        populated_dimensions = {
+            dimension
+            for name, dimension in dimensions.items()
+            if counts.get(name, 0) > 0 and dimension is not None
+        }
+        mismatched_dimensions = [
+            name
+            for name, dimension in dimensions.items()
+            if counts.get(name, 0) > 0
+            and expected_dimension is not None
+            and dimension != expected_dimension
+        ]
+
+        reason = ""
+        compatible: bool | None = True
+        verified = True
+        reindex_required = False
+        if inspection_errors:
+            compatible = False
+            verified = False
+            reason = "vector_index_inspection_failed: " + "; ".join(inspection_errors)
+        elif len(populated_dimensions) > 1:
+            compatible = False
+            verified = False
+            reindex_required = True
+            reason = "mixed_collection_dimensions"
+        elif mismatched_dimensions:
+            compatible = False
+            verified = False
+            reindex_required = True
+            reason = (
+                f"embedding_dimension_mismatch: expected={expected_dimension}, "
+                f"collections={','.join(mismatched_dimensions)}"
+            )
+        elif fingerprint_mismatches:
+            compatible = False
+            verified = False
+            reindex_required = True
+            reason = "embedding_fingerprint_mismatch: " + ",".join(
+                fingerprint_mismatches
+            )
+        elif missing_fingerprints:
+            # Legacy indexes can only be trusted after a full rebuild. Equal
+            # dimensions do not prove that two embedding models share a space.
+            compatible = False
+            verified = False
+            reindex_required = True
+            reason = "legacy_index_missing_fingerprint: " + ",".join(
+                missing_fingerprints
+            )
+        elif expected_dimension is None and populated_dimensions:
+            compatible = None
+            verified = False
+            reason = "embedding_dimension_not_probed"
+
+        status = {
+            "backend": "chroma",
+            "compatible": compatible,
+            "verified": verified,
+            "reindex_required": reindex_required,
+            "reason": reason,
+            "expected_dimension": expected_dimension,
+            "collection_dimensions": dimensions,
+            "collection_counts": counts,
+            "embedding_fingerprint": expected_fingerprint,
+        }
+        self._vector_index_status = status
+        return status
+
+    def get_vector_index_status(self, *, refresh: bool = False) -> dict[str, Any]:
+        if refresh:
+            return dict(self._refresh_vector_index_status(
+                expected_dimension=self._embedding_dimension,
+            ))
+        return dict(self._vector_index_status)
+
+    async def inspect_vector_index(self, *, probe_embedding: bool = True) -> dict[str, Any]:
+        """Inspect persistent vector compatibility, optionally probing the model."""
+        expected_dimension = self._embedding_dimension
+        if probe_embedding and expected_dimension is None:
+            probe = await self.embed_text("nanobot vector index compatibility probe")
+            expected_dimension = len(probe) if probe else None
+        return dict(self._refresh_vector_index_status(
+            expected_dimension=expected_dimension,
+        ))
+
+    async def _ensure_vector_index_compatible(self, dimension: int) -> bool:
+        active_collections = [
+            collection
+            for collection in (
+                self._chunk_collection,
+                self._summary_collection,
+                self._question_collection,
+            )
+            if collection is not None
+        ]
+        if active_collections and all(
+            not self._is_real_chroma_collection(collection)
+            for collection in active_collections
+        ):
+            # Lightweight adapters are used by integrations and unit tests;
+            # only persistent Chroma collections have the metadata contract
+            # enforced by this compatibility layer.
+            return True
+        async with self._vector_index_lock:
+            status = self._refresh_vector_index_status(
+                expected_dimension=dimension,
+            )
+        compatible = status.get("compatible") is True
+        if not compatible:
+            self._warn_vector_index_incompatible(status)
+        return compatible
+
+    def _warn_vector_index_incompatible(self, status: dict[str, Any]) -> None:
+        reason = str(status.get("reason") or "")
+        if not reason or reason == self._vector_index_warning_reason:
+            return
+        self._vector_index_warning_reason = reason
+        logger.warning(
+            "Dense paper retrieval disabled: {}; dimensions={}. Run `nanobot "
+            "paper reindex` after stopping the gateway.",
+            reason,
+            status.get("collection_dimensions", {}),
+        )
+
+    def _stamp_vector_collections(
+        self,
+        collections: list[Any],
+        *,
+        dimension: int,
+    ) -> None:
+        # ``hnsw:*`` values are immutable collection configuration in Chroma.
+        # Chroma 1.5 rejects them in ``modify`` even when the supplied value is
+        # identical to the existing value. Only stamp nanobot-owned metadata.
+        metadata = {
+            key: value
+            for key, value in self._vector_collection_metadata(
+                dimension=dimension
+            ).items()
+            if not key.startswith("hnsw:")
+        }
+        for collection in collections:
+            if collection is not None and self._is_real_chroma_collection(collection):
+                current_metadata = {
+                    key: value
+                    for key, value in (collection.metadata or {}).items()
+                    if not key.startswith("hnsw:")
+                }
+                updated_metadata = {**current_metadata, **metadata}
+                if updated_metadata != current_metadata:
+                    collection.modify(metadata=updated_metadata)
+
     def _init_chroma_collections(self) -> None:
         """Initialize Chroma vector database collections."""
         if not self.config.enable_hypothetical_retrieval:
@@ -817,18 +1310,25 @@ class PaperKnowledgeBase:
             self._chroma_client = chromadb.PersistentClient(path=persist_dir)
             
             # Create or get collections
+            collection_metadata = self._vector_collection_metadata()
             self._summary_collection = self._chroma_client.get_or_create_collection(
                 name="paper_summaries",
-                metadata={"hnsw:space": "cosine"},
+                metadata=collection_metadata,
             )
             self._question_collection = self._chroma_client.get_or_create_collection(
                 name="paper_questions",
-                metadata={"hnsw:space": "cosine"},
+                metadata=collection_metadata,
             )
             self._chunk_collection = self._chroma_client.get_or_create_collection(
                 name="paper_chunks",
-                metadata={"hnsw:space": "cosine"},
+                metadata=collection_metadata,
             )
+
+            vector_status = self._refresh_vector_index_status(
+                expected_dimension=self._embedding_dimension,
+            )
+            if vector_status.get("reindex_required"):
+                self._warn_vector_index_incompatible(vector_status)
             
             logger.info(
                 "Chroma initialized: summaries={}, questions={}, chunks={}",
@@ -836,12 +1336,18 @@ class PaperKnowledgeBase:
                 self._question_collection.count(),
                 self._chunk_collection.count(),
             )
+            self._repair_lexical_index_from_chroma_if_needed()
         except Exception as e:
             logger.warning("Chroma initialization failed: {}, falling back to JSONL-only mode", e)
             self._chroma_client = None
             self._summary_collection = None
             self._question_collection = None
             self._chunk_collection = None
+            self._vector_index_status = {
+                **self._vector_index_status,
+                "compatible": False,
+                "reason": f"chroma_unavailable: {e}",
+            }
 
     def _read_jsonl(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
@@ -895,30 +1401,38 @@ class PaperKnowledgeBase:
         """Idempotently replace one paper's JSONL rows under an in-process lock."""
         paper_id = str(doc_row.get("paper_id", ""))
         async with self._jsonl_lock:
+            previous_documents = self._read_jsonl(self.docs_file)
+            previous_chunks = self._read_jsonl(self.chunks_file)
             documents = [
-                row for row in self._read_jsonl(self.docs_file)
+                row for row in previous_documents
                 if str(row.get("paper_id", "")) != paper_id
             ]
             chunks = [
-                row for row in self._read_jsonl(self.chunks_file)
+                row for row in previous_chunks
                 if str(row.get("paper_id", "")) != paper_id
             ]
             documents.append(doc_row)
             chunks.extend(chunk_rows)
-            self._write_jsonl(self.docs_file, documents)
-            self._write_jsonl(self.chunks_file, chunks)
+            try:
+                self._write_jsonl(self.docs_file, documents)
+                self._write_jsonl(self.chunks_file, chunks)
+            except Exception:
+                logger.exception(
+                    "Paper JSONL commit failed for {}; restoring previous snapshot",
+                    paper_id,
+                )
+                self._write_jsonl(self.docs_file, previous_documents)
+                self._write_jsonl(self.chunks_file, previous_chunks)
+                raise
 
-    async def _replace_lexical_paper(
-        self,
+    @staticmethod
+    def _lexical_paper_rows(
         *,
         doc_row: dict[str, Any],
         chunk_rows: list[dict[str, Any]],
-    ) -> None:
-        """Replace one paper in the derived FTS index without blocking the loop."""
-        if self._lexical_index is None:
-            return
+    ) -> list[dict[str, Any]]:
         paper_id = str(doc_row.get("paper_id", ""))
-        rows = [{
+        return [{
             "chunk_id": row.get("chunk_id", ""),
             "paper_id": paper_id,
             "title": doc_row.get("title", ""),
@@ -927,12 +1441,40 @@ class PaperKnowledgeBase:
             "questions": row.get("hypothetical_questions", []),
             "body": row.get("text", ""),
         } for row in chunk_rows]
+
+    async def _replace_lexical_paper_strict(
+        self,
+        *,
+        doc_row: dict[str, Any],
+        chunk_rows: list[dict[str, Any]],
+    ) -> None:
+        """Replace one paper in the derived FTS index and propagate failures."""
+        if self._lexical_index is None:
+            return
+        paper_id = str(doc_row.get("paper_id", ""))
+        rows = self._lexical_paper_rows(
+            doc_row=doc_row,
+            chunk_rows=chunk_rows,
+        )
+        await asyncio.to_thread(
+            self._lexical_index.replace_paper,
+            paper_id,
+            rows,
+            source_mtime_ns=self._chunks_source_mtime_ns(),
+        )
+
+    async def _replace_lexical_paper(
+        self,
+        *,
+        doc_row: dict[str, Any],
+        chunk_rows: list[dict[str, Any]],
+    ) -> None:
+        """Replace one paper in the derived FTS index without blocking the loop."""
+        paper_id = str(doc_row.get("paper_id", ""))
         try:
-            await asyncio.to_thread(
-                self._lexical_index.replace_paper,
-                paper_id,
-                rows,
-                source_mtime_ns=self._chunks_source_mtime_ns(),
+            await self._replace_lexical_paper_strict(
+                doc_row=doc_row,
+                chunk_rows=chunk_rows,
             )
             self._lexical_last_error = ""
         except Exception as exc:
@@ -991,6 +1533,7 @@ class PaperKnowledgeBase:
             }
             else "hash-lexical-256" if self._embedding_backend == "hash_lexical" else None
         )
+        vector_index = self.get_vector_index_status()
         return {
             "backend": self._embedding_backend,
             "model": active_model,
@@ -1000,6 +1543,7 @@ class PaperKnowledgeBase:
             "degraded": self._embedding_backend in {"hash_lexical", "unavailable"}
             or bool(self._embedding_last_error),
             "reason": reason,
+            "vector_index": vector_index,
         }
 
     async def _embed_api_batch(self, texts: list[str]) -> list[list[float]]:
@@ -1132,6 +1676,184 @@ class PaperKnowledgeBase:
                 documents=documents[start:end],
                 metadatas=metadatas[start:end],
             )
+
+    async def _copy_collection_with_current_embeddings(
+        self,
+        *,
+        source: Any,
+        target: Any,
+        batch_size: int,
+    ) -> int:
+        """Copy one Chroma collection while recomputing every vector."""
+        # Chroma's local Rust client has thread-affine mutation paths on some
+        # versions. Keep maintenance operations on the caller thread; only the
+        # embedding model itself is offloaded by ``embed_texts``.
+        total = int(source.count())
+        copied = 0
+        for offset in range(0, total, batch_size):
+            payload = source.get(
+                limit=batch_size,
+                offset=offset,
+                include=["documents", "metadatas"],
+            )
+            ids = [str(value) for value in (payload.get("ids") or [])]
+            documents = list(payload.get("documents") or [])
+            metadatas = list(payload.get("metadatas") or [])
+            if not ids:
+                continue
+            if len(documents) != len(ids) or any(document is None for document in documents):
+                raise RuntimeError(
+                    f"Collection {source.name} contains records without source documents"
+                )
+            texts = [str(document) for document in documents]
+            embeddings = await self.embed_texts(texts)
+            normalized_metadatas = [
+                metadata if isinstance(metadata, dict) else {}
+                for metadata in metadatas
+            ]
+            if len(normalized_metadatas) < len(ids):
+                normalized_metadatas.extend(
+                    {} for _ in range(len(ids) - len(normalized_metadatas))
+                )
+            target.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                documents=texts,
+                metadatas=normalized_metadatas,
+            )
+            copied += len(ids)
+        return copied
+
+    async def rebuild_vector_index(
+        self,
+        *,
+        keep_backup: bool = True,
+    ) -> dict[str, Any]:
+        """Re-embed all Chroma records and swap collections after validation.
+
+        Existing documents and metadata are copied into temporary collections.
+        Canonical collection names are changed only after all three copies have
+        the expected record count, so an embedding or write failure leaves the
+        active index untouched.
+        """
+        if self._chroma_client is None:
+            raise RuntimeError("Chroma is unavailable; vector index cannot be rebuilt")
+
+        async with self._vector_index_lock:
+            probe = await self.embed_text("nanobot vector index rebuild probe")
+            if not probe:
+                raise RuntimeError("Embedding backend returned an empty probe vector")
+            dimension = len(probe)
+            suffix = uuid.uuid4().hex[:10]
+            sources = {
+                "paper_chunks": self._chunk_collection,
+                "paper_summaries": self._summary_collection,
+                "paper_questions": self._question_collection,
+            }
+            if any(collection is None for collection in sources.values()):
+                missing = [name for name, value in sources.items() if value is None]
+                raise RuntimeError(
+                    "Missing Chroma collections: " + ", ".join(missing)
+                )
+
+            metadata = self._vector_collection_metadata(dimension=dimension)
+            temporary: dict[str, Any] = {}
+            copied_counts: dict[str, int] = {}
+            source_counts: dict[str, int] = {}
+            switched: list[tuple[str, Any, Any, str, str]] = []
+            batch_size = max(1, min(256, self.config.embedding_batch_size * 2))
+
+            try:
+                for name in _VECTOR_COLLECTION_NAMES:
+                    source = sources[name]
+                    source_counts[name] = int(source.count())
+                    temporary_name = f"{name}__rebuild_{suffix}"
+                    target = self._chroma_client.create_collection(
+                        name=temporary_name,
+                        metadata=metadata,
+                    )
+                    temporary[name] = target
+                    copied_counts[name] = await self._copy_collection_with_current_embeddings(
+                        source=source,
+                        target=target,
+                        batch_size=batch_size,
+                    )
+
+                target_counts = {
+                    name: int(collection.count())
+                    for name, collection in temporary.items()
+                }
+                if copied_counts != source_counts or target_counts != source_counts:
+                    raise RuntimeError(
+                        "Vector index validation failed: "
+                        f"source={source_counts}, copied={copied_counts}, "
+                        f"target={target_counts}"
+                    )
+
+                # Rename old collections to recoverable backups, then move the
+                # validated temporary collections onto the canonical names.
+                for name in _VECTOR_COLLECTION_NAMES:
+                    source = sources[name]
+                    target = temporary[name]
+                    backup_name = f"{name}__backup_{suffix}"
+                    temporary_name = f"{name}__rebuild_{suffix}"
+                    source.modify(name=backup_name)
+                    try:
+                        target.modify(name=name)
+                    except Exception:
+                        source.modify(name=name)
+                        raise
+                    switched.append((name, source, target, backup_name, temporary_name))
+
+            except Exception:
+                # Roll back collection names in reverse order. The original
+                # collections remain intact because their vectors are never
+                # modified during the rebuild phase.
+                for name, source, target, _backup_name, temporary_name in reversed(switched):
+                    try:
+                        target.modify(name=temporary_name)
+                        source.modify(name=name)
+                    except Exception:
+                        logger.exception("Failed to roll back vector collection {}", name)
+                for target in temporary.values():
+                    try:
+                        self._chroma_client.delete_collection(name=target.name)
+                    except Exception:
+                        logger.debug("Unable to remove temporary collection {}", target.name)
+                raise
+
+            if not keep_backup:
+                for _name, _source, _target, backup_name, _temporary_name in switched:
+                    self._chroma_client.delete_collection(name=backup_name)
+
+            self._chunk_collection = self._chroma_client.get_collection(
+                name="paper_chunks"
+            )
+            self._summary_collection = self._chroma_client.get_collection(
+                name="paper_summaries"
+            )
+            self._question_collection = self._chroma_client.get_collection(
+                name="paper_questions"
+            )
+            self._vector_index_warning_reason = ""
+            status = self._refresh_vector_index_status(
+                expected_dimension=dimension,
+            )
+            if status.get("compatible") is not True:
+                raise RuntimeError(
+                    "Rebuilt vector index failed compatibility verification: "
+                    + str(status.get("reason") or "unknown error")
+                )
+            return {
+                "status": "ok",
+                "dimension": dimension,
+                "embedding_fingerprint": self._embedding_fingerprint(),
+                "source_counts": source_counts,
+                "target_counts": copied_counts,
+                "backup_suffix": suffix if keep_backup else None,
+                "backups_kept": keep_backup,
+                "vector_index": status,
+            }
     
     def rerank_similarity(self, query: str, doc: str) -> float:
         if not self.config.rerank_model:
@@ -1161,21 +1883,240 @@ class PaperKnowledgeBase:
                     )
         raw_scores = await asyncio.to_thread(self.rerank_model.predict, pairs)
         values = raw_scores.tolist() if hasattr(raw_scores, "tolist") else list(raw_scores)
+        score_mode = str(self.config.rerank_score_mode or "logit").lower()
+        if score_mode not in {"logit", "probability"}:
+            raise ValueError(f"Unsupported rerank_score_mode: {score_mode}")
         normalized: list[float] = []
         for raw_score in values:
             score = float(raw_score)
             if not math.isfinite(score):
                 score = 0.0
-            elif not 0.0 <= score <= 1.0:
-                # Cross-Encoders commonly return logits; map them to a stable
-                # relevance range before mixing with RRF/recency features.
+            elif score_mode == "logit":
+                # Qwen3-Reranker returns raw logit differences by default.
+                # Convert every value (including logits already in [0, 1]) so
+                # the relevance threshold has continuous, stable semantics.
                 score = 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, score))))
+            else:
+                score = max(0.0, min(1.0, score))
             normalized.append(score)
         if len(normalized) != len(pairs):
             raise RuntimeError(
                 f"Cross-encoder returned {len(normalized)} scores for {len(pairs)} pairs"
             )
         return normalized
+
+    def retrieval_relevance_filter_active(self) -> bool:
+        """Return whether retrieval candidates require Cross-Encoder approval."""
+        return bool(
+            self.config.retrieval_relevance_filter_enabled
+            and self.config.rerank_model
+        )
+
+    def retrieval_candidate_count(self, requested_top_k: int) -> int:
+        """Return the high-recall pool size to collect before relevance gating."""
+        requested = max(1, int(requested_top_k))
+        if not self.retrieval_relevance_filter_active():
+            return requested
+        return max(requested, int(self.config.retrieval_rerank_candidate_count))
+
+    @staticmethod
+    def _is_paper_discovery_query(query: str) -> bool:
+        """Recognize broad requests whose output is a list of relevant papers."""
+        normalized = re.sub(r"\s+", " ", str(query or "")).strip().lower()
+        if not normalized:
+            return False
+        patterns = (
+            r"(?:有(?:没有|哪些|什么)|找|推荐|检索|搜索).{0,12}(?:论文|文献|文章)",
+            r"(?:相关|关于).{0,12}(?:论文|文献|文章)",
+            r"(?:论文|文献|文章).{0,8}(?:有哪些|推荐|列表)",
+            r"\b(?:find|search(?: for)?|recommend|list)\b.{0,30}\b(?:papers?|literature|articles?)\b",
+            r"\b(?:papers?|literature|articles?)\b.{0,20}\b(?:about|on|related to)\b",
+        )
+        return any(re.search(pattern, normalized) for pattern in patterns)
+
+    async def rerank_and_filter_retrieval_results(
+        self,
+        results: list[dict[str, Any]],
+        *,
+        queries: list[str],
+        top_k: int,
+        per_paper_limit: int,
+    ) -> list[dict[str, Any]]:
+        """Turn high-recall rankings into a relevance-gated evidence set.
+
+        RRF and dense scores remain useful for candidate generation, but neither
+        is an absolute relevance judgement.  This method keeps the retrieval
+        score for diagnostics, assigns an independent Cross-Encoder relevance
+        score, rejects weak chunks, and applies an additional paper-level gate
+        for broad paper-discovery queries.
+        """
+        if not results:
+            return []
+
+        desired = max(1, int(top_k))
+        candidate_limit = self.retrieval_candidate_count(desired)
+        candidates = sorted(
+            (dict(item) for item in results),
+            key=lambda item: float(item.get("score", 0.0) or 0.0),
+            reverse=True,
+        )[:candidate_limit]
+
+        if not self.retrieval_relevance_filter_active():
+            return _select_diverse(
+                candidates,
+                k=desired,
+                per_paper_limit=max(1, per_paper_limit),
+                mmr_lambda=self.config.mmr_lambda,
+            )
+
+        query_list: list[str] = []
+        seen_queries: set[str] = set()
+        for raw_query in queries:
+            normalized_query = re.sub(r"\s+", " ", str(raw_query or "")).strip()
+            query_key = normalized_query.casefold()
+            if normalized_query and query_key not in seen_queries:
+                seen_queries.add(query_key)
+                query_list.append(normalized_query)
+            if len(query_list) >= 4:
+                break
+        if not query_list:
+            return []
+
+        docs_meta = self.load_docs_meta()
+        is_discovery = self._is_paper_discovery_query(query_list[0])
+        pairs: list[tuple[str, str]] = []
+        pair_targets: list[tuple[str, int | str]] = []
+
+        for index, candidate in enumerate(candidates):
+            paper_id = str(candidate.get("paper_id", ""))
+            paper_meta = docs_meta.get(paper_id, {})
+            title = str(
+                paper_meta.get("title")
+                or candidate.get("paper_title")
+                or candidate.get("title")
+                or ""
+            )
+            section = str(
+                candidate.get("heading_path") or candidate.get("section") or ""
+            )
+            text = str(candidate.get("text", ""))[:6000]
+            rerank_document = (
+                f"Title: {title}\nSection: {section}\nContent: {text}"
+            )
+            for rerank_query in query_list:
+                pairs.append((rerank_query, rerank_document))
+                pair_targets.append(("chunk", index))
+
+        paper_keys: list[str] = []
+        if is_discovery:
+            first_candidate_by_paper: dict[str, dict[str, Any]] = {}
+            for index, candidate in enumerate(candidates):
+                key = str(candidate.get("paper_id") or candidate.get("chunk_id") or index)
+                first_candidate_by_paper.setdefault(key, candidate)
+            paper_keys = list(first_candidate_by_paper)
+            for paper_key in paper_keys:
+                candidate = first_candidate_by_paper[paper_key]
+                paper_id = str(candidate.get("paper_id", ""))
+                paper_meta = docs_meta.get(paper_id, {})
+                title = str(
+                    paper_meta.get("title")
+                    or candidate.get("paper_title")
+                    or candidate.get("title")
+                    or ""
+                )
+                abstract = str(paper_meta.get("abstract") or "")[:5000]
+                if not abstract:
+                    abstract = str(candidate.get("text", ""))[:1500]
+                paper_document = f"Title: {title}\nAbstract: {abstract}"
+                for rerank_query in query_list:
+                    pairs.append((rerank_query, paper_document))
+                    pair_targets.append(("paper", paper_key))
+
+        try:
+            pair_scores = await self.rerank_pairs(pairs)
+        except Exception as exc:
+            logger.error("Retrieval relevance reranking failed: {}", exc)
+            if self.config.retrieval_relevance_fail_closed:
+                logger.warning(
+                    "Retrieval relevance filter failed closed; suppressing {} unverified chunks",
+                    len(candidates),
+                )
+                return []
+            return _select_diverse(
+                candidates,
+                k=desired,
+                per_paper_limit=max(1, per_paper_limit),
+                mmr_lambda=self.config.mmr_lambda,
+            )
+
+        chunk_scores: dict[int, float] = {}
+        paper_scores: dict[str, float] = {}
+        for (target_type, target), relevance_score in zip(pair_targets, pair_scores):
+            if target_type == "chunk":
+                index = int(target)
+                chunk_scores[index] = max(chunk_scores.get(index, 0.0), relevance_score)
+            else:
+                paper_key = str(target)
+                paper_scores[paper_key] = max(
+                    paper_scores.get(paper_key, 0.0), relevance_score
+                )
+
+        threshold = max(
+            0.0,
+            min(1.0, float(self.config.retrieval_min_relevance_score)),
+        )
+        filtered: list[dict[str, Any]] = []
+        for index, candidate in enumerate(candidates):
+            relevance_score = float(chunk_scores.get(index, 0.0))
+            paper_key = str(
+                candidate.get("paper_id") or candidate.get("chunk_id") or index
+            )
+            paper_relevance_score = paper_scores.get(paper_key)
+            if relevance_score < threshold:
+                continue
+            if (
+                is_discovery
+                and paper_relevance_score is not None
+                and paper_relevance_score < threshold
+            ):
+                continue
+
+            original_score = float(candidate.get("score", 0.0) or 0.0)
+            candidate["retrieval_score"] = round(original_score, 6)
+            if candidate.get("score_type") == "weighted_rrf":
+                candidate["fusion_score"] = round(original_score, 6)
+            candidate["relevance_score"] = round(relevance_score, 6)
+            if paper_relevance_score is not None:
+                candidate["paper_relevance_score"] = round(
+                    float(paper_relevance_score), 6
+                )
+            candidate["score"] = relevance_score
+            candidate["score_type"] = "cross_encoder_relevance"
+            filtered.append(candidate)
+
+        filtered.sort(
+            key=lambda item: (
+                float(item.get("relevance_score", 0.0) or 0.0),
+                float(item.get("retrieval_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        selected = _select_diverse(
+            filtered,
+            k=desired,
+            per_paper_limit=max(1, per_paper_limit),
+            mmr_lambda=self.config.mmr_lambda,
+        )
+        logger.info(
+            "Retrieval relevance filter: candidates={} accepted={} returned={} "
+            "threshold={:.3f} paper_discovery={}",
+            len(candidates),
+            len(filtered),
+            len(selected),
+            threshold,
+            is_discovery,
+        )
+        return selected
 
     def split_into_chunks(self, text: str) -> list[str]:
         clean = text.strip()
@@ -1222,6 +2163,19 @@ class PaperKnowledgeBase:
             "source": doc.get("source", "unknown"),
             "year": doc.get("year"),
             "venue": doc.get("venue", ""),
+            "uploaded_at": doc.get("uploaded_at"),
+            "original_filename": doc.get("original_filename", ""),
+            "content_sha256": doc.get("content_sha256", ""),
+            "size_bytes": doc.get("size_bytes"),
+            "page_count": doc.get("page_count"),
+            "parser_name": doc.get("parser_name", ""),
+            "parse_quality_score": doc.get("parse_quality_score"),
+            "parsed_page_count": doc.get("parsed_page_count"),
+            "page_coverage_ratio": doc.get("page_coverage_ratio"),
+            "text_char_count": doc.get("text_char_count"),
+            "doi": doc.get("doi", ""),
+            "arxiv_id": doc.get("arxiv_id", ""),
+            "metadata_provenance": doc.get("metadata_provenance", {}),
             "updated_at": now,
         }
         new_chunks: list[dict[str, Any]] = []
@@ -1259,6 +2213,7 @@ class PaperKnowledgeBase:
         await self._persist_paper_rows(doc_row=doc_row, chunk_rows=new_chunks)
         await self._replace_lexical_paper(doc_row=doc_row, chunk_rows=new_chunks)
         embedding_status = self.get_embedding_status()
+        vector_index_status = self.get_vector_index_status()
         lexical_status = self.get_lexical_status()
         return {
             "paper_id": paper_id,
@@ -1266,11 +2221,32 @@ class PaperKnowledgeBase:
             "distilled": bool(distilled_chunks),
             "storage_backend": "jsonl",
             "embedding": embedding_status,
+            "vector_index": vector_index_status,
             "lexical": lexical_status,
             "degraded": bool(embedding_status["degraded"] or lexical_status["degraded"]),
         }
 
+    async def _paper_lock(self, paper_id: str) -> asyncio.Lock:
+        async with self._paper_locks_guard:
+            return self._paper_locks.setdefault(paper_id, asyncio.Lock())
+
     async def upsert_semantic_chunks(
+        self,
+        doc: dict[str, Any],
+        semantic_chunks: list[dict[str, Any]],
+        chunk_metadata: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Serialize replacement of one paper across all configured backends."""
+        paper_id = str(doc.get("paper_id") or doc.get("id") or "paper")
+        lock = await self._paper_lock(paper_id)
+        async with lock:
+            return await self._upsert_semantic_chunks_unlocked(
+                doc=doc,
+                semantic_chunks=semantic_chunks,
+                chunk_metadata=chunk_metadata,
+            )
+
+    async def _upsert_semantic_chunks_unlocked(
         self,
         doc: dict[str, Any],
         semantic_chunks: list[dict[str, Any]],
@@ -1308,6 +2284,19 @@ class PaperKnowledgeBase:
             "source": doc.get("source", "unknown"),
             "year": doc.get("year"),
             "venue": doc.get("venue", ""),
+            "uploaded_at": doc.get("uploaded_at"),
+            "original_filename": doc.get("original_filename", ""),
+            "content_sha256": doc.get("content_sha256", ""),
+            "size_bytes": doc.get("size_bytes"),
+            "page_count": doc.get("page_count"),
+            "parser_name": doc.get("parser_name", ""),
+            "parse_quality_score": doc.get("parse_quality_score"),
+            "parsed_page_count": doc.get("parsed_page_count"),
+            "page_coverage_ratio": doc.get("page_coverage_ratio"),
+            "text_char_count": doc.get("text_char_count"),
+            "doi": doc.get("doi", ""),
+            "arxiv_id": doc.get("arxiv_id", ""),
+            "metadata_provenance": doc.get("metadata_provenance", {}),
             "updated_at": now,
         }
 
@@ -1327,12 +2316,16 @@ class PaperKnowledgeBase:
                 "section": chunk.get("section", "content"),
                 "heading_level": chunk.get("heading_level", 0),
                 "heading_path": chunk.get("heading_path", "content"),
+                "page_start": chunk.get("page_start"),
+                "page_end": chunk.get("page_end"),
                 "kind": "semantic_chunk",
                 "summary": meta.get("summary", chunk_text[:200]),
                 "hypothetical_questions": meta.get("hypothetical_questions", []),
                 "keywords": meta.get("keywords", []),
                 "entities": meta.get("entities", []),
                 "claims": meta.get("claims", []),
+                "content_sha256": doc.get("content_sha256", ""),
+                "parser_name": doc.get("parser_name", ""),
                 "updated_at": now,
             })
 
@@ -1342,14 +2335,30 @@ class PaperKnowledgeBase:
         for row, embedding in zip(parent_rows, parent_embeddings):
             row["embedding"] = embedding
 
-        await self._persist_paper_rows(doc_row=doc_row, chunk_rows=parent_rows)
-        await self._replace_lexical_paper(doc_row=doc_row, chunk_rows=parent_rows)
+        vector_dimension = (
+            len(parent_embeddings[0])
+            if parent_embeddings and parent_embeddings[0]
+            else self._embedding_dimension
+        )
+        if (
+            self._chroma_client is not None
+            and vector_dimension is not None
+            and not await self._ensure_vector_index_compatible(vector_dimension)
+        ):
+            reason = self._vector_index_status.get("reason", "incompatible index")
+            raise RuntimeError(
+                f"Chroma vector index is incompatible ({reason}); "
+                "run `nanobot paper reindex` before ingesting more papers"
+            )
+
         embedding_status = self.get_embedding_status()
-        lexical_status = self.get_lexical_status()
 
         # If Chroma is unavailable, parent-chunk retrieval remains functional.
         if not self._chroma_client or not self._summary_collection:
             logger.warning("Chroma not available, falling back to traditional upsert")
+            await self._persist_paper_rows(doc_row=doc_row, chunk_rows=parent_rows)
+            await self._replace_lexical_paper(doc_row=doc_row, chunk_rows=parent_rows)
+            lexical_status = self.get_lexical_status()
             return {
                 "paper_id": paper_id,
                 "chunk_count": len(parent_rows),
@@ -1367,9 +2376,6 @@ class PaperKnowledgeBase:
                     ) if reason
                 ],
             }
-
-        # Clear existing chunks for this paper
-        self._delete_paper_from_chroma(paper_id)
 
         parent_ids: list[str] = []
         parent_documents: list[str] = []
@@ -1395,8 +2401,13 @@ class PaperKnowledgeBase:
                 "paper_year": str(doc.get("year") or ""),
                 "paper_source": doc.get("source", "unknown"),
                 "section": section,
+                "chunk_index": int(row.get("chunk_index", 0)),
                 "heading_level": str(heading_level),
                 "heading_path": heading_path,
+                "page_start": str(row.get("page_start") or ""),
+                "page_end": str(row.get("page_end") or ""),
+                "content_sha256": str(row.get("content_sha256") or ""),
+                "parser_name": str(row.get("parser_name") or ""),
                 "keywords": json.dumps(keywords),
                 "entities": json.dumps(entities),
                 "claims": json.dumps(claims),
@@ -1415,7 +2426,10 @@ class PaperKnowledgeBase:
                         "paper_year": str(doc.get("year") or ""),
                         "chunk_id": chunk_id,
                         "section": section,
+                        "chunk_index": int(row.get("chunk_index", 0)),
                         "heading_path": heading_path,
+                        "page_start": str(row.get("page_start") or ""),
+                        "page_end": str(row.get("page_end") or ""),
                         "type": "summary",
                     },
                 ))
@@ -1436,20 +2450,14 @@ class PaperKnowledgeBase:
                         "paper_year": str(doc.get("year") or ""),
                         "chunk_id": chunk_id,
                         "section": section,
+                        "chunk_index": int(row.get("chunk_index", 0)),
                         "heading_path": heading_path,
+                        "page_start": str(row.get("page_start") or ""),
+                        "page_end": str(row.get("page_end") or ""),
                         "question_idx": str(question_index),
                         "type": "hypothetical_question",
                     },
                 ))
-
-        if parent_ids:
-            await self._upsert_chroma_batches(
-                self._chunk_collection,
-                ids=parent_ids,
-                embeddings=[list(row.get("embedding", [])) for row in parent_rows],
-                documents=parent_documents,
-                metadatas=parent_metadatas,
-            )
 
         auxiliary_records = summary_records + question_records
         auxiliary_embeddings = await self.embed_texts(
@@ -1458,22 +2466,64 @@ class PaperKnowledgeBase:
         summary_embeddings = auxiliary_embeddings[:len(summary_records)]
         question_embeddings = auxiliary_embeddings[len(summary_records):]
 
-        if summary_records:
-            await self._upsert_chroma_batches(
-                self._summary_collection,
-                ids=[record[0] for record in summary_records],
-                embeddings=summary_embeddings,
-                documents=[record[1] for record in summary_records],
-                metadatas=[record[2] for record in summary_records],
+        # Validate/stamp immutable collection configuration before changing any
+        # paper data. A metadata failure must not happen after JSONL/FTS commit,
+        # otherwise only Chroma can be rolled back and the backends diverge.
+        if vector_dimension is not None:
+            self._stamp_vector_collections(
+                [
+                    self._chunk_collection,
+                    self._summary_collection,
+                    self._question_collection,
+                ],
+                dimension=vector_dimension,
             )
-        if question_records:
-            await self._upsert_chroma_batches(
-                self._question_collection,
-                ids=[record[0] for record in question_records],
-                embeddings=question_embeddings,
-                documents=[record[1] for record in question_records],
-                metadatas=[record[2] for record in question_records],
+            self._refresh_vector_index_status(
+                expected_dimension=vector_dimension,
             )
+
+        previous_vectors = self._snapshot_paper_from_chroma(paper_id)
+        try:
+            self._delete_paper_from_chroma(paper_id, strict=True)
+            if parent_ids:
+                await self._upsert_chroma_batches(
+                    self._chunk_collection,
+                    ids=parent_ids,
+                    embeddings=[list(row.get("embedding", [])) for row in parent_rows],
+                    documents=parent_documents,
+                    metadatas=parent_metadatas,
+                )
+            if summary_records:
+                await self._upsert_chroma_batches(
+                    self._summary_collection,
+                    ids=[record[0] for record in summary_records],
+                    embeddings=summary_embeddings,
+                    documents=[record[1] for record in summary_records],
+                    metadatas=[record[2] for record in summary_records],
+                )
+            if question_records:
+                await self._upsert_chroma_batches(
+                    self._question_collection,
+                    ids=[record[0] for record in question_records],
+                    embeddings=question_embeddings,
+                    documents=[record[1] for record in question_records],
+                    metadatas=[record[2] for record in question_records],
+                )
+            await self._persist_paper_rows(doc_row=doc_row, chunk_rows=parent_rows)
+            await self._replace_lexical_paper(doc_row=doc_row, chunk_rows=parent_rows)
+        except Exception:
+            logger.exception(
+                "Paper index commit failed for {}; restoring previous Chroma snapshot",
+                paper_id,
+            )
+            try:
+                self._delete_paper_from_chroma(paper_id, strict=True)
+                await self._restore_chroma_snapshot(previous_vectors)
+            except Exception:
+                logger.exception("Chroma rollback also failed for {}", paper_id)
+            raise
+
+        lexical_status = self.get_lexical_status()
 
         question_count = len(question_records)
 
@@ -1502,43 +2552,318 @@ class PaperKnowledgeBase:
             ],
         }
 
-    def _delete_paper_from_chroma(self, paper_id: str) -> None:
+    def _snapshot_paper_from_chroma(
+        self,
+        paper_id: str,
+    ) -> list[tuple[Any, dict[str, Any]]]:
+        """Capture existing vectors so a failed multi-collection replace can roll back."""
+        snapshots: list[tuple[Any, dict[str, Any]]] = []
+        for collection in (
+            self._chunk_collection,
+            self._summary_collection,
+            self._question_collection,
+        ):
+            if collection is None:
+                continue
+            payload = collection.get(
+                where={"paper_id": paper_id},
+                include=["embeddings", "documents", "metadatas"],
+            )
+            if payload.get("ids"):
+                snapshots.append((collection, payload))
+        return snapshots
+
+    async def _restore_chroma_snapshot(
+        self,
+        snapshots: list[tuple[Any, dict[str, Any]]],
+    ) -> None:
+        for collection, payload in snapshots:
+            kwargs = {
+                key: payload.get(key)
+                for key in ("ids", "embeddings", "documents", "metadatas")
+                if payload.get(key) is not None
+            }
+            if kwargs.get("ids"):
+                await asyncio.to_thread(collection.upsert, **kwargs)
+
+    @staticmethod
+    def _safe_storage_paper_id(paper_id: str) -> str:
+        """Mirror the ingest filename mapping without importing the tool layer."""
+        clean = re.sub(r"[^A-Za-z0-9._-]+", "_", paper_id).strip("._") or "paper"
+        if clean != paper_id or len(clean) > 120:
+            digest = hashlib.sha256(paper_id.encode("utf-8")).hexdigest()[:8]
+            clean = f"{clean[:108]}-{digest}"
+        return clean
+
+    def _paper_artifact_candidates(
+        self,
+        *,
+        paper_id: str,
+        documents: list[dict[str, Any]],
+    ) -> set[Path]:
+        """Return explicit local PDF/Markdown candidates owned by one paper."""
+        candidates: set[Path] = set()
+        safe_id = self._safe_storage_paper_id(paper_id)
+        downloads_dir = self.base_dir / "downloads"
+        candidates.update({
+            downloads_dir / f"{safe_id}.pdf",
+            downloads_dir / f"{safe_id}.md",
+        })
+        for document in documents:
+            content_sha256 = str(document.get("content_sha256", "")).lower()
+            if re.fullmatch(r"[0-9a-f]{64}", content_sha256):
+                upload_path = self.base_dir / "uploads" / content_sha256
+                candidates.update({
+                    upload_path.with_suffix(".pdf"),
+                    upload_path.with_suffix(".md"),
+                })
+
+            raw_url = str(document.get("url", "")).strip()
+            if not raw_url or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", raw_url):
+                continue
+            path = Path(raw_url)
+            if not path.is_absolute():
+                path = self.workspace / path
+            candidates.add(path)
+        return candidates
+
+    def _safe_local_artifact(self, path: Path) -> Path | None:
+        """Resolve a candidate only when it is a regular KB-managed PDF/Markdown."""
+        if path.suffix.lower() not in {".pdf", ".md"} or path.is_symlink():
+            return None
+        try:
+            resolved = path.resolve(strict=False)
+            managed_roots = (
+                (self.base_dir / "uploads").resolve(strict=False),
+                (self.base_dir / "downloads").resolve(strict=False),
+            )
+        except OSError:
+            return None
+        if not any(resolved.is_relative_to(root) for root in managed_roots):
+            return None
+        return resolved
+
+    @staticmethod
+    def _asset_belongs_to_paper(row: dict[str, Any], paper_id: str) -> bool:
+        value = row.get("value")
+        if isinstance(value, dict) and value.get("paper_id"):
+            return str(value["paper_id"]) == paper_id
+        key = str(row.get("key", ""))
+        return re.fullmatch(
+            rf"{re.escape(paper_id)}_(?:Figure|Table)_\d+(?:\.\d+)*",
+            key,
+            re.IGNORECASE,
+        ) is not None
+
+    async def delete_paper(
+        self,
+        paper_id: str,
+        *,
+        delete_files: bool = True,
+    ) -> dict[str, Any]:
+        """Delete one paper consistently across canonical and derived stores.
+
+        JSONL metadata/chunks, Chroma collections, the SQLite FTS index and
+        figure/table records are committed as one logical operation.  Local
+        PDF/Markdown files are removed only after that commit succeeds and only
+        when they resolve inside the managed uploads/downloads directories.
+        """
+        normalized_id = str(paper_id or "").strip()
+        if (
+            not normalized_id
+            or len(normalized_id) > 512
+            or any(char in normalized_id for char in ("\0", "\n", "\r"))
+        ):
+            raise ValueError("paper_id must be a non-empty single-line identifier")
+
+        paper_lock = await self._paper_lock(normalized_id)
+        async with paper_lock:
+            assets_path = self.base_dir / "figures.jsonl"
+            async with self._assets_lock:
+                async with self._jsonl_lock:
+                    previous_documents = self._read_jsonl(self.docs_file)
+                    previous_chunks = self._read_jsonl(self.chunks_file)
+                    previous_assets = self._read_jsonl(assets_path)
+                    matched_documents = [
+                        row for row in previous_documents
+                        if str(row.get("paper_id", "")) == normalized_id
+                    ]
+                    matched_chunks = [
+                        row for row in previous_chunks
+                        if str(row.get("paper_id", "")) == normalized_id
+                    ]
+                    matched_assets = [
+                        row for row in previous_assets
+                        if self._asset_belongs_to_paper(row, normalized_id)
+                    ]
+                    remaining_documents = [
+                        row for row in previous_documents
+                        if str(row.get("paper_id", "")) != normalized_id
+                    ]
+                    remaining_chunks = [
+                        row for row in previous_chunks
+                        if str(row.get("paper_id", "")) != normalized_id
+                    ]
+                    remaining_assets = [
+                        row for row in previous_assets
+                        if not self._asset_belongs_to_paper(row, normalized_id)
+                    ]
+                    previous_vectors = self._snapshot_paper_from_chroma(normalized_id)
+                    vector_counts = {
+                        str(getattr(collection, "name", "unknown")): len(
+                            payload.get("ids") or []
+                        )
+                        for collection, payload in previous_vectors
+                    }
+
+                    found = bool(
+                        matched_documents
+                        or matched_chunks
+                        or matched_assets
+                        or any(vector_counts.values())
+                    )
+                    if not found:
+                        return {
+                            "status": "not_found",
+                            "deleted": False,
+                            "paper_id": normalized_id,
+                        }
+
+                    rollback_errors: list[str] = []
+                    try:
+                        self._delete_paper_from_chroma(normalized_id, strict=True)
+                        self._write_jsonl(self.docs_file, remaining_documents)
+                        self._write_jsonl(self.chunks_file, remaining_chunks)
+                        if assets_path.exists() or matched_assets:
+                            self._write_jsonl(assets_path, remaining_assets)
+                        await self._replace_lexical_paper_strict(
+                            doc_row={"paper_id": normalized_id, "title": ""},
+                            chunk_rows=[],
+                        )
+                        self._lexical_last_error = ""
+                    except Exception as exc:
+                        logger.exception(
+                            "Paper deletion failed for {}; restoring storage snapshots",
+                            normalized_id,
+                        )
+                        try:
+                            self._write_jsonl(self.docs_file, previous_documents)
+                            self._write_jsonl(self.chunks_file, previous_chunks)
+                            if assets_path.exists() or previous_assets:
+                                self._write_jsonl(assets_path, previous_assets)
+                        except Exception as rollback_exc:
+                            rollback_errors.append(f"jsonl: {rollback_exc}")
+                            logger.exception("JSONL rollback failed for {}", normalized_id)
+                        try:
+                            self._delete_paper_from_chroma(normalized_id, strict=True)
+                            await self._restore_chroma_snapshot(previous_vectors)
+                        except Exception as rollback_exc:
+                            rollback_errors.append(f"chroma: {rollback_exc}")
+                            logger.exception("Chroma rollback failed for {}", normalized_id)
+                        try:
+                            await self._replace_lexical_paper_strict(
+                                doc_row=matched_documents[0] if matched_documents else {
+                                    "paper_id": normalized_id,
+                                    "title": "",
+                                },
+                                chunk_rows=matched_chunks,
+                            )
+                        except Exception as rollback_exc:
+                            rollback_errors.append(f"lexical: {rollback_exc}")
+                            self._lexical_last_error = str(rollback_exc)
+                            logger.exception("FTS rollback failed for {}", normalized_id)
+                        detail = (
+                            f"; rollback errors: {', '.join(rollback_errors)}"
+                            if rollback_errors else ""
+                        )
+                        raise RuntimeError(
+                            f"failed to delete paper {normalized_id}{detail}"
+                        ) from exc
+
+            deleted_files: list[str] = []
+            artifact_errors: list[str] = []
+            if delete_files:
+                remaining_artifacts = {
+                    safe_path
+                    for row in remaining_documents
+                    for candidate in self._paper_artifact_candidates(
+                        paper_id=str(row.get("paper_id", "")),
+                        documents=[row],
+                    )
+                    if (safe_path := self._safe_local_artifact(candidate)) is not None
+                }
+                candidates = self._paper_artifact_candidates(
+                    paper_id=normalized_id,
+                    documents=matched_documents,
+                )
+                for candidate in sorted(candidates, key=str):
+                    safe_path = self._safe_local_artifact(candidate)
+                    if safe_path is None or safe_path in remaining_artifacts:
+                        continue
+                    try:
+                        if safe_path.is_file():
+                            safe_path.unlink()
+                            try:
+                                display_path = safe_path.relative_to(
+                                    self.workspace.resolve(strict=False)
+                                )
+                            except ValueError:
+                                display_path = safe_path
+                            deleted_files.append(str(display_path))
+                    except OSError as exc:
+                        artifact_errors.append(f"{safe_path.name}: {exc}")
+                        logger.warning(
+                            "Paper {} index was deleted but artifact {} could not be removed: {}",
+                            normalized_id,
+                            safe_path,
+                            exc,
+                        )
+
+            status = "partial" if artifact_errors else "deleted"
+            return {
+                "status": status,
+                "deleted": True,
+                "paper_id": normalized_id,
+                "deleted_document_count": len(matched_documents),
+                "deleted_chunk_count": len(matched_chunks),
+                "deleted_asset_count": len(matched_assets),
+                "deleted_vector_count": sum(vector_counts.values()),
+                "deleted_vectors": vector_counts,
+                "deleted_files": deleted_files,
+                "artifact_errors": artifact_errors,
+            }
+
+    def _delete_paper_from_chroma(self, paper_id: str, *, strict: bool = False) -> None:
         """Delete all chunks, summaries, and questions for a paper from Chroma."""
         if not self._chroma_client:
             return
-        
+
         try:
-            # Get all IDs for this paper
-            # Note: Chroma doesn't support delete by metadata filter directly,
-            # so we need to query and delete by IDs
-            
-            # Delete from chunks
-            chunk_ids = self._chunk_collection.get(
-                where={"paper_id": paper_id},
-            ).get("ids", [])
-            if chunk_ids:
-                self._chunk_collection.delete(ids=chunk_ids)
-            
-            # Delete from summaries
-            summary_ids = self._summary_collection.get(
-                where={"paper_id": paper_id},
-            ).get("ids", [])
-            if summary_ids:
-                self._summary_collection.delete(ids=summary_ids)
-            
-            # Delete from questions
-            question_ids = self._question_collection.get(
-                where={"paper_id": paper_id},
-            ).get("ids", [])
-            if question_ids:
-                self._question_collection.delete(ids=question_ids)
-            
-            if summary_ids or question_ids:
-                logger.debug("Deleted paper {} from Chroma: chunks={}, summaries={}, questions={}", 
-                            paper_id, len(chunk_ids), len(summary_ids), len(question_ids))
-            
-        except Exception as e:
-            logger.warning("Failed to delete paper {} from Chroma: {}", paper_id, e)
+            counts: dict[str, int] = {}
+            for name, collection in (
+                ("chunks", self._chunk_collection),
+                ("summaries", self._summary_collection),
+                ("questions", self._question_collection),
+            ):
+                if collection is None:
+                    counts[name] = 0
+                    continue
+                ids = collection.get(where={"paper_id": paper_id}).get("ids", [])
+                counts[name] = len(ids)
+                if ids:
+                    collection.delete(ids=ids)
+            if any(counts.values()):
+                logger.debug(
+                    "Deleted paper {} from Chroma: chunks={}, summaries={}, questions={}",
+                    paper_id,
+                    counts["chunks"],
+                    counts["summaries"],
+                    counts["questions"],
+                )
+        except Exception as exc:
+            logger.warning("Failed to delete paper {} from Chroma: {}", paper_id, exc)
+            if strict:
+                raise
 
     async def _retrieve_jsonl_multiquery(
         self,
@@ -1636,6 +2961,10 @@ class PaperKnowledgeBase:
             )
 
         k = max(1, top_k or self.config.retrieval_top_k)
+        candidate_k = self.retrieval_candidate_count(k)
+        relevance_queries = [
+            item for item in [query, *(queries or [])] if str(item or "").strip()
+        ]
         mode_collections = {
             "hybrid": (self._chunk_collection, self._summary_collection, self._question_collection),
             "chunks_only": (self._chunk_collection,),
@@ -1646,13 +2975,20 @@ class PaperKnowledgeBase:
             collection is not None for collection in mode_collections[search_mode]
         ):
             logger.warning("Chroma not available, falling back to traditional retrieve")
-            return await self._retrieve_jsonl_multiquery(
+            fallback_results = await self._retrieve_jsonl_multiquery(
                 query=query,
                 queries=queries,
                 entities=entities,
+                top_k=candidate_k,
+                per_paper_limit=per_paper_limit,
+            )
+            filtered_results = await self.rerank_and_filter_retrieval_results(
+                fallback_results,
+                queries=relevance_queries,
                 top_k=k,
                 per_paper_limit=per_paper_limit,
             )
+            return _public_retrieval_results(filtered_results)
         
         # --- Entity-aware retrieval ---
         if entities:
@@ -1660,42 +2996,55 @@ class PaperKnowledgeBase:
                 entities=entities,
                 query=query,
                 queries=queries,
-                top_k=k,
+                top_k=candidate_k,
                 per_paper_limit=per_paper_limit,
                 search_mode=search_mode,
                 use_hybrid=use_hybrid,
             )
-            if entity_results or not self.chunks_file.exists():
-                return entity_results
-            logger.warning("Chroma entity lookup returned no chunks; retrying against JSONL fallback")
-            return await self._retrieve_jsonl_multiquery(
-                query=query,
-                queries=queries,
-                entities=entities,
+            if not entity_results and self.chunks_file.exists():
+                logger.warning(
+                    "Chroma entity lookup returned no chunks; retrying against JSONL fallback"
+                )
+                entity_results = await self._retrieve_jsonl_multiquery(
+                    query=query,
+                    queries=queries,
+                    entities=entities,
+                    top_k=candidate_k,
+                    per_paper_limit=per_paper_limit,
+                )
+            filtered_results = await self.rerank_and_filter_retrieval_results(
+                entity_results,
+                queries=relevance_queries,
                 top_k=k,
                 per_paper_limit=per_paper_limit,
             )
+            return _public_retrieval_results(filtered_results)
         
         results = await self._retrieve_dense_hybrid(
             query=query,
             queries=queries,
-            top_k=k,
+            top_k=candidate_k,
             per_paper_limit=per_paper_limit,
             search_mode=search_mode,
             where_filter=where_filter,
             use_hybrid=use_hybrid,
         )
-        if results or not self.chunks_file.exists():
-            return results
-
-        logger.warning("Chroma returned no paper chunks; retrying against JSONL fallback")
-        return await self._retrieve_jsonl_multiquery(
-            query=query,
-            queries=queries,
-            entities=entities,
+        if not results and self.chunks_file.exists():
+            logger.warning("Chroma returned no paper chunks; retrying against JSONL fallback")
+            results = await self._retrieve_jsonl_multiquery(
+                query=query,
+                queries=queries,
+                entities=entities,
+                top_k=candidate_k,
+                per_paper_limit=per_paper_limit,
+            )
+        filtered_results = await self.rerank_and_filter_retrieval_results(
+            results,
+            queries=relevance_queries,
             top_k=k,
             per_paper_limit=per_paper_limit,
         )
+        return _public_retrieval_results(filtered_results)
 
     async def _retrieve_by_entities(
         self,
@@ -1816,6 +3165,22 @@ class PaperKnowledgeBase:
                 item["paper_title"] = meta.get("paper_title", "")
                 item["paper_year"] = meta.get("paper_year")
                 item["paper_source"] = meta.get("paper_source", "")
+                for key in (
+                    "section", "heading_level", "heading_path", "page_start", "page_end",
+                ):
+                    if meta.get(key) not in (None, ""):
+                        item[key] = meta[key]
+
+                raw_chunk_index = meta.get("chunk_index")
+                if raw_chunk_index in (None, ""):
+                    # Existing Chroma collections predate chunk_index metadata.
+                    # Semantic chunk IDs end with the original numeric index,
+                    # so old indexes can still preserve source order immediately.
+                    raw_chunk_index = chunk_id.rsplit(":", 1)[-1]
+                try:
+                    item["chunk_index"] = int(raw_chunk_index)
+                except (TypeError, ValueError):
+                    item["chunk_index"] = None
                 for key in ("keywords", "entities", "claims"):
                     try:
                         item[key] = json.loads(meta.get(key, "[]"))
@@ -1891,6 +3256,13 @@ class PaperKnowledgeBase:
         valid_query_embeddings = [
             embedding for embedding in query_embeddings if embedding
         ]
+        if valid_query_embeddings:
+            vector_dimension = len(valid_query_embeddings[0])
+            if not await self._ensure_vector_index_compatible(vector_dimension):
+                # Keep the persistent BM25 path available. Querying every
+                # incompatible collection would only repeat the same Chroma
+                # dimension exception once per view and per request.
+                valid_query_embeddings = []
 
         # One batched Chroma query per enabled view instead of one call per
         # rewritten query. Each returned row remains an independent RRF list.
@@ -2180,6 +3552,19 @@ class PaperKnowledgeBase:
                 "url": d.get("url", ""),
                 "year": d.get("year"),
                 "source": d.get("source", ""),
+                "uploaded_at": d.get("uploaded_at"),
+                "original_filename": d.get("original_filename", ""),
+                "content_sha256": d.get("content_sha256", ""),
+                "size_bytes": d.get("size_bytes"),
+                "page_count": d.get("page_count"),
+                "parser_name": d.get("parser_name", ""),
+                "parse_quality_score": d.get("parse_quality_score"),
+                "parsed_page_count": d.get("parsed_page_count"),
+                "page_coverage_ratio": d.get("page_coverage_ratio"),
+                "text_char_count": d.get("text_char_count"),
+                "doi": d.get("doi", ""),
+                "arxiv_id": d.get("arxiv_id", ""),
+                "metadata_provenance": d.get("metadata_provenance", {}),
             }
         return meta
 
@@ -2209,6 +3594,7 @@ class PaperKnowledgeBase:
                 logger.debug("Unable to read Chroma stats: {}", exc)
 
         embedding_status = self.get_embedding_status()
+        vector_index_status = self.get_vector_index_status()
         lexical_status = self.get_lexical_status()
         lexical_count = lexical_status.get("document_count")
         lexical_consistent = (
@@ -2216,11 +3602,17 @@ class PaperKnowledgeBase:
             if isinstance(lexical_count, int)
             else None
         )
-        backends_consistent = chroma_consistent is True and lexical_consistent is True
+        vector_compatible = vector_index_status.get("compatible") is not False
+        backends_consistent = (
+            chroma_consistent is True
+            and lexical_consistent is True
+            and vector_compatible
+        )
         storage_degraded = (
             self._chunk_collection is None
             or chroma_consistent is not True
             or lexical_consistent is not True
+            or not vector_compatible
         )
         degradation_reasons: list[str] = []
         if self._chunk_collection is None:
@@ -2233,6 +3625,8 @@ class PaperKnowledgeBase:
             degradation_reasons.append("lexical_jsonl_inconsistent")
         if embedding_status.get("reason"):
             degradation_reasons.append(str(embedding_status["reason"]))
+        if vector_index_status.get("reason") and not vector_compatible:
+            degradation_reasons.append(str(vector_index_status["reason"]))
 
         if self._chunk_collection is not None and self._lexical_index is not None:
             storage_backend = "chroma+sqlite_fts5+jsonl"
@@ -2254,6 +3648,7 @@ class PaperKnowledgeBase:
             "lexical_consistent": lexical_consistent,
             "backends_consistent": backends_consistent,
             "embedding": embedding_status,
+            "vector_index": vector_index_status,
             "lexical": lexical_status,
             "degraded": storage_degraded or bool(embedding_status["degraded"]),
             "degradation_reasons": degradation_reasons,
@@ -2265,6 +3660,10 @@ class PaperKnowledgeBase:
                     "year": row.get("year"),
                     "chunk_count": chunk_counts.get(str(row.get("paper_id", "")), 0),
                     "updated_at": row.get("updated_at", ""),
+                    "page_count": row.get("page_count"),
+                    "parser_name": row.get("parser_name", ""),
+                    "parse_quality_score": row.get("parse_quality_score"),
+                    "page_coverage_ratio": row.get("page_coverage_ratio"),
                 }
                 for row in recent
             ],

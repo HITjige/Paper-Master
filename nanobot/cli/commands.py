@@ -62,6 +62,8 @@ app = typer.Typer(
     help=f"{__logo__} nanobot - Personal AI Assistant",
     no_args_is_help=True,
 )
+paper_app = typer.Typer(help="Inspect and maintain the paper knowledge-base index")
+app.add_typer(paper_app, name="paper")
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
@@ -519,6 +521,94 @@ def _warn_deprecated_config_keys(config_path: Path | None) -> None:
         )
 
 
+def _paper_kb_from_config(config: Config):
+    """Create the maintenance-mode paper KB without starting an agent/provider."""
+    from nanobot.agent.paper_kb import PaperKbConfig, PaperKnowledgeBase
+
+    paper = config.tools.paper
+    return PaperKnowledgeBase(
+        workspace=config.workspace_path,
+        config=PaperKbConfig(
+            enabled=paper.enable,
+            embedding_api_key=paper.embedding_api_key,
+            embedding_api_base=paper.embedding_api_base,
+            embedding_model=paper.embedding_model,
+            embedding_fallback=paper.embedding_fallback,
+            embedding_batch_size=paper.embedding_batch_size,
+            rerank_model=paper.rerank_model,
+            metadata_concurrency=paper.metadata_concurrency,
+            retrieval_top_k=paper.retrieval_top_k,
+            max_chunk_chars=paper.max_chunk_chars,
+            min_chunk_chars=paper.min_chunk_chars,
+            rrf_k=paper.rrf_k,
+            dense_rrf_weight=paper.dense_rrf_weight,
+            sparse_rrf_weight=paper.sparse_rrf_weight,
+            bm25_title_weight=paper.bm25_title_weight,
+            bm25_keywords_weight=paper.bm25_keywords_weight,
+            bm25_summary_weight=paper.bm25_summary_weight,
+            bm25_questions_weight=paper.bm25_questions_weight,
+            bm25_body_weight=paper.bm25_body_weight,
+        ),
+    )
+
+
+@paper_app.command("index-status")
+def paper_index_status(
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    probe: bool = typer.Option(
+        True,
+        "--probe/--no-probe",
+        help="Load the configured embedding backend to verify its output dimension",
+    ),
+):
+    """Show embedding identity, collection dimensions, and migration status."""
+    runtime_config = _load_runtime_config(config, workspace)
+    kb = _paper_kb_from_config(runtime_config)
+    try:
+        status = asyncio.run(kb.inspect_vector_index(probe_embedding=probe))
+    except Exception as exc:
+        console.print(f"[red]Unable to inspect paper index:[/red] {exc}")
+        raise typer.Exit(1)
+    console.print_json(data=status)
+    if status.get("reindex_required"):
+        raise typer.Exit(2)
+
+
+@paper_app.command("reindex")
+def paper_reindex(
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    keep_backup: bool = typer.Option(
+        True,
+        "--keep-backup/--drop-backup",
+        help="Keep the old collections under timestamped backup names",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
+):
+    """Re-embed every paper vector and switch collections with rollback."""
+    runtime_config = _load_runtime_config(config, workspace)
+    if not yes:
+        console.print(
+            "[yellow]Stop every running nanobot gateway that uses this workspace "
+            "before continuing.[/yellow]"
+        )
+        if not typer.confirm("Rebuild the paper vector index now?"):
+            raise typer.Abort()
+
+    kb = _paper_kb_from_config(runtime_config)
+    try:
+        result = asyncio.run(kb.rebuild_vector_index(keep_backup=keep_backup))
+    except Exception as exc:
+        console.print(f"[red]Paper index rebuild failed; active collections were preserved:[/red] {exc}")
+        raise typer.Exit(1)
+    console.print_json(data=result)
+    console.print(
+        "[green]Paper vector index rebuilt successfully.[/green] Restart the gateway "
+        "before serving new requests."
+    )
+
+
 def _migrate_cron_store(config: "Config") -> None:
     """One-time migration: move legacy global cron store into the workspace."""
     from nanobot.config.paths import get_cron_dir
@@ -593,6 +683,8 @@ def serve(
         unified_session=runtime_config.agents.defaults.unified_session,
         disabled_skills=runtime_config.agents.defaults.disabled_skills,
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
+        memory_config=runtime_config.agents.defaults.memory,
+        skill_config=runtime_config.agents.defaults.skills,
         tools_config=runtime_config.tools,
     )
 
@@ -603,13 +695,40 @@ def serve(
     console.print("  [cyan]Session[/cyan]  : api:default")
     console.print(f"  [cyan]Timeout[/cyan]  : {timeout}s")
     if host in {"0.0.0.0", "::"}:
+        if not api_cfg.auth_token:
+            console.print(
+                "[red]Refusing to expose the KB API on all interfaces without "
+                "api.authToken.[/red]"
+            )
+            raise typer.Exit(2)
         console.print(
             "[yellow]Warning:[/yellow] API is bound to all interfaces. "
             "Only do this behind a trusted network boundary, firewall, or reverse proxy."
         )
     console.print()
 
-    api_app = create_app(agent_loop, model_name=model_name, request_timeout=timeout)
+    kb_token_validator = None
+    if api_cfg.auth_token:
+        import hmac
+
+        def _validate_kb_token(token: str) -> bool:
+            return hmac.compare_digest(token, api_cfg.auth_token)
+
+        kb_token_validator = _validate_kb_token
+    if kb_token_validator is not None or api_cfg.allowed_origins:
+        api_app = create_app(
+            agent_loop,
+            model_name=model_name,
+            request_timeout=timeout,
+            kb_token_validator=kb_token_validator,
+            allowed_origins=set(api_cfg.allowed_origins),
+        )
+    else:
+        api_app = create_app(
+            agent_loop,
+            model_name=model_name,
+            request_timeout=timeout,
+        )
 
     async def on_startup(_app):
         await agent_loop._connect_mcp()
@@ -697,6 +816,8 @@ def _run_gateway(
         unified_session=config.agents.defaults.unified_session,
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+        memory_config=config.agents.defaults.memory,
+        skill_config=config.agents.defaults.skills,
         tools_config=config.tools,
     )
 
@@ -769,10 +890,13 @@ def _run_gateway(
 
     # Point the WebSocket channel's API URL to the gateway's own aiohttp
     # endpoints (KB upload / health), not an external `nanobot serve`.
-    ws_channel = channels.channels.get("websocket")
+    ws_channel = getattr(channels, "channels", {}).get("websocket")
     if ws_channel is not None:
         gateway_host = config.gateway.host or "127.0.0.1"
-        ws_channel._api_server_url = f"http://{gateway_host}:{port}"
+        advertised_gateway_host = (
+            "127.0.0.1" if gateway_host in {"0.0.0.0", "::"} else gateway_host
+        )
+        ws_channel._api_server_url = f"http://{advertised_gateway_host}:{port}"
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
@@ -846,28 +970,41 @@ def _run_gateway(
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def _health_server(host: str, health_port: int):
-        """Simple aiohttp: health + KB endpoints with CORS for cross-origin SPA."""
+        """Simple aiohttp server for health and authenticated KB endpoints."""
         from aiohttp import web as _web
-        from typing import Any as _Any
 
-        @_web.middleware
-        async def _cors(
-            request: _web.Request, handler: _Any
-        ) -> _web.StreamResponse:
-            if request.method == "OPTIONS":
-                resp = _web.Response(status=204)
-            else:
-                resp = await handler(request)
-            resp.headers["Access-Control-Allow-Origin"] = "*"
-            resp.headers["Access-Control-Allow-Methods"] = (
-                "GET, POST, OPTIONS"
-            )
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-            resp.headers["Access-Control-Max-Age"] = "3600"
-            return resp
+        from nanobot.api.server import (
+            MAX_PAPER_UPLOAD_TOTAL_SIZE,
+            _cors_middleware,
+            _PaperIngestJobManager,
+            handle_kb_stats,
+            handle_paper_delete,
+            handle_paper_ingest_job,
+            handle_papers_upload,
+        )
 
-        app = _web.Application(middlewares=[_cors])
+        paper_config = getattr(getattr(agent, "tools_config", None), "paper", None)
+        configured_total_mb = getattr(paper_config, "max_upload_total_mb", 200)
+        max_upload_total = (
+            configured_total_mb * 1024 * 1024
+            if isinstance(configured_total_mb, int) and configured_total_mb > 0
+            else MAX_PAPER_UPLOAD_TOTAL_SIZE
+        )
+        app = _web.Application(
+            client_max_size=max_upload_total + 1024 * 1024,
+            middlewares=[_cors_middleware],
+        )
         app["agent_loop"] = agent
+        app["paper_ingest_locks"] = {}
+        app["paper_ingest_jobs"] = _PaperIngestJobManager()
+        app["allowed_origins"] = set()
+        if ws_channel is not None:
+            app["kb_token_validator"] = ws_channel.validate_api_token
+        elif host in {"0.0.0.0", "::"}:
+            # Never expose an unauthenticated management API on all interfaces.
+            app["kb_token_validator"] = lambda _token: False
+        else:
+            app["kb_token_validator"] = None
 
         async def _health_handler(
             _request: _web.Request,
@@ -876,10 +1013,15 @@ def _run_gateway(
 
         app.router.add_get("/health", _health_handler)
 
-        from nanobot.api.server import handle_kb_stats, handle_papers_upload
-
         app.router.add_post("/api/papers/upload", handle_papers_upload)
+        app.router.add_get("/api/papers/jobs/{job_id}", handle_paper_ingest_job)
+        app.router.add_delete(r"/api/papers/{paper_id:.+}", handle_paper_delete)
         app.router.add_get("/api/kb/stats", handle_kb_stats)
+
+        async def _close_ingest_jobs(current_app: _web.Application) -> None:
+            await current_app["paper_ingest_jobs"].close()
+
+        app.on_cleanup.append(_close_ingest_jobs)
 
         runner = _web.AppRunner(app)
         await runner.setup()
@@ -1085,6 +1227,8 @@ def agent(
         unified_session=config.agents.defaults.unified_session,
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+        memory_config=config.agents.defaults.memory,
+        skill_config=config.agents.defaults.skills,
         tools_config=config.tools,
     )
     restart_notice = consume_restart_notice_from_env()
@@ -1263,6 +1407,142 @@ def agent(
                 await agent_loop.close_mcp()
 
         asyncio.run(run_interactive())
+
+
+# ============================================================================
+# Generated Skill lifecycle commands (local operator only)
+# ============================================================================
+
+skills_app = typer.Typer(help="Review and publish generated Skill candidates")
+app.add_typer(skills_app, name="skills")
+
+
+def _load_skill_candidate_manager(
+    config_path: str | None,
+    workspace: str | None,
+):
+    from nanobot.agent.skill_lifecycle import SkillCandidateManager
+
+    runtime_config = _load_runtime_config(config_path, workspace)
+    skill_config = runtime_config.agents.defaults.skills
+    return SkillCandidateManager(
+        runtime_config.workspace_path,
+        auto_promote=skill_config.auto_promote,
+        max_skill_chars=skill_config.max_skill_chars,
+        max_skill_lines=skill_config.max_skill_lines,
+    )
+
+
+@skills_app.command("candidates")
+def skill_candidates(
+    status: str | None = typer.Option(
+        None,
+        "--status",
+        help="Filter by draft, promoted, or rejected",
+    ),
+    workspace: str | None = typer.Option(None, "--workspace", "-w"),
+    config: str | None = typer.Option(None, "--config", "-c"),
+) -> None:
+    """List generated Skill candidates without activating them."""
+    manager = _load_skill_candidate_manager(config, workspace)
+    candidates = manager.list_candidates(status=status)
+    if not candidates:
+        console.print("[dim]No Skill candidates found.[/dim]")
+        return
+    table = Table("Candidate ID", "Name", "Action", "Source", "Status", "Created")
+    for candidate in candidates:
+        table.add_row(
+            str(candidate.get("candidate_id", "")),
+            str(candidate.get("name", "")),
+            str(candidate.get("action", "")),
+            str(candidate.get("source", "")),
+            str(candidate.get("status", "")),
+            str(candidate.get("created_at", "")),
+        )
+    console.print(table)
+
+
+@skills_app.command("show")
+def skill_candidate_show(
+    candidate_id: str = typer.Argument(
+        ...,
+        help="Candidate ID from `skills candidates`",
+    ),
+    workspace: str | None = typer.Option(None, "--workspace", "-w"),
+    config: str | None = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Show a candidate's provenance and generated instructions."""
+    manager = _load_skill_candidate_manager(config, workspace)
+    try:
+        root, manifest = manager.get_candidate(candidate_id)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Unable to read candidate:[/red] {exc}")
+        raise typer.Exit(1)
+    console.print_json(data=manifest)
+    skill_file = root / str(manifest.get("name", "")) / "SKILL.md"
+    if skill_file.is_file() and not skill_file.is_symlink():
+        console.print(Markdown(skill_file.read_text(encoding="utf-8")))
+
+
+@skills_app.command("promote")
+def skill_candidate_promote(
+    candidate_id: str = typer.Argument(..., help="Validated draft candidate ID"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w"),
+    config: str | None = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Publish a reviewed candidate into the active workspace catalog."""
+    manager = _load_skill_candidate_manager(config, workspace)
+    try:
+        result = manager.promote(candidate_id)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Unable to promote candidate:[/red] {exc}")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]Published[/green] {result['name']} from {result['candidate_id']}"
+    )
+
+
+@skills_app.command("reject")
+def skill_candidate_reject(
+    candidate_id: str = typer.Argument(..., help="Draft candidate ID"),
+    reason: str = typer.Option("", "--reason", help="Optional rejection reason"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w"),
+    config: str | None = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Reject a candidate without deleting its audit trail."""
+    manager = _load_skill_candidate_manager(config, workspace)
+    try:
+        result = manager.reject(candidate_id, reason)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Unable to reject candidate:[/red] {exc}")
+        raise typer.Exit(1)
+    console.print(f"[yellow]Rejected[/yellow] {result['name']} ({result['candidate_id']})")
+
+
+@skills_app.command("stats")
+def skill_usage_stats(
+    workspace: str | None = typer.Option(None, "--workspace", "-w"),
+    config: str | None = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Show model-selected Skill activations and turn-completion outcomes."""
+    from nanobot.agent.skill_lifecycle import SkillUsageStore
+
+    runtime_config = _load_runtime_config(config, workspace)
+    rows = SkillUsageStore(runtime_config.workspace_path).stats()
+    if not rows:
+        console.print("[dim]No Skill activations recorded.[/dim]")
+        return
+    table = Table("Skill", "Source", "Activations", "Completed", "Failed", "Last used")
+    for row in rows:
+        table.add_row(
+            str(row.get("skill_name", "")),
+            str(row.get("source", "")),
+            str(row.get("activation_count", 0)),
+            str(row.get("success_count", 0)),
+            str(row.get("failure_count", 0)),
+            str(row.get("last_used_at", "")),
+        )
+    console.print(table)
 
 
 # ============================================================================

@@ -8,30 +8,66 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json as _json
 import mimetypes
+import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from aiohttp import web
 from loguru import logger
-
-from datetime import datetime
 
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_JSON_REQUEST_SIZE = 20 * 1024 * 1024
 MAX_PAPER_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB per PDF
+MAX_PAPER_UPLOAD_TOTAL_SIZE = 200 * 1024 * 1024
+MAX_PAPER_UPLOAD_FILES = 10
+MAX_PDF_PAGES = 2000
+PAPER_UPLOAD_CHUNK_SIZE = 1024 * 1024
 _DATA_URL_RE = re.compile(r"^data:([^;]+);base64,(.+)$", re.DOTALL)
 
 
 class _FileSizeExceeded(Exception):
     """Raised when an uploaded file exceeds the size limit."""
+
+
+class _PaperUploadError(Exception):
+    """Stable, user-safe validation error for one uploaded paper."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        stage: str = "validation",
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.stage = stage
+        self.retryable = retryable
+
+
+@dataclass(slots=True)
+class _UploadedPaper:
+    original_filename: str
+    path: Path
+    sha256: str
+    size_bytes: int
+    page_count: int
+    pdf_title: str = ""
 
 
 API_SESSION_KEY = "api:default"
@@ -178,27 +214,423 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
         if part is None:
             break
         if part.name == "message":
-            text = (await part.read()).decode("utf-8")
+            text = await _read_multipart_text(part, "message")
         elif part.name == "session_id":
-            session_id = (await part.read()).decode("utf-8").strip()
+            session_id = (await _read_multipart_text(part, "session_id")).strip()
         elif part.name == "model":
-            model = (await part.read()).decode("utf-8").strip()
+            model = (await _read_multipart_text(part, "model")).strip()
         elif part.name == "files":
-            raw = await part.read()
-            if len(raw) > MAX_FILE_SIZE:
-                raise _FileSizeExceeded(
-                    f"File '{part.filename}' exceeds {MAX_FILE_SIZE // (1024 * 1024)}MB limit"
-                )
             base = safe_filename(part.filename or "upload.bin")
             filename = f"{uuid.uuid4().hex[:12]}_{base}"
             dest = media_dir / filename
-            dest.write_bytes(raw)
+            temp_dest = media_dir / f".{filename}.part"
+            size = 0
+            try:
+                with temp_dest.open("xb") as output:
+                    while True:
+                        chunk = await part.read_chunk(size=PAPER_UPLOAD_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_FILE_SIZE:
+                            raise _FileSizeExceeded(
+                                f"File '{part.filename}' exceeds {MAX_FILE_SIZE // (1024 * 1024)}MB limit"
+                            )
+                        output.write(chunk)
+                os.replace(temp_dest, dest)
+            except Exception:
+                temp_dest.unlink(missing_ok=True)
+                raise
             media_paths.append(str(dest))
 
     if not text:
         text = "请分析上传的文件"
 
     return text, media_paths, session_id, model
+
+
+async def _read_multipart_text(
+    part: Any,
+    field_name: str,
+    *,
+    max_bytes: int = 64 * 1024,
+) -> str:
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = await part.read_chunk(size=min(16 * 1024, max_bytes + 1))
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > max_bytes:
+            raise ValueError(f"Multipart field '{field_name}' is too large")
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8")
+
+
+async def _read_json_body_limited(
+    request: web.Request,
+    *,
+    max_bytes: int = MAX_JSON_REQUEST_SIZE,
+) -> dict[str, Any]:
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.content.iter_chunked(64 * 1024):
+        size += len(chunk)
+        if size > max_bytes:
+            raise _FileSizeExceeded(
+                f"JSON request exceeds {max_bytes // (1024 * 1024)}MB limit"
+            )
+        chunks.append(chunk)
+    payload = _json.loads(b"".join(chunks))
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be an object")
+    return payload
+
+
+def _inspect_pdf(path: Path, max_pages: int = MAX_PDF_PAGES) -> tuple[int, str]:
+    """Open a PDF without extracting its body and return basic trusted metadata."""
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(path, strict=False)
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise _PaperUploadError(
+                "PDF_ENCRYPTED",
+                "Password-protected PDFs are not supported",
+            )
+        page_count = len(reader.pages)
+        if page_count < 1:
+            raise _PaperUploadError("PDF_EMPTY", "PDF contains no pages")
+        if page_count > max_pages:
+            raise _PaperUploadError(
+                "PDF_TOO_MANY_PAGES",
+                f"PDF exceeds the {max_pages}-page limit",
+            )
+        metadata = reader.metadata
+        title = str(getattr(metadata, "title", "") or "").strip()[:200]
+        return page_count, title
+    except _PaperUploadError:
+        raise
+    except Exception as exc:
+        logger.info("Rejected invalid uploaded PDF {}: {}", path.name, exc)
+        raise _PaperUploadError(
+            "PDF_INVALID",
+            "The uploaded file is not a valid PDF",
+        ) from exc
+
+
+async def _stream_paper_upload(
+    part: Any,
+    uploads_dir: Path,
+    *,
+    max_size: int = MAX_PAPER_UPLOAD_SIZE,
+    max_pages: int = MAX_PDF_PAGES,
+) -> _UploadedPaper:
+    """Stream one multipart PDF to a content-addressed file with early limits."""
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    original_filename = str(part.filename or "paper.pdf")[:500]
+    temp_path = uploads_dir / f".upload.{uuid.uuid4().hex}.part"
+    digest = hashlib.sha256()
+    header = bytearray()
+    size = 0
+    try:
+        with temp_path.open("xb") as output:
+            while True:
+                chunk = await part.read_chunk(size=PAPER_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_size:
+                    raise _PaperUploadError(
+                        "PDF_TOO_LARGE",
+                        f"PDF exceeds the {max_size // (1024 * 1024)}MB limit",
+                    )
+                if len(header) < 1024:
+                    header.extend(chunk[: 1024 - len(header)])
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+
+        if not size:
+            raise _PaperUploadError("PDF_EMPTY", "Uploaded PDF is empty")
+        if b"%PDF-" not in bytes(header):
+            raise _PaperUploadError(
+                "PDF_SIGNATURE_INVALID",
+                "Uploaded file does not have a valid PDF signature",
+            )
+
+        # This is a metadata-only pass after the streaming byte/page limits.
+        # Full extraction remains in the bounded background ingestion worker.
+        page_count, pdf_title = _inspect_pdf(temp_path, max_pages)
+
+        sha256 = digest.hexdigest()
+        final_path = uploads_dir / f"{sha256}.pdf"
+        if final_path.exists():
+            temp_path.unlink(missing_ok=True)
+        else:
+            os.replace(temp_path, final_path)
+        return _UploadedPaper(
+            original_filename=original_filename,
+            path=final_path,
+            sha256=sha256,
+            size_bytes=size,
+            page_count=page_count,
+            pdf_title=pdf_title,
+        )
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _paper_error_result(
+    filename: str | None,
+    error: _PaperUploadError,
+) -> dict[str, Any]:
+    return {
+        "filename": filename or "paper.pdf",
+        "status": "error",
+        "stage": error.stage,
+        "error_code": error.code,
+        "error": error.message,
+        "retryable": error.retryable,
+    }
+
+
+def _request_bearer_token(request: web.Request) -> str:
+    authorization = request.headers.get("Authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+def _origin_is_allowed(origin: str, allowed_origins: set[str]) -> bool:
+    if not origin:
+        return True
+    if origin in allowed_origins:
+        return True
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and parsed.hostname in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
+
+
+def _positive_int_setting(owner: Any, name: str, default: int) -> int:
+    value = getattr(owner, name, default) if owner is not None else default
+    return value if isinstance(value, int) and value > 0 else default
+
+
+async def _ingest_uploaded_paper(
+    agent_loop: Any,
+    kb: Any,
+    uploaded: _UploadedPaper,
+    ingest_locks: dict[str, asyncio.Lock],
+) -> dict[str, Any]:
+    """Ingest one validated, content-addressed PDF and normalize its result."""
+    paper_id = f"upload:{uploaded.sha256}"
+    local_md_path = uploaded.path.with_suffix(".md")
+    filename_title = Path(
+        safe_filename(uploaded.original_filename) or "paper.pdf"
+    ).stem[:200]
+    doc = {
+        "paper_id": paper_id,
+        "title": uploaded.pdf_title or filename_title or "Uploaded paper",
+        "source": "upload",
+        "url": str(local_md_path),
+        "year": None,
+        "uploaded_at": datetime.now().astimezone().isoformat(),
+        "original_filename": uploaded.original_filename,
+        "content_sha256": uploaded.sha256,
+        "size_bytes": uploaded.size_bytes,
+        "page_count": uploaded.page_count,
+        "metadata_provenance": {
+            "title": "pdf_metadata" if uploaded.pdf_title else "filename",
+            "year": "unknown",
+        },
+    }
+
+    lock = ingest_locks.setdefault(paper_id, asyncio.Lock())
+    async with lock:
+        existing_meta = kb.load_docs_meta().get(paper_id)
+        existing_chunk_count = sum(
+            1
+            for row in kb._read_jsonl(kb.chunks_file)
+            if str(row.get("paper_id", "")) == paper_id
+        )
+        if existing_meta and existing_chunk_count:
+            return {
+                "filename": uploaded.original_filename,
+                "paper_id": paper_id,
+                "title": existing_meta.get("title") or doc["title"],
+                "status": "ok",
+                "stage": "completed",
+                "chunk_count": existing_chunk_count,
+                "deduplicated": True,
+                "content_sha256": uploaded.sha256,
+            }
+
+        ingest_result = await agent_loop.kb_ingest_local(
+            doc=doc,
+            local_pdf_path=str(uploaded.path),
+        )
+        status = str(ingest_result.get("status", "error"))
+        row: dict[str, Any] = {
+            "filename": uploaded.original_filename,
+            "paper_id": paper_id,
+            "title": doc.get("title", ""),
+            "status": status,
+            "stage": "completed" if status == "ok" else "ingestion",
+            "chunk_count": int(ingest_result.get("chunk_count", 0) or 0),
+            "deduplicated": False,
+            "content_sha256": uploaded.sha256,
+        }
+        if status == "ok":
+            row.update({
+                "degraded": bool(ingest_result.get("degraded", False)),
+                "storage_backend": ingest_result.get("storage_backend", "unknown"),
+                "degradation_reasons": ingest_result.get("degradation_reasons", []),
+                "parser_name": ingest_result.get("parser_name", ""),
+                "parse_quality_score": ingest_result.get("parse_quality_score"),
+            })
+        else:
+            internal_error = str(ingest_result.get("error", "INGEST_FAILED"))
+            public_messages = {
+                "failed_to_parse_content": "No usable text could be extracted from the PDF",
+                "no_chunks_generated": "No indexable sections were found in the PDF",
+                "Knowledge base not enabled": "Knowledge base is not enabled",
+                "Paper ingest tool not available": "Paper ingestion is not available",
+            }
+            row.update({
+                "error_code": internal_error.upper().replace(" ", "_"),
+                "error": public_messages.get(internal_error, "PDF ingestion failed"),
+                "retryable": internal_error not in {"no_chunks_generated"},
+            })
+        return row
+
+
+class _PaperIngestJobManager:
+    """Small in-process job registry with bounded expensive ingestion work."""
+
+    def __init__(self, concurrency: int = 2, max_jobs: int = 200) -> None:
+        self._semaphore = asyncio.Semaphore(max(1, concurrency))
+        self._max_jobs = max(10, max_jobs)
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    def submit(
+        self,
+        *,
+        agent_loop: Any,
+        kb: Any,
+        uploads: list[_UploadedPaper],
+        ingest_locks: dict[str, asyncio.Lock],
+        validation_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        job_id = f"ingest_{uuid.uuid4().hex}"
+        now = datetime.now().astimezone().isoformat()
+        pending = [
+            {
+                "filename": upload.original_filename,
+                "paper_id": f"upload:{upload.sha256}",
+                "status": "pending",
+                "stage": "queued",
+                "content_sha256": upload.sha256,
+            }
+            for upload in uploads
+        ]
+        job = {
+            "job_id": job_id,
+            "status": "pending",
+            "created_at": now,
+            "updated_at": now,
+            "total": len(validation_results) + len(uploads),
+            "completed": len(validation_results),
+            "results": [*validation_results, *pending],
+        }
+        self._jobs[job_id] = job
+        task = asyncio.create_task(
+            self._run(job, agent_loop, kb, uploads, ingest_locks),
+            name=job_id,
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        self._prune()
+        return dict(job)
+
+    async def _run(
+        self,
+        job: dict[str, Any],
+        agent_loop: Any,
+        kb: Any,
+        uploads: list[_UploadedPaper],
+        ingest_locks: dict[str, asyncio.Lock],
+    ) -> None:
+        job["status"] = "running"
+        job["updated_at"] = datetime.now().astimezone().isoformat()
+        validation_count = len(job["results"]) - len(uploads)
+        try:
+            for index, upload in enumerate(uploads):
+                job["results"][validation_count + index]["stage"] = "ingestion"
+                async with self._semaphore:
+                    try:
+                        result = await _ingest_uploaded_paper(
+                            agent_loop,
+                            kb,
+                            upload,
+                            ingest_locks,
+                        )
+                    except Exception:
+                        logger.exception("Background PDF ingestion failed for {}", upload.original_filename)
+                        result = _paper_error_result(
+                            upload.original_filename,
+                            _PaperUploadError(
+                                "INGEST_INTERNAL_ERROR",
+                                "PDF ingestion failed due to an internal error",
+                                stage="ingestion",
+                                retryable=True,
+                            ),
+                        )
+                    job["results"][validation_count + index] = result
+                    job["completed"] += 1
+                    job["updated_at"] = datetime.now().astimezone().isoformat()
+            succeeded = sum(
+                result.get("status") == "ok" for result in job["results"]
+            )
+            job["succeeded"] = succeeded
+            job["failed"] = len(job["results"]) - succeeded
+            job["status"] = "completed"
+        except asyncio.CancelledError:
+            job["status"] = "cancelled"
+            raise
+        finally:
+            job["updated_at"] = datetime.now().astimezone().isoformat()
+
+    def get(self, job_id: str) -> dict[str, Any] | None:
+        job = self._jobs.get(job_id)
+        return dict(job) if job is not None else None
+
+    def _prune(self) -> None:
+        if len(self._jobs) <= self._max_jobs:
+            return
+        completed = [
+            job_id
+            for job_id, job in self._jobs.items()
+            if job.get("status") in {"completed", "cancelled"}
+        ]
+        for job_id in completed[: len(self._jobs) - self._max_jobs]:
+            self._jobs.pop(job_id, None)
+
+    async def close(self) -> None:
+        for task in list(self._tasks):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +654,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             text, media_paths, session_id, requested_model = await _parse_multipart(request)
         else:
             try:
-                body = await request.json()
+                body = await _read_json_body_limited(request)
+            except _FileSizeExceeded:
+                raise
             except Exception:
                 return _error_json(400, "Invalid JSON body")
             stream = body.get("stream", False)
@@ -386,14 +820,46 @@ async def handle_papers_upload(request: web.Request) -> web.Response:
 
     Returns JSON with per-file results.
     """
-    logger.info("Beginning paper upload handling")  # Debug log to trace request handling
+    logger.info("Beginning paper upload handling")
     agent_loop = request.app["agent_loop"]
     kb = getattr(agent_loop, "kb", None)
     if kb is None:
         return _error_json(400, "Knowledge base not available (paper tools disabled)")
 
-    reader = await request.multipart()
+    if not request.content_type.startswith("multipart/"):
+        return _error_json(400, "Expected multipart/form-data")
+    try:
+        reader = await request.multipart()
+    except Exception:
+        return _error_json(400, "Invalid multipart upload")
+
     results: list[dict[str, Any]] = []
+    uploads: list[_UploadedPaper] = []
+    total_size = 0
+    file_count = 0
+    paper_config = getattr(getattr(agent_loop, "tools_config", None), "paper", None)
+    max_file_size = _positive_int_setting(
+        paper_config,
+        "max_upload_mb",
+        MAX_PAPER_UPLOAD_SIZE // (1024 * 1024),
+    ) * 1024 * 1024
+    max_total_size = _positive_int_setting(
+        paper_config,
+        "max_upload_total_mb",
+        MAX_PAPER_UPLOAD_TOTAL_SIZE // (1024 * 1024),
+    ) * 1024 * 1024
+    max_files = _positive_int_setting(
+        paper_config,
+        "max_upload_files",
+        MAX_PAPER_UPLOAD_FILES,
+    )
+    max_pdf_pages = _positive_int_setting(
+        paper_config,
+        "max_pdf_pages",
+        MAX_PDF_PAGES,
+    )
+    uploads_dir = kb.base_dir / "uploads"
+    ingest_locks: dict[str, asyncio.Lock] = request.app["paper_ingest_locks"]
 
     while True:
         part = await reader.next()
@@ -401,58 +867,136 @@ async def handle_papers_upload(request: web.Request) -> web.Response:
             break
         if part.name != "files":
             continue
-
-        raw = await part.read()
-        if len(raw) > MAX_PAPER_UPLOAD_SIZE:
-            results.append({
-                "filename": part.filename,
-                "status": "error",
-                "error": f"File exceeds {MAX_PAPER_UPLOAD_SIZE // (1024 * 1024)}MB limit",
-            })
+        file_count += 1
+        if file_count > max_files:
+            results.append(_paper_error_result(
+                part.filename,
+                _PaperUploadError(
+                    "TOO_MANY_FILES",
+                    f"A maximum of {max_files} PDFs can be uploaded at once",
+                ),
+            ))
             continue
 
-        # 1. Save to workspace/kb/uploads/
-        uploads_dir = kb.base_dir / "uploads"
-        uploads_dir.mkdir(parents=True, exist_ok=True)
-        filename = safe_filename(part.filename or f"paper_{uuid.uuid4().hex[:8]}.pdf")
-        local_path = uploads_dir / filename
-        local_path.write_bytes(raw)
-        local_md_path = local_path.with_suffix(".md")
-
-        # 2. Build paper metadata (title will be extracted from markdown heading)
-        stem = (Path(part.filename or "paper").stem)[:200]
-        import hashlib
-        paper_id = hashlib.md5(stem.encode()).hexdigest()[:12]
-        doc = {
-            "paper_id": paper_id,
-            "title": Path(part.filename or "paper").stem,
-            "source": "upload",
-            "url": str(local_md_path),
-            "year": datetime.now().year,
-        }
-
-        # 3. Ingest via AgentLoop helper
         try:
-            ingest_result = await agent_loop.kb_ingest_local(
-                doc=doc,
-                local_pdf_path=str(local_path),
+            remaining_total = max_total_size - total_size
+            if remaining_total <= 0:
+                raise _PaperUploadError(
+                    "UPLOAD_TOTAL_TOO_LARGE",
+                    f"Upload batch exceeds the {max_total_size // (1024 * 1024)}MB limit",
+                )
+            uploaded = await _stream_paper_upload(
+                part,
+                uploads_dir,
+                max_size=min(max_file_size, remaining_total),
+                max_pages=max_pdf_pages,
             )
-            results.append({
-                "filename": part.filename,
-                "paper_id": doc["paper_id"],
-                "title": doc.get("title", ""),
-                "status": ingest_result.get("status", "ok"),
-                "chunk_count": ingest_result.get("chunk_count", 0),
-            })
-        except Exception as exc:
+            total_size += uploaded.size_bytes
+            uploads.append(uploaded)
+        except _PaperUploadError as exc:
+            results.append(_paper_error_result(part.filename, exc))
+        except Exception:
             logger.exception("KB ingest failed for {}", part.filename)
-            results.append({
-                "filename": part.filename,
-                "status": "error",
-                "error": str(exc),
-            })
+            results.append(_paper_error_result(
+                part.filename,
+                _PaperUploadError(
+                    "INGEST_INTERNAL_ERROR",
+                    "PDF ingestion failed due to an internal error",
+                    stage="ingestion",
+                    retryable=True,
+                ),
+            ))
 
-    return web.json_response({"results": results})
+    if not results and not uploads:
+        return _error_json(400, "No PDF files were provided")
+
+    wait_for_completion = request.query.get("wait", "").lower() in {"1", "true", "yes"}
+    if wait_for_completion:
+        for uploaded in uploads:
+            try:
+                results.append(await _ingest_uploaded_paper(
+                    agent_loop,
+                    kb,
+                    uploaded,
+                    ingest_locks,
+                ))
+            except Exception:
+                logger.exception("PDF ingestion failed for {}", uploaded.original_filename)
+                results.append(_paper_error_result(
+                    uploaded.original_filename,
+                    _PaperUploadError(
+                        "INGEST_INTERNAL_ERROR",
+                        "PDF ingestion failed due to an internal error",
+                        stage="ingestion",
+                        retryable=True,
+                    ),
+                ))
+        succeeded = sum(result.get("status") == "ok" for result in results)
+        return web.json_response({
+            "status": "ok" if succeeded == len(results) else "partial" if succeeded else "error",
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": len(results) - succeeded,
+            "results": results,
+        })
+
+    if not uploads:
+        return web.json_response({
+            "status": "error",
+            "total": len(results),
+            "succeeded": 0,
+            "failed": len(results),
+            "results": results,
+        })
+    job_manager: _PaperIngestJobManager = request.app["paper_ingest_jobs"]
+    job = job_manager.submit(
+        agent_loop=agent_loop,
+        kb=kb,
+        uploads=uploads,
+        ingest_locks=ingest_locks,
+        validation_results=results,
+    )
+    return web.json_response(job, status=202)
+
+
+async def handle_paper_ingest_job(request: web.Request) -> web.Response:
+    """GET /api/papers/jobs/{job_id} — return bounded background job state."""
+    manager: _PaperIngestJobManager = request.app["paper_ingest_jobs"]
+    job = manager.get(request.match_info["job_id"])
+    if job is None:
+        return _error_json(404, "Paper ingestion job was not found")
+    return web.json_response(job)
+
+
+async def handle_paper_delete(request: web.Request) -> web.Response:
+    """DELETE /api/papers/{paper_id} — remove one paper from every KB backend."""
+    agent_loop = request.app["agent_loop"]
+    kb = getattr(agent_loop, "kb", None)
+    if kb is None:
+        return _error_json(400, "Knowledge base not available (paper tools disabled)")
+
+    paper_id = str(request.match_info.get("paper_id", "")).strip()
+    if not paper_id:
+        return _error_json(400, "paper_id is required", err_type="invalid_request_error")
+
+    ingest_locks: dict[str, asyncio.Lock] = request.app["paper_ingest_locks"]
+    ingest_lock = ingest_locks.setdefault(paper_id, asyncio.Lock())
+    try:
+        async with ingest_lock:
+            result = await kb.delete_paper(paper_id)
+    except ValueError as exc:
+        return _error_json(400, str(exc), err_type="invalid_request_error")
+    except Exception:
+        logger.exception("Failed to delete paper {}", paper_id)
+        return _error_json(
+            500,
+            "Paper deletion failed; storage snapshots were restored where possible",
+            err_type="server_error",
+        )
+
+    if not result.get("deleted"):
+        return _error_json(404, "Paper was not found", err_type="not_found_error")
+    return web.json_response(result)
 
 
 async def handle_kb_stats(request: web.Request) -> web.Response:
@@ -497,13 +1041,32 @@ async def handle_kb_stats(request: web.Request) -> web.Response:
 
 @web.middleware
 async def _cors_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
-    """Add permissive CORS headers for the embedded WebUI."""
+    """Protect KB routes and add CORS only for explicitly trusted origins."""
+    origin = request.headers.get("Origin", "")
+    allowed_origins = request.app.get("allowed_origins", set())
+    origin_allowed = _origin_is_allowed(origin, allowed_origins)
+    if origin and not origin_allowed:
+        return _error_json(403, "Origin is not allowed", err_type="forbidden")
+
+    if request.path.startswith("/api/") and request.method != "OPTIONS":
+        token_validator = request.app.get("kb_token_validator")
+        if token_validator is not None:
+            token = _request_bearer_token(request)
+            try:
+                authorized = bool(token and token_validator(token))
+            except Exception:
+                logger.exception("KB API token validation failed")
+                authorized = False
+            if not authorized:
+                return _error_json(401, "Unauthorized", err_type="authentication_error")
+
     if request.method == "OPTIONS":
-        # Preflight
         resp = web.Response(status=204)
     else:
         resp = await handler(request)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
+    if origin and origin_allowed:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
     resp.headers["Access-Control-Max-Age"] = "3600"
@@ -516,7 +1079,12 @@ async def _cors_middleware(request: web.Request, handler: Any) -> web.StreamResp
 
 
 def create_app(
-    agent_loop, model_name: str = "nanobot", request_timeout: float = 120.0
+    agent_loop,
+    model_name: str = "nanobot",
+    request_timeout: float = 120.0,
+    *,
+    kb_token_validator: Any | None = None,
+    allowed_origins: set[str] | None = None,
 ) -> web.Application:
     """Create the aiohttp application.
 
@@ -525,14 +1093,24 @@ def create_app(
         model_name: Model name reported in responses.
         request_timeout: Per-request timeout in seconds.
     """
+    paper_config = getattr(getattr(agent_loop, "tools_config", None), "paper", None)
+    max_upload_total = _positive_int_setting(
+        paper_config,
+        "max_upload_total_mb",
+        MAX_PAPER_UPLOAD_TOTAL_SIZE // (1024 * 1024),
+    ) * 1024 * 1024
     app = web.Application(
-        client_max_size=20 * 1024 * 1024,  # 20MB for base64 images
+        client_max_size=max_upload_total + 1024 * 1024,
         middlewares=[_cors_middleware],
     )
     app["agent_loop"] = agent_loop
     app["model_name"] = model_name
     app["request_timeout"] = request_timeout
     app["session_locks"] = {}  # per-user locks, keyed by session_key
+    app["paper_ingest_locks"] = {}
+    app["paper_ingest_jobs"] = _PaperIngestJobManager()
+    app["kb_token_validator"] = kb_token_validator
+    app["allowed_origins"] = allowed_origins or set()
 
     # OpenAI-compatible API
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
@@ -541,6 +1119,13 @@ def create_app(
 
     # Knowledge Base management
     app.router.add_post("/api/papers/upload", handle_papers_upload)
+    app.router.add_get("/api/papers/jobs/{job_id}", handle_paper_ingest_job)
+    app.router.add_delete(r"/api/papers/{paper_id:.+}", handle_paper_delete)
     app.router.add_get("/api/kb/stats", handle_kb_stats)
+
+    async def _close_ingest_jobs(current_app: web.Application) -> None:
+        await current_app["paper_ingest_jobs"].close()
+
+    app.on_cleanup.append(_close_ingest_jobs)
 
     return app

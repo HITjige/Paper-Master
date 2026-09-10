@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -25,6 +28,34 @@ except ImportError:
     HAS_AIOHTTP = False
 
 pytest_plugins = ("pytest_asyncio",)
+
+
+def _pdf_bytes(*, title: str = "Test Paper") -> bytes:
+    from pypdf import PdfWriter
+
+    output = BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.add_metadata({"/Title": title})
+    writer.write(output)
+    return output.getvalue()
+
+
+def _make_paper_agent(tmp_path: Path, ingest_result: dict | None = None) -> MagicMock:
+    agent = _make_mock_agent()
+    kb = MagicMock()
+    kb.base_dir = tmp_path / "kb"
+    kb.chunks_file = kb.base_dir / "chunks.jsonl"
+    kb.load_docs_meta.return_value = {}
+    kb._read_jsonl.return_value = []
+    agent.kb = kb
+    agent.kb_ingest_local = AsyncMock(return_value=ingest_result or {
+        "status": "ok",
+        "chunk_count": 3,
+        "storage_backend": "jsonl",
+        "degraded": False,
+    })
+    return agent
 
 
 def _make_mock_agent(response_text: str = "mock response") -> MagicMock:
@@ -60,6 +91,50 @@ async def aiohttp_client():
     finally:
         for client in clients:
             await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp test utilities unavailable")
+async def test_delete_paper_endpoint(aiohttp_client, tmp_path) -> None:
+    agent = _make_paper_agent(tmp_path)
+    agent.kb.delete_paper = AsyncMock(return_value={
+        "status": "deleted",
+        "deleted": True,
+        "paper_id": "upload:abc",
+        "deleted_document_count": 1,
+        "deleted_chunk_count": 3,
+        "deleted_asset_count": 0,
+        "deleted_vector_count": 7,
+        "deleted_vectors": {"paper_chunks": 3},
+        "deleted_files": ["kb/uploads/abc.pdf"],
+        "artifact_errors": [],
+    })
+    client = await aiohttp_client(create_app(agent, model_name="m"))
+
+    response = await client.delete("/api/papers/upload%3Aabc")
+
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["deleted"] is True
+    agent.kb.delete_paper.assert_awaited_once_with("upload:abc")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp test utilities unavailable")
+async def test_delete_paper_endpoint_returns_404(aiohttp_client, tmp_path) -> None:
+    agent = _make_paper_agent(tmp_path)
+    agent.kb.delete_paper = AsyncMock(return_value={
+        "status": "not_found",
+        "deleted": False,
+        "paper_id": "missing",
+    })
+    client = await aiohttp_client(create_app(agent, model_name="m"))
+
+    response = await client.delete("/api/papers/missing")
+
+    assert response.status == 404
+    payload = await response.json()
+    assert payload["error"]["type"] == "not_found_error"
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +385,147 @@ async def test_multipart_with_session_id(aiohttp_client, mock_agent, tmp_path) -
         assert call_kwargs["session_key"] == "api:my-session"
     finally:
         os.chdir(original_cwd)
+
+
+# ---------------------------------------------------------------------------
+# Paper knowledge-base upload tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_paper_upload_streams_to_content_addressed_path(
+    aiohttp_client, tmp_path
+) -> None:
+    from aiohttp import FormData
+
+    raw = _pdf_bytes(title="Content Addressed Paper")
+    digest = hashlib.sha256(raw).hexdigest()
+    agent = _make_paper_agent(tmp_path)
+    client = await aiohttp_client(create_app(agent, model_name="m"))
+    form = FormData()
+    form.add_field(
+        "files",
+        raw,
+        filename="same-name.pdf",
+        content_type="application/pdf",
+    )
+
+    response = await client.post("/api/papers/upload?wait=true", data=form)
+    payload = await response.json()
+
+    assert response.status == 200
+    assert payload["status"] == "ok"
+    assert payload["results"][0]["paper_id"] == f"upload:{digest}"
+    assert payload["results"][0]["content_sha256"] == digest
+    call = agent.kb_ingest_local.await_args.kwargs
+    assert call["doc"]["year"] is None
+    assert call["doc"]["page_count"] == 1
+    assert Path(call["local_pdf_path"]).name == f"{digest}.pdf"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_paper_upload_rejects_non_pdf_content(
+    aiohttp_client, tmp_path
+) -> None:
+    from aiohttp import FormData
+
+    agent = _make_paper_agent(tmp_path)
+    client = await aiohttp_client(create_app(agent, model_name="m"))
+    form = FormData()
+    form.add_field(
+        "files",
+        b"this is not a pdf",
+        filename="fake.pdf",
+        content_type="application/pdf",
+    )
+
+    response = await client.post("/api/papers/upload?wait=true", data=form)
+    payload = await response.json()
+
+    assert response.status == 200
+    assert payload["status"] == "error"
+    assert payload["results"][0]["error_code"] == "PDF_SIGNATURE_INVALID"
+    agent.kb_ingest_local.assert_not_awaited()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_paper_upload_returns_ingest_error_details(
+    aiohttp_client, tmp_path
+) -> None:
+    from aiohttp import FormData
+
+    agent = _make_paper_agent(tmp_path, {
+        "status": "error",
+        "error": "failed_to_parse_content",
+    })
+    client = await aiohttp_client(create_app(agent, model_name="m"))
+    form = FormData()
+    form.add_field("files", _pdf_bytes(), filename="scan.pdf")
+
+    response = await client.post("/api/papers/upload?wait=true", data=form)
+    payload = await response.json()
+
+    result = payload["results"][0]
+    assert result["status"] == "error"
+    assert result["error_code"] == "FAILED_TO_PARSE_CONTENT"
+    assert "No usable text" in result["error"]
+    assert result["stage"] == "ingestion"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_paper_upload_runs_as_pollable_background_job(
+    aiohttp_client, tmp_path
+) -> None:
+    from aiohttp import FormData
+
+    agent = _make_paper_agent(tmp_path)
+    client = await aiohttp_client(create_app(agent, model_name="m"))
+    form = FormData()
+    form.add_field("files", _pdf_bytes(), filename="async.pdf")
+
+    response = await client.post("/api/papers/upload", data=form)
+    accepted = await response.json()
+    assert response.status == 202
+    assert accepted["status"] in {"pending", "running"}
+
+    for _ in range(20):
+        status_response = await client.get(
+            f"/api/papers/jobs/{accepted['job_id']}"
+        )
+        job = await status_response.json()
+        if job["status"] == "completed":
+            break
+        await asyncio.sleep(0)
+    assert job["status"] == "completed"
+    assert job["results"][0]["status"] == "ok"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_kb_api_uses_bearer_token_and_rejects_untrusted_origin(
+    aiohttp_client, tmp_path
+) -> None:
+    agent = _make_paper_agent(tmp_path)
+    app = create_app(
+        agent,
+        model_name="m",
+        kb_token_validator=lambda token: token == "valid-token",
+    )
+    client = await aiohttp_client(app)
+
+    unauthorized = await client.get("/api/kb/stats")
+    assert unauthorized.status == 401
+    forbidden = await client.get(
+        "/api/kb/stats",
+        headers={
+            "Authorization": "Bearer valid-token",
+            "Origin": "https://evil.example",
+        },
+    )
+    assert forbidden.status == 403
 
 
 # ---------------------------------------------------------------------------

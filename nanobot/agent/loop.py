@@ -18,7 +18,9 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
+from nanobot.agent.paper_kb import PaperKbConfig, PaperKnowledgeBase
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
+from nanobot.agent.skill_lifecycle import SkillCandidateManager, SkillUsageStore
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
@@ -48,7 +50,6 @@ from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
-from nanobot.agent.paper_kb import PaperKbConfig, PaperKnowledgeBase
 
 # Multi-agent system imports
 try:
@@ -63,6 +64,13 @@ if TYPE_CHECKING:
 
 
 UNIFIED_SESSION_KEY = "unified:default"
+_PAPER_TOOL_NAMES = frozenset({
+    "paper_search",
+    "paper_similarity",
+    "paper_rerank",
+    "paper_ingest",
+    "kb_retrieve",
+})
 
 
 class _LoopHook(AgentHook):
@@ -152,6 +160,12 @@ class AgentLoop:
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
+    _MULTI_AGENT_LAST_ROUTING_KEY = "multi_agent_last_routing"
+    _MULTI_AGENT_LAST_SOURCES_KEY = "multi_agent_last_sources"
+    _MULTI_AGENT_ACTIVE_PAPERS_KEY = "multi_agent_active_papers"
+    _MULTI_AGENT_PRESENTED_PAPER_IDS_KEY = "multi_agent_presented_paper_ids"
+    _MULTI_AGENT_LAST_SEARCH_TOPIC_KEY = "multi_agent_last_search_topic"
+    _MULTI_AGENT_CONTEXT_MESSAGE_COUNT_KEY = "multi_agent_context_message_count"
 
     def __init__(
         self,
@@ -177,6 +191,8 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
+        memory_config: Any | None = None,
+        skill_config: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -207,6 +223,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self.tools_config = _tc
+        self.skill_config = skill_config or defaults.skills
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
@@ -215,10 +232,27 @@ class AgentLoop:
             workspace,
             timezone=timezone,
             disabled_skills=disabled_skills,
+            context_window_tokens=self.context_window_tokens,
+            max_completion_tokens=(
+                provider.generation.max_tokens
+                if isinstance(provider.generation.max_tokens, int)
+                else defaults.max_tokens
+            ),
+            context_block_limit=self.context_block_limit,
+            memory_config=memory_config or defaults.memory,
         )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
+        self.skill_candidates = SkillCandidateManager(
+            workspace,
+            auto_promote=self.skill_config.auto_promote,
+            max_skill_chars=self.skill_config.max_skill_chars,
+            max_skill_lines=self.skill_config.max_skill_lines,
+        )
+        self.skill_usage = (
+            SkillUsageStore(workspace) if self.skill_config.track_usage else None
+        )
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -229,6 +263,7 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
             disabled_skills=disabled_skills,
+            skill_usage=self.skill_usage,
         )
         self._unified_session = unified_session
         self._running = False
@@ -267,6 +302,7 @@ class AgentLoop:
             store=self.context.memory,
             provider=provider,
             model=self.model,
+            skill_candidates=self.skill_candidates,
         )
 
         if self.tools_config.paper.enable:
@@ -282,6 +318,20 @@ class AgentLoop:
                     embedding_fallback=paper_cfg.embedding_fallback,
                     embedding_batch_size=paper_cfg.embedding_batch_size,
                     rerank_model=paper_cfg.rerank_model,
+                    rerank_score_mode=paper_cfg.rerank_score_mode,
+                    retrieval_relevance_filter_enabled=(
+                        paper_cfg.retrieval_relevance_filter_enabled
+                    ),
+                    retrieval_min_relevance_score=(
+                        paper_cfg.retrieval_min_relevance_score
+                    ),
+                    retrieval_rerank_candidate_count=(
+                        paper_cfg.retrieval_rerank_candidate_count
+                    ),
+                    retrieval_relevance_fail_closed=(
+                        paper_cfg.retrieval_relevance_fail_closed
+                    ),
+                    metadata_concurrency=paper_cfg.metadata_concurrency,
                     rrf_k=paper_cfg.rrf_k,
                     dense_rrf_weight=paper_cfg.dense_rrf_weight,
                     sparse_rrf_weight=paper_cfg.sparse_rrf_weight,
@@ -321,7 +371,7 @@ class AgentLoop:
                         kb=self.kb,
                         tools=paper_tools,
                         max_iterations=3,
-                        similarity_threshold=0.2,
+                        similarity_threshold=paper_cfg.retrieval_min_relevance_score,
                         top_k=self.tools_config.paper.auto_context_top_k or 5,
                         ingest_limit=3,
                         memory_store=self.context.memory,
@@ -380,6 +430,11 @@ class AgentLoop:
                     provider=self.provider,
                     model=self.model,
                     mineru_api_token=self._mineru_api_token,
+                    mineru_language=self.tools_config.paper.mineru_language,
+                    enable_pdf_ocr=self.tools_config.paper.enable_pdf_ocr,
+                    ocr_language=self.tools_config.paper.ocr_language,
+                    ocr_max_pages=self.tools_config.paper.ocr_max_pages,
+                    max_pdf_text_chars=self.tools_config.paper.max_pdf_text_chars,
                 )
             )
             self.tools.register(KBRetrieveTool(workspace=self.workspace, kb=self.kb))
@@ -504,6 +559,23 @@ class AgentLoop:
                 items.append({"role": "user", "content": merged})
             return items
 
+        activated_skills: set[str] = set()
+        skill_run_id = self.skill_usage.new_run_id() if self.skill_usage else None
+
+        def _record_skill_activation(path: str) -> None:
+            if self.skill_usage is None:
+                return
+            identified = self.skill_usage.identify(path)
+            if identified is None or identified[0] in activated_skills:
+                return
+            name = self.skill_usage.record_activation(
+                path,
+                session_key=session.key if session else None,
+                run_id=skill_run_id,
+            )
+            if name:
+                activated_skills.add(name)
+
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
             tools=self.tools,
@@ -522,7 +594,18 @@ class AgentLoop:
             retry_wait_callback=on_retry_wait,
             checkpoint_callback=_checkpoint,
             injection_callback=_drain_pending,
+            skill_activation_callback=_record_skill_activation,
         ))
+        if self.skill_usage is not None:
+            self.skill_usage.record_outcome(
+                activated_skills,
+                success=(
+                    result.stop_reason == "completed"
+                    and bool((result.final_content or "").strip())
+                ),
+                session_key=session.key if session else None,
+                run_id=skill_run_id,
+            )
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
@@ -826,9 +909,19 @@ class AgentLoop:
                 )
             )
 
-        # Check if we should use multi-agent workflow
-        if self.should_use_multi_agent(msg.content):
-            logger.info("Using multi-agent workflow for query: {}", preview)
+        # Choose the execution path using both the current query and recent
+        # paper-session context. A lexical check alone cannot recognize
+        # follow-ups such as "该模型的性能呢？".
+        use_multi_agent, orchestrator_context = (
+            await self._decide_multi_agent_with_orchestrator(msg.content, session)
+        )
+        if use_multi_agent:
+            logger.info(
+                "Using multi-agent workflow for query: {} (reason={}, confidence={})",
+                preview,
+                orchestrator_context.get("orchestrator_reasoning", ""),
+                orchestrator_context.get("orchestrator_confidence", 0.0),
+            )
             return await self.process_with_multi_agent(
                 content=msg.content,
                 session_key=key,
@@ -836,6 +929,7 @@ class AgentLoop:
                 chat_id=msg.chat_id,
                 on_progress=on_progress or _bus_progress,
                 session_summary=pending,
+                orchestrator_context=orchestrator_context,
             )
 
         await self.consolidator.maybe_consolidate_by_tokens(
@@ -884,7 +978,7 @@ class AgentLoop:
             self.sessions.save(session)
             user_persisted_early = True
 
-        final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
+        final_content, tools_used, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -903,6 +997,17 @@ class AgentLoop:
         # Skip the already-persisted user message when saving the turn
         save_skip = 1 + len(history) + (1 if user_persisted_early else 0)
         self._save_turn(session, all_msgs, save_skip)
+        paper_tools_used = [name for name in tools_used if name in _PAPER_TOOL_NAMES]
+        if paper_tools_used:
+            paper_refs = self._paper_references_from_tool_messages(all_msgs)
+            self._remember_multi_agent_context(
+                session,
+                {
+                    "routing_decision": "single_agent_paper_tools",
+                    "retrieval_results": paper_refs,
+                },
+                paper_tools_used,
+            )
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
@@ -1183,7 +1288,11 @@ class AgentLoop:
             "rewritten_queries", "rewrite_reasoning",
             "sub_queries_detail", "extracted_entities",
             "referenced_papers", "requires_clarification",
+            "explicit_paper_ids", "external_search_requested",
+            "novelty_required", "discovery_request",
+            "presented_paper_ids", "last_search_topic", "resolved_topic",
             "external_search_completed", "post_research_retrieval",
+            "research_outcome", "novelty_excluded_count",
             "iteration_count", "max_iterations",
             "user_query", "session_id",
             "recent_dialog_context",
@@ -1204,6 +1313,7 @@ class AgentLoop:
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         session_summary: str | None = None,
+        orchestrator_context: dict[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Process a message using the multi-agent workflow.
 
@@ -1240,7 +1350,19 @@ class AgentLoop:
         # ------------------------------------------------------------------
         # Check for paused state — resume mode
         # ------------------------------------------------------------------
-        paused_state = session.metadata.pop("multi_agent_paused_state", None)
+        paused_state = session.metadata.get("multi_agent_paused_state")
+        if paused_state is not None and self._has_paper_novelty_signal(content):
+            # A user may decline the selection UI implicitly by asking for
+            # more/other papers. Treat that as a fresh discovery turn instead
+            # of feeding it to the paper-selection parser.
+            session.metadata.pop("multi_agent_paused_state", None)
+            self.sessions.save(session)
+            paused_state = None
+            logger.info(
+                "process_with_multi_agent: abandoned paused selection for a fresh novelty query"
+            )
+        elif paused_state is not None:
+            session.metadata.pop("multi_agent_paused_state", None)
         if paused_state is not None:
             logger.info(
                 "process_with_multi_agent: found paused state, resuming workflow"
@@ -1297,11 +1419,21 @@ class AgentLoop:
 
             # Persist assistant response into session history
             if final_answer.strip():
-                session.add_message("assistant", final_answer)
+                persisted_answer = self._multi_agent_persisted_answer(
+                    final_answer=final_answer,
+                    citations=citations,
+                    full_response=full_response,
+                )
+                session.add_message("assistant", persisted_answer)
                 self._clear_pending_user_turn(session)
+                self._remember_multi_agent_context(session, result, metadata["sources_used"])
                 self.sessions.save(session)
                 self._schedule_background(
                     self.consolidator.maybe_consolidate_by_tokens(session)
+                )
+                self._schedule_skill_extraction(
+                    result,
+                    str(result.get("user_query") or paused_state.get("user_query", "")),
                 )
 
             return OutboundMessage(
@@ -1332,6 +1464,15 @@ class AgentLoop:
             node_history_chars = int(self.tools_config.paper.multi_agent_node_history_chars or 0)
             recent_dialog = self._truncate_context(recent_dialog, node_history_chars)
 
+            router_short = self._format_recent_dialog(
+                history,
+                max_turns=self.tools_config.paper.router_short_history_turns,
+            )
+            router_short = self._truncate_context(
+                router_short,
+                self.tools_config.paper.router_short_memory_chars,
+            )
+
             long_term_memory = self.context.memory.read_memory()
             user_profile = self.context.memory.read_user()
             soul_context = self.context.memory.read_soul()
@@ -1341,10 +1482,44 @@ class AgentLoop:
             soul_context = self._truncate_context(soul_context, node_history_chars)
             session_summary_context = self._truncate_context(session_summary_context, node_history_chars)
 
+            last_routing_decision = str(
+                session.metadata.get(self._MULTI_AGENT_LAST_ROUTING_KEY) or "none"
+            )
+            router_long = self._truncate_context(
+                session_summary_context or long_term_memory,
+                self.tools_config.paper.router_long_memory_chars,
+            )
+            gate_context = dict(orchestrator_context or {})
+            active_papers = session.metadata.get(
+                self._MULTI_AGENT_ACTIVE_PAPERS_KEY, []
+            )
+            presented_paper_ids = session.metadata.get(
+                self._MULTI_AGENT_PRESENTED_PAPER_IDS_KEY, []
+            )
+            last_search_topic = str(
+                session.metadata.get(self._MULTI_AGENT_LAST_SEARCH_TOPIC_KEY) or ""
+            )
+
             result = await self._multi_agent_graph.run(
                 user_query=content,
                 session_id=session_key,
                 progress_callback=on_progress,
+                router_memory_short=router_short or "(empty)",
+                router_memory_long=router_long or "(empty)",
+                last_routing_decision=last_routing_decision,
+                routing_context={
+                    "active_papers": active_papers,
+                    **gate_context,
+                },
+                referenced_papers=active_papers,
+                presented_paper_ids=presented_paper_ids,
+                last_search_topic=last_search_topic,
+                orchestrator_decision=gate_context.get("orchestrator_decision", "multi_agent"),
+                orchestrator_reasoning=gate_context.get("orchestrator_reasoning", ""),
+                orchestrator_confidence=float(
+                    gate_context.get("orchestrator_confidence", 0.0) or 0.0
+                ),
+                retrieval_judge_margin=self.tools_config.paper.multi_agent_retrieval_judge_margin,
                 recent_dialog_context=recent_dialog or "(empty)",
                 long_term_memory_context=long_term_memory or "(empty)",
                 user_profile_context=user_profile or "(empty)",
@@ -1388,6 +1563,11 @@ class AgentLoop:
                 if selection_ui.strip():
                     session.add_message("assistant", selection_ui)
                     self._clear_pending_user_turn(session)
+                    self._remember_multi_agent_context(
+                        session,
+                        result,
+                        ["external_search"] if result.get("external_papers") else [],
+                    )
                     self.sessions.save(session)
 
                 return OutboundMessage(
@@ -1440,15 +1620,19 @@ class AgentLoop:
 
             # Persist assistant response into session history
             if final_answer.strip():
-                session.add_message("assistant", final_answer)
+                persisted_answer = self._multi_agent_persisted_answer(
+                    final_answer=final_answer,
+                    citations=citations,
+                    full_response=full_response,
+                )
+                session.add_message("assistant", persisted_answer)
                 self._clear_pending_user_turn(session)
+                self._remember_multi_agent_context(session, result, metadata["sources_used"])
                 self.sessions.save(session)
                 self._schedule_background(
                     self.consolidator.maybe_consolidate_by_tokens(session)
                 )
-            # self._append_turn_history(content, final_answer)
-            # self._schedule_background(self.dream.run())
-            # self._schedule_skill_extraction(result, content)
+                self._schedule_skill_extraction(result, content)
 
             return OutboundMessage(
                 channel=channel,
@@ -1489,210 +1673,424 @@ class AgentLoop:
         """
         if not self.tools_config.paper.enable or not hasattr(self, "kb"):
             return {"status": "error", "error": "Knowledge base not enabled"}
-
-        from nanobot.agent.tools.paper import (
-            _extract_assets_and_strip,
-            _extract_figure_table_blocks,
-            _extract_front_matter,
-            _generate_chunk_metadata,
-            _merge_split_paragraphs,
-            _normalize_blank_lines,
-            _remove_noisy_blocks,
-            _save_asset_kv,
-            _split_markdown_semantic,
-            _strip_front_matter,
-            _valid_extracted_text,
-        )
-
         pdf_path = Path(local_pdf_path)
-        text_content: str = ""
-
-        # 1. Parse PDF using MinerULoader (precise markdown output).
-        if self._mineru_api_token:
-            try:
-                from langchain_mineru import MinerULoader
-
-                loader = MinerULoader(
-                    source=str(pdf_path),
-                    language="en",
-                    mode="precision",
-                    token=self._mineru_api_token,
-                )
-                parsed = await asyncio.to_thread(loader.load)
-                text_content = parsed[0].page_content if parsed else ""
-            except Exception:
-                logger.warning(
-                    "MinerULoader failed for {}, falling back to extract_text",
-                    pdf_path,
-                )
-
-        if not _valid_extracted_text(text_content):
-            from nanobot.utils.document import extract_text
-
-            text_content = await asyncio.to_thread(extract_text, pdf_path)
-            text_content = text_content if isinstance(text_content, str) else ""
-
-        if not _valid_extracted_text(text_content):
-            return {
-                "status": "error",
-                "error": "failed_to_parse_content",
-                "paper_id": str(doc.get("paper_id", "paper")),
-            }
-
-        assets_path = self.workspace / "kb" / "figures.jsonl"
-        paper_id = str(doc.get("paper_id", "paper"))
-
-        text_content = _remove_noisy_blocks(text_content) if text_content else ""
-        # Extract and remove figure/table blocks (images + caption → KV),
-        # then merge paragraphs broken across pages.
-        text_content, assets_by_key = _extract_figure_table_blocks(
-            text_content, paper_id=paper_id,
-        )
-        text_content = _merge_split_paragraphs(text_content)
-        if assets_by_key:
-            _save_asset_kv(assets_path, assets_by_key, paper_id=paper_id)
-        if not text_content or not text_content.strip():
-            return {"status": "error", "error": "failed_to_parse_content"}
-
-        # Save front matter before stripping (for metadata extraction)
-        raw_front_matter = _extract_front_matter(text_content)
-        # Strip front matter (title/authors/abstract before Introduction)
-        body_text = _strip_front_matter(text_content)
-        # Final cleanup: discard any remaining image links / HTML tables
-        body_text, _ = _extract_assets_and_strip(body_text, paper_id=paper_id)
-        body_text = _normalize_blank_lines(body_text)
-
-        # Extract title from front matter's first ``# `` heading
-        if raw_front_matter:
-            m = re.search(r"^#\s+(.+)$", raw_front_matter, re.MULTILINE)
-            if m:
-                doc["title"] = m.group(1).strip()[:200]
-
-        # Enrich metadata from front matter when arXiv data is missing
-        if (not doc.get("authors") or not doc.get("abstract")) and raw_front_matter:
-            from nanobot.agent.tools.paper import _parse_front_matter_metadata
-            fm_meta = await _parse_front_matter_metadata(
-                raw_front_matter, self.provider, self.model,
-            )
-            if fm_meta.get("title"):
-                doc["title"] = fm_meta["title"]
-            if fm_meta.get("authors"):
-                doc["authors"] = fm_meta["authors"]
-            if fm_meta.get("abstract"):
-                doc["abstract"] = fm_meta["abstract"]
-            if fm_meta.get("year"):
-                doc["year"] = fm_meta["year"]
-
-        # 2. Save .md (body only, without front matter) for inspection.
         md_path = pdf_path.with_suffix(".md")
-        md_path.write_text(body_text, encoding="utf-8")
-
-        # 3. Semantic chunking on body text.
-        semantic_chunks = _split_markdown_semantic(
-            body_text,
-            max_chunk_chars=self.kb.config.max_chunk_chars,
-            min_chunk_chars=self.kb.config.min_chunk_chars,
+        ingest_tool = self.tools.get("paper_ingest")
+        if ingest_tool is None or not hasattr(ingest_tool, "ingest_local_pdf"):
+            return {"status": "error", "error": "Paper ingest tool not available"}
+        result = await ingest_tool.ingest_local_pdf(
+            doc,
+            pdf_path,
+            markdown_path=md_path,
+            summarize=True,
         )
-        if not semantic_chunks:
-            return {"status": "error", "error": "no_chunks_generated"}
-
-        # 4. Generate HyDE metadata for each chunk.
-        chunk_metadata: list[dict[str, Any]] = []
-        for chunk in semantic_chunks:
-            meta = await _generate_chunk_metadata(
-                text=chunk.get("text", ""),
-                section=chunk.get("section", "content"),
-                provider=self.provider,
-                model=self.model,
-                num_questions=self.kb.config.num_hypothetical_questions,
-                summarize=True,
-                title=doc.get("title", ""),
-                abstract=doc.get("abstract", ""),
-                paper_id=paper_id,
-                assets_by_key=assets_by_key,
-            )
-            chunk_metadata.append(meta)
-
-        # 6. Upsert to Chroma.
-        result = await self.kb.upsert_semantic_chunks(
-            doc=doc,
-            semantic_chunks=semantic_chunks,
-            chunk_metadata=chunk_metadata,
-        )
-        result["status"] = "ok"
-        result["local_md"] = str(md_path)
-        # Delete the uploaded PDF only after the complete indexing transaction succeeds.
-        pdf_path.unlink(missing_ok=True)
+        if (
+            result.get("status") == "ok"
+            and not self.tools_config.paper.retain_uploaded_pdf
+        ):
+            pdf_path.unlink(missing_ok=True)
         return result
 
     def _schedule_skill_extraction(self, result: dict[str, Any], user_query: str) -> None:
-        """Fire-and-forget background task: extract reusable skills from paper Q&A.
-        
-        Runs Phase 1 (LLM analysis) + Phase 2 (AgentRunner with file tools)
-        to determine if this multi-agent discussion produced domain expertise
-        worth preserving as a Skill. If so, creates or updates SKILL.md files
-        under workspace/skills/.
-        """
-        if not self.tools_config.paper.enable:
+        """Stage reusable Skill candidates from a completed paper workflow."""
+        if (
+            not self.tools_config.paper.enable
+            or not self.skill_config.auto_extract_from_papers
+            or not user_query.strip()
+        ):
             return
         try:
             from nanobot.agent.skill_extractor import SkillExtractor
 
-            result["user_query"] = user_query
+            result_snapshot = dict(result)
+            result_snapshot["user_query"] = user_query
             extractor = SkillExtractor(
                 store=self.context.memory,
                 provider=self.provider,
                 model=self.model,
                 workspace=self.workspace,
+                candidate_manager=self.skill_candidates,
+                min_evidence_items=self.skill_config.min_evidence_items,
             )
-            self._schedule_background(extractor.extract(result))
+            self._schedule_background(extractor.extract(result_snapshot))
         except Exception:
             logger.exception("Failed to schedule skill extraction")
 
-    def should_use_multi_agent(self, content: str) -> bool:
-        """Determine if a query should use the multi-agent workflow.
-        
-        Heuristics:
-        - Query mentions papers, research, arXiv, or academic topics
-        - Query is complex (multiple questions or comparisons)
-        - Query asks for latest/recent papers
-        
-        Args:
-            content: User query
-            
-        Returns:
-            True if multi-agent should be used
-        """
+    @staticmethod
+    def _has_explicit_paper_signal(content: str) -> bool:
+        content_lower = content.lower()
+        paper_keywords = (
+            "paper", "论文", "文献", "文章", "学术", "research", "arxiv",
+            "publication", "survey", "review", "citation", "引用",
+            "transformer", "mamba", "llm", "gpt", "bert",
+            "neural network", "神经网络", "deep learning", "深度学习",
+            "machine learning", "机器学习",
+        )
+        return any(keyword in content_lower for keyword in paper_keywords)
+
+    @staticmethod
+    def _has_paper_followup_signal(content: str) -> bool:
+        content_lower = content.lower().strip()
+        followup_indicators = (
+            "该论文", "这篇", "本文", "上述", "前面", "刚才", "第一篇",
+            "第二篇", "第三篇", "该模型", "这个模型", "该方法", "这个方法",
+            "它的", "其", "继续", "展开", "详细", "性能", "指标", "准确率",
+            "实验", "消融", "数据集", "baseline", "基线", "局限", "创新点",
+            "算法", "优化", "优化器", "目标函数", "损失函数", "训练策略",
+            "收敛", "公式", "架构", "模块", "怎么设计", "如何设计",
+            "怎么实现", "具体原理",
+            "还有", "其他", "其它", "更多", "另外", "再推荐", "再找",
+            "compare it", "this paper", "the paper", "this model", "the model",
+            "its performance", "previous one", "above", "former", "latter",
+            "method", "algorithm", "optimizer", "objective", "loss function",
+            "architecture", "training strategy", "how is it designed",
+            "more papers", "other papers", "another paper",
+        )
+        return any(indicator in content_lower for indicator in followup_indicators)
+
+    @staticmethod
+    def _has_paper_novelty_signal(content: str) -> bool:
+        content_lower = content.lower()
+        return any(indicator in content_lower for indicator in (
+            "还有", "其他", "其它", "更多", "另外", "再推荐", "再找",
+            "more papers", "other papers", "another paper", "additional papers",
+        ))
+
+    @staticmethod
+    def _is_simple_acknowledgement(content: str) -> bool:
+        normalized = content.strip().lower().rstrip("。.!！?？~～")
+        return normalized in {
+            "谢谢", "感谢", "好的", "好", "明白了", "知道了", "收到",
+            "ok", "okay", "thanks", "thank you", "got it",
+        }
+
+    def _has_recent_multi_agent_context(self, session: Session) -> bool:
+        marker = session.metadata.get(self._MULTI_AGENT_CONTEXT_MESSAGE_COUNT_KEY)
+        try:
+            marker_count = int(marker)
+        except (TypeError, ValueError):
+            return False
+        # A turn normally contributes two messages. Keep paper context for the
+        # configured short-history window, with a small allowance for tool-free
+        # acknowledgements between two paper questions.
+        max_delta = self.tools_config.paper.router_short_history_turns * 2 + 2
+        return len(session.messages) - marker_count <= max_delta
+
+    def should_use_multi_agent(self, content: str, session: Session | None = None) -> bool:
+        """Fast deterministic gate used before the optional LLM orchestrator."""
         if not self._multi_agent_graph:
             return False
+        if session is not None and session.metadata.get("multi_agent_paused_state"):
+            return True
         if not self.tools_config.paper.multi_agent_orchestrator_enabled:
             return False
-        
-        content_lower = content.lower()
-        
-        # Keywords indicating paper-related queries
-        paper_keywords = [
-            "paper", "论文", "文献", "研究", "research",
-            "arxiv", "publication", "survey", "review",
-            "method", "algorithm", "model", "architecture",
-            "transformer", "mamba", "llm", "gpt", "bert",
-            "neural", "deep learning", "machine learning",
-        ]
-        
-        # Check for paper-related keywords
-        has_paper_keyword = any(kw in content_lower for kw in paper_keywords)
-        
-        # Check for complex queries (comparison, analysis, summary)
-        complex_indicators = [
-            "compare", "对比", "比较", "vs", "versus",
-            "summarize", "总结", "综述", "分析",
-            "latest", "最新", "recent", "最近",
-            "difference", "区别", "差异",
-        ]
-        has_complex_indicator = any(ind in content_lower for ind in complex_indicators)
-        
-        # Use multi-agent if it's paper-related or complex
-        return has_paper_keyword or has_complex_indicator
+        if self._has_explicit_paper_signal(content):
+            return True
+        return bool(
+            session is not None
+            and self._has_recent_multi_agent_context(session)
+            and self._has_paper_followup_signal(content)
+        )
+
+    async def _decide_multi_agent_with_orchestrator(
+        self,
+        content: str,
+        session: Session,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Choose single vs. paper multi-agent using rules plus recent context.
+
+        High-confidence paper queries and referential follow-ups avoid an extra
+        model call. Only ambiguous messages inside a recent paper conversation
+        reach the lightweight LLM classifier.
+        """
+        if not self._multi_agent_graph:
+            return False, {
+                "orchestrator_decision": "single_agent",
+                "orchestrator_reasoning": "multi-agent graph unavailable",
+                "orchestrator_confidence": 1.0,
+            }
+        if session.metadata.get("multi_agent_paused_state"):
+            return True, {
+                "orchestrator_decision": "multi_agent",
+                "orchestrator_reasoning": "resume paused paper workflow",
+                "orchestrator_confidence": 1.0,
+            }
+        if not self.tools_config.paper.multi_agent_orchestrator_enabled:
+            return False, {
+                "orchestrator_decision": "single_agent",
+                "orchestrator_reasoning": "paper orchestrator disabled",
+                "orchestrator_confidence": 1.0,
+            }
+        if self._has_explicit_paper_signal(content):
+            return True, {
+                "orchestrator_decision": "multi_agent",
+                "orchestrator_reasoning": "explicit academic-paper signal",
+                "orchestrator_confidence": 1.0,
+            }
+
+        if self._is_simple_acknowledgement(content):
+            return False, {
+                "orchestrator_decision": "single_agent",
+                "orchestrator_reasoning": "simple acknowledgement",
+                "orchestrator_confidence": 1.0,
+            }
+
+        recent_paper_context = self._has_recent_multi_agent_context(session)
+        if recent_paper_context and self._has_paper_followup_signal(content):
+            return True, {
+                "orchestrator_decision": "multi_agent",
+                "orchestrator_reasoning": "referential follow-up to recent paper workflow",
+                "orchestrator_confidence": 0.98,
+            }
+        if not recent_paper_context:
+            return False, {
+                "orchestrator_decision": "single_agent",
+                "orchestrator_reasoning": "no paper signal or recent paper context",
+                "orchestrator_confidence": 0.98,
+            }
+
+        recent_dialog = self._format_recent_dialog(
+            session.get_history(max_messages=0),
+            max_turns=self.tools_config.paper.router_short_history_turns,
+        )
+        recent_dialog = self._truncate_context(
+            recent_dialog,
+            self.tools_config.paper.router_short_memory_chars,
+        )
+        active_papers = session.metadata.get(self._MULTI_AGENT_ACTIVE_PAPERS_KEY, [])
+        prompt = (
+            "Classify whether the current message continues an academic-paper "
+            "search/analysis conversation and therefore needs the paper multi-agent workflow. "
+            "Use single_agent for acknowledgements, general chat, coding, or a clear topic change. "
+            "Return JSON only: "
+            '{"decision":"multi_agent|single_agent","confidence":0.0,"reasoning":"short"}.\n\n'
+            f"Recent dialog:\n{recent_dialog or '(empty)'}\n\n"
+            f"Active papers:\n{json.dumps(active_papers, ensure_ascii=False)}\n\n"
+            f"Current message:\n{content}"
+        )
+        route_schema = {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": ["multi_agent", "single_agent"],
+                },
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "reasoning": {"type": "string"},
+            },
+            "required": ["decision", "confidence", "reasoning"],
+            "additionalProperties": False,
+        }
+        try:
+            response = await self.provider.chat_structured_with_retry(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a conservative conversation route classifier.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                json_schema=route_schema,
+                temperature=0.0,
+                max_tokens=256,
+                disable_thinking=True,
+            )
+            if response.finish_reason == "error":
+                raise RuntimeError(response.content or "route classifier failed")
+            raw = (response.content or "").strip()
+            if "```" in raw:
+                raw = raw.split("```", 2)[1]
+                if raw.lstrip().startswith("json"):
+                    raw = raw.lstrip()[4:]
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start < 0 or end <= start:
+                raise ValueError("route classifier returned no JSON object")
+            payload = json.loads(raw[start : end + 1])
+            decision = str(payload.get("decision", "")).strip().lower()
+            if decision not in {"multi_agent", "single_agent"}:
+                raise ValueError(f"invalid route decision: {decision!r}")
+            confidence = float(payload.get("confidence", 0.0) or 0.0)
+            threshold = self.tools_config.paper.multi_agent_orchestrator_confidence_threshold
+            # Paper conversations are sticky: only a high-confidence explicit
+            # topic switch is allowed to leave the paper workflow. A low-
+            # confidence/ambiguous decision keeps the previous multi-agent path.
+            use_multi = not (
+                decision == "single_agent" and confidence >= threshold
+            )
+            return use_multi, {
+                "orchestrator_decision": decision,
+                "orchestrator_reasoning": str(payload.get("reasoning", ""))[:300],
+                "orchestrator_confidence": confidence,
+            }
+        except Exception as exc:
+            logger.warning("Paper route orchestrator failed; keeping recent paper route: {}", exc)
+            return True, {
+                "orchestrator_decision": "multi_agent",
+                "orchestrator_reasoning": "orchestrator unavailable; preserve recent paper context",
+                "orchestrator_confidence": 0.0,
+            }
+
+    def _multi_agent_persisted_answer(
+        self,
+        *,
+        final_answer: str,
+        citations: list[Any],
+        full_response: str,
+    ) -> str:
+        mode = self.tools_config.paper.multi_agent_memory_mode
+        if mode == "debug_trace":
+            return full_response
+        if mode != "strict_with_citations" or not citations:
+            return final_answer
+        references = "\n".join(
+            f"{index}. {citation}" for index, citation in enumerate(citations[:10], 1)
+        )
+        return f"{final_answer}\n\nReferences:\n{references}"
+
+    def _remember_multi_agent_context(
+        self,
+        session: Session,
+        result: dict[str, Any],
+        sources: list[str],
+    ) -> None:
+        session.metadata[self._MULTI_AGENT_LAST_ROUTING_KEY] = str(
+            result.get("routing_decision") or "unknown"
+        )
+        session.metadata[self._MULTI_AGENT_LAST_SOURCES_KEY] = list(dict.fromkeys(sources))
+
+        papers: list[dict[str, str]] = []
+        for key in (
+            "papers_for_selection",
+            "retrieval_results",
+            "external_papers",
+            "referenced_papers",
+        ):
+            values = result.get(key, [])
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if not isinstance(value, dict):
+                    continue
+                paper_id = str(value.get("paper_id") or value.get("id") or "").strip()
+                title = str(
+                    value.get("paper_title") or value.get("title") or ""
+                ).strip()
+                if paper_id or title:
+                    papers.append({"paper_id": paper_id, "title": title})
+        deduped: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for paper in papers:
+            identity = (paper["paper_id"].lower(), paper["title"].lower())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            deduped.append(paper)
+            if len(deduped) >= 8:
+                break
+        if deduped:
+            session.metadata[self._MULTI_AGENT_ACTIVE_PAPERS_KEY] = deduped
+
+        visible_ids: list[str] = []
+        if result.get("research_phase") == "select":
+            for paper in result.get("papers_for_selection", []):
+                if isinstance(paper, dict) and paper.get("paper_id"):
+                    visible_ids.append(str(paper["paper_id"]))
+        for citation in result.get("citations", []):
+            match = re.match(r"\[([^]]+)\]", str(citation or "").strip())
+            if match:
+                visible_ids.append(match.group(1))
+        visible_ids.extend(re.findall(
+            r"\[([A-Za-z0-9][A-Za-z0-9._:/-]{1,127})\](?!\()",
+            str(result.get("final_answer") or result.get("draft_answer") or ""),
+        ))
+        answer_text = str(
+            result.get("final_answer") or result.get("draft_answer") or ""
+        ).casefold()
+        for paper in papers:
+            paper_id = paper.get("paper_id", "")
+            title = paper.get("title", "").strip()
+            if paper_id and len(title) >= 8 and title.casefold() in answer_text:
+                visible_ids.append(paper_id)
+
+        previous_ids = session.metadata.get(
+            self._MULTI_AGENT_PRESENTED_PAPER_IDS_KEY, []
+        )
+        cumulative_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for raw_id in [*previous_ids, *visible_ids]:
+            paper_id = re.sub(
+                r"^arxiv:\s*", "", str(raw_id or "").strip(), flags=re.IGNORECASE
+            )
+            versioned = re.fullmatch(
+                r"(?P<base>(?:\d{4}\.\d{4,5}|[a-z.-]+/\d{7}))v\d+",
+                paper_id,
+                flags=re.IGNORECASE,
+            )
+            identity = (versioned.group("base") if versioned else paper_id).casefold()
+            if identity and identity not in seen_ids:
+                seen_ids.add(identity)
+                cumulative_ids.append(paper_id)
+        if cumulative_ids:
+            session.metadata[self._MULTI_AGENT_PRESENTED_PAPER_IDS_KEY] = cumulative_ids[-200:]
+
+        resolved_topic = str(result.get("resolved_topic") or "").strip()
+        if result.get("discovery_request") and resolved_topic:
+            session.metadata[self._MULTI_AGENT_LAST_SEARCH_TOPIC_KEY] = resolved_topic
+        session.metadata[self._MULTI_AGENT_CONTEXT_MESSAGE_COUNT_KEY] = len(session.messages)
+
+    @staticmethod
+    def _paper_references_from_tool_messages(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Extract a bounded set of paper identities from Paper tool results."""
+        references: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def visit(value: Any) -> None:
+            if len(references) >= 8:
+                return
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                    if len(references) >= 8:
+                        break
+                return
+            if not isinstance(value, dict):
+                return
+
+            paper_id = str(
+                value.get("paper_id") or value.get("arxiv_id") or ""
+            ).strip()
+            title = str(
+                value.get("paper_title") or value.get("title") or ""
+            ).strip()
+            identity = (paper_id.casefold(), title.casefold())
+            if (paper_id or title) and identity not in seen:
+                seen.add(identity)
+                references.append({"paper_id": paper_id, "title": title})
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    visit(nested)
+                    if len(references) >= 8:
+                        break
+
+        for message in reversed(messages):
+            if message.get("role") != "tool":
+                continue
+            if str(message.get("name") or "") not in _PAPER_TOOL_NAMES:
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                visit(json.loads(content))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if len(references) >= 8:
+                break
+        return references
 
     @staticmethod
     def _truncate_context(text: str, max_chars: int) -> str:

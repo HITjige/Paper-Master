@@ -140,14 +140,16 @@ class MultiAgentGraph:
         # Research node uses conditional edges based on phase
         # - wait_for_selection: Go to synthesis to show selection prompt (user needs to respond)
         # - continue_ingest: Self-loop to continue with ingest phase within research node
-        # - skip_to_retrieval: Go to retrieval for post-research search (ingest done or skipped)
+        # - to_retrieval: Only after selected papers are available in the KB
+        # - to_synthesis: Search-only, skipped, empty, or provider-error outcome
         workflow.add_conditional_edges(
             NODE_RESEARCH,
             research_phase_conditional,
             {
                 "wait_for_selection": NODE_SYNTHESIS,   # Go to synthesis to show selection UI
                 "continue_ingest": NODE_RESEARCH,       # Self-loop to execute ingest phase
-                "skip_to_retrieval": NODE_RETRIEVAL,    # Go to retrieval for post-research search
+                "to_retrieval": NODE_RETRIEVAL,
+                "to_synthesis": NODE_SYNTHESIS,
             },
         )
         
@@ -367,7 +369,8 @@ graph TD
     RETRIEVAL -->|insufficient| RESEARCH
     RETRIEVAL -->|sufficient / post_research| SYNTHESIS
     
-    RESEARCH -->|"post-ingest retrieval"| RETRIEVAL
+    RESEARCH -->|"successful ingest"| RETRIEVAL
+    RESEARCH -->|"search-only / empty / failed"| SYNTHESIS
     SYNTHESIS --> CRITIC
     
     CRITIC -->|passed| END([End])

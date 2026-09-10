@@ -18,6 +18,7 @@ from nanobot.agent.paper_kb import (
     tokenize_text,
 )
 from nanobot.agent.tools.paper import (
+    _decode_chunk_metadata_json,
     _generate_chunk_metadata,
     _remove_noisy_blocks,
     _split_markdown_semantic,
@@ -200,6 +201,264 @@ def test_paper_kb_rebuilds_persistent_fts_from_jsonl(tmp_path: Path):
         assert kb._lexical_index.search("中文论文", top_n=1)[0][0] == "p1:0"
     finally:
         kb._lexical_index.close()
+
+
+def test_vector_stamp_does_not_resubmit_immutable_hnsw_metadata(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("chromadb")
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            embedding_model="",
+            embedding_fallback="hash",
+            chroma_persist_dir=str(tmp_path / "chroma"),
+        ),
+    )
+    try:
+        kb._stamp_vector_collections(
+            [kb._chunk_collection, kb._summary_collection, kb._question_collection],
+            dimension=256,
+        )
+        for collection in (
+            kb._chunk_collection,
+            kb._summary_collection,
+            kb._question_collection,
+        ):
+            assert collection.metadata["nanobot:embedding_dimension"] == 256
+    finally:
+        kb._lexical_index.close()
+
+
+def test_stamp_failure_precedes_paper_data_commit(tmp_path: Path, monkeypatch) -> None:
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, min_chunk_chars=5),
+    )
+    kb._chroma_client = object()
+    kb._chunk_collection = MagicMock()
+    kb._summary_collection = MagicMock()
+    kb._question_collection = MagicMock()
+    kb.embed_texts = AsyncMock(side_effect=lambda texts: [[1.0, 0.0] for _ in texts])
+    monkeypatch.setattr(
+        kb,
+        "_stamp_vector_collections",
+        MagicMock(side_effect=ValueError("immutable metadata")),
+    )
+
+    with pytest.raises(ValueError, match="immutable metadata"):
+        asyncio.run(kb.upsert_semantic_chunks(
+            {"paper_id": "p1", "title": "Paper"},
+            [{"text": "long enough chunk", "section": "Method"}],
+            [{"summary": "summary", "hypothetical_questions": ["question"]}],
+        ))
+
+    assert kb._read_jsonl(kb.docs_file) == []
+    assert kb._read_jsonl(kb.chunks_file) == []
+    kb._lexical_index.close()
+
+
+def test_vector_index_detects_mixed_dimensions_and_rebuilds_atomically(
+    tmp_path: Path,
+):
+    chromadb = pytest.importorskip("chromadb")
+    chroma_path = tmp_path / "chroma"
+    client = chromadb.PersistentClient(path=str(chroma_path))
+    fixtures = {
+        "paper_chunks": (3, "p1:0", "parent chunk"),
+        "paper_summaries": (2, "p1:0:summary", "chunk summary"),
+        "paper_questions": (2, "p1:0:q0", "what is the method?"),
+    }
+    for name, (dimension, record_id, document) in fixtures.items():
+        collection = client.get_or_create_collection(
+            name=name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        collection.add(
+            ids=[record_id],
+            embeddings=[[1.0] * dimension],
+            documents=[document],
+            metadatas=[{"paper_id": "p1", "chunk_id": "p1:0"}],
+        )
+
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            embedding_model="",
+            embedding_fallback="hash",
+            embedding_batch_size=2,
+            chroma_persist_dir=str(chroma_path),
+        ),
+    )
+    before = kb.get_vector_index_status(refresh=True)
+    assert before["compatible"] is False
+    assert before["reindex_required"] is True
+    assert before["reason"] == "mixed_collection_dimensions"
+    assert before["collection_dimensions"] == {
+        "paper_chunks": 3,
+        "paper_summaries": 2,
+        "paper_questions": 2,
+    }
+
+    result = asyncio.run(kb.rebuild_vector_index(keep_backup=False))
+
+    assert result["status"] == "ok"
+    assert result["dimension"] == 256
+    assert result["source_counts"] == {
+        "paper_chunks": 1,
+        "paper_summaries": 1,
+        "paper_questions": 1,
+    }
+    after = kb.get_vector_index_status(refresh=True)
+    assert after["compatible"] is True
+    assert after["verified"] is True
+    assert after["reindex_required"] is False
+    assert set(after["collection_dimensions"].values()) == {256}
+    assert {
+        collection.name for collection in kb._chroma_client.list_collections()
+    } == set(fixtures)
+
+
+def test_incompatible_vector_index_skips_dense_and_keeps_sparse_results(
+    tmp_path: Path,
+    monkeypatch,
+):
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir(parents=True)
+    (kb_dir / "documents.jsonl").write_text(
+        json.dumps({"paper_id": "p1", "title": "EEG image generation"}) + "\n",
+        encoding="utf-8",
+    )
+    (kb_dir / "chunks.jsonl").write_text(
+        json.dumps({
+            "chunk_id": "p1:0",
+            "paper_id": "p1",
+            "text": "EEG signals can condition an image diffusion model.",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            embedding_model="",
+            embedding_fallback="hash",
+            enable_hypothetical_retrieval=False,
+        ),
+    )
+
+    class _MustNotQuery:
+        def query(self, **kwargs):
+            raise AssertionError("incompatible dense collection was queried")
+
+    class _ParentCollection(_MustNotQuery):
+        def get(self, *, ids, include):
+            return {
+                "ids": ids,
+                "documents": [
+                    "EEG signals can condition an image diffusion model."
+                    for _ in ids
+                ],
+                "metadatas": [{
+                    "paper_id": "p1",
+                    "paper_title": "EEG image generation",
+                    "keywords": "[]",
+                    "entities": "[]",
+                    "claims": "[]",
+                } for _ in ids],
+                "embeddings": [[1.0] + [0.0] * 255 for _ in ids],
+            }
+
+    kb._chroma_client = object()
+    kb._chunk_collection = _ParentCollection()
+    kb._summary_collection = _MustNotQuery()
+    kb._question_collection = _MustNotQuery()
+    kb._vector_index_status = {
+        **kb._vector_index_status,
+        "compatible": False,
+        "reindex_required": True,
+        "reason": "embedding_dimension_mismatch",
+    }
+    kb._ensure_vector_index_compatible = AsyncMock(return_value=False)
+
+    async def _direct_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr("nanobot.agent.paper_kb.asyncio.to_thread", _direct_to_thread)
+    results = asyncio.run(kb._retrieve_dense_hybrid(
+        query="EEG image diffusion",
+        top_k=2,
+        per_paper_limit=2,
+        search_mode="hybrid",
+        where_filter=None,
+        use_hybrid=True,
+    ))
+
+    assert [row["chunk_id"] for row in results] == ["p1:0"]
+    assert results[0]["bm25_score"] is not None
+    assert results[0]["dense_score"] is None
+    assert kb.get_vector_index_status()["reindex_required"] is True
+
+
+def test_empty_lexical_index_can_be_rebuilt_from_chroma(tmp_path: Path) -> None:
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            embedding_model="",
+            embedding_fallback="hash",
+            min_chunk_chars=20,
+        ),
+    )
+    text = (
+        "ATM evaluates EEG decoding performance with within-subject and "
+        "cross-subject accuracy experiments. " * 8
+    )
+    assert kb._chunk_collection is not None
+    assert kb._summary_collection is not None
+    assert kb._question_collection is not None
+    common_metadata = {
+        "paper_id": "atm-1",
+        "paper_title": "ATM",
+        "paper_source": "upload",
+        "paper_year": "2024",
+        "section": "Experiments",
+        "heading_path": "Experiments",
+    }
+    kb._chunk_collection.upsert(
+        ids=["atm-1:0"],
+        embeddings=[_hash_embedding(text)],
+        documents=[text],
+        metadatas=[{**common_metadata, "keywords": json.dumps(["ATM", "EEG", "accuracy"])}],
+    )
+    summary = "ATM performance on EEG decoding benchmarks."
+    kb._summary_collection.upsert(
+        ids=["atm-1:0:summary"],
+        embeddings=[_hash_embedding(summary)],
+        documents=[summary],
+        metadatas=[{**common_metadata, "chunk_id": "atm-1:0", "type": "summary"}],
+    )
+    question = "What is the cross-subject accuracy of ATM?"
+    kb._question_collection.upsert(
+        ids=["atm-1:0:q0"],
+        embeddings=[_hash_embedding(question)],
+        documents=[question],
+        metadatas=[{
+            **common_metadata,
+            "chunk_id": "atm-1:0",
+            "type": "hypothetical_question",
+        }],
+    )
+    assert kb._lexical_index is not None
+    assert kb._lexical_index.count() == 0
+
+    status = kb.rebuild_lexical_index_from_chroma()
+    matches = kb._lexical_index.search("cross-subject accuracy", top_n=5)
+
+    assert status["document_count"] == 1
+    assert matches and matches[0][0] == "atm-1:0"
+    kb._lexical_index.close()
 
 
 def test_hybrid_retrieval_exposes_separate_dense_sparse_and_rrf_scores(
@@ -515,7 +774,7 @@ def test_cross_encoder_pairs_are_batched_and_logits_are_normalized(
 
         def predict(self, pairs):
             self.calls.append(pairs)
-            return [-2.0, 2.0]
+            return [-2.0, 0.2, 2.0]
 
     async def _direct_to_thread(function, *args, **kwargs):
         return function(*args, **kwargs)
@@ -533,14 +792,293 @@ def test_cross_encoder_pairs_are_batched_and_logits_are_normalized(
     try:
         scores = asyncio.run(kb.rerank_pairs([
             ("query", "negative"),
+            ("query", "weak positive logit"),
             ("query", "positive"),
         ]))
     finally:
         kb._lexical_index.close()
 
     assert scores[0] == pytest.approx(1.0 / (1.0 + math.exp(2.0)))
-    assert scores[1] == pytest.approx(1.0 / (1.0 + math.exp(-2.0)))
+    assert scores[1] == pytest.approx(1.0 / (1.0 + math.exp(-0.2)))
+    assert scores[2] == pytest.approx(1.0 / (1.0 + math.exp(-2.0)))
     assert len(kb.rerank_model.calls) == 1
+
+
+def test_relevance_filter_uses_multi_query_max_and_preserves_fusion_score(
+    tmp_path: Path,
+):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            enable_hypothetical_retrieval=False,
+            rerank_model="fake",
+            retrieval_min_relevance_score=0.5,
+        ),
+    )
+    kb.rerank_pairs = AsyncMock(return_value=[0.1, 0.9, 0.2, 0.3])
+    results = asyncio.run(kb.rerank_and_filter_retrieval_results(
+        [
+            {
+                "chunk_id": "p1:0",
+                "paper_id": "p1",
+                "paper_title": "Relevant",
+                "text": "reinforcement learning evidence",
+                "score": 1.0,
+                "score_type": "weighted_rrf",
+            },
+            {
+                "chunk_id": "p2:0",
+                "paper_id": "p2",
+                "paper_title": "Irrelevant",
+                "text": "unrelated signal processing",
+                "score": 0.95,
+                "score_type": "weighted_rrf",
+            },
+        ],
+        queries=["强化学习", "reinforcement learning"],
+        top_k=5,
+        per_paper_limit=3,
+    ))
+
+    assert [item["chunk_id"] for item in results] == ["p1:0"]
+    assert results[0]["score"] == pytest.approx(0.9)
+    assert results[0]["relevance_score"] == pytest.approx(0.9)
+    assert results[0]["fusion_score"] == pytest.approx(1.0)
+    assert results[0]["score_type"] == "cross_encoder_relevance"
+    assert len(kb.rerank_pairs.await_args.args[0]) == 4
+    kb._lexical_index.close()
+
+
+def test_paper_discovery_applies_paper_level_relevance_gate(tmp_path: Path):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            enable_hypothetical_retrieval=False,
+            rerank_model="fake",
+            retrieval_min_relevance_score=0.5,
+        ),
+    )
+    # Two chunk scores followed by one paper-level score per paper.
+    kb.rerank_pairs = AsyncMock(return_value=[0.9, 0.8, 0.9, 0.2])
+    results = asyncio.run(kb.rerank_and_filter_retrieval_results(
+        [
+            {
+                "chunk_id": "p1:0",
+                "paper_id": "p1",
+                "paper_title": "RL",
+                "text": "reinforcement learning",
+                "score": 1.0,
+            },
+            {
+                "chunk_id": "p2:0",
+                "paper_id": "p2",
+                "paper_title": "EEG",
+                "text": "mentions reinforcement learning once",
+                "score": 0.9,
+            },
+        ],
+        queries=["有没有强化学习相关的文章"],
+        top_k=5,
+        per_paper_limit=3,
+    ))
+
+    assert [item["paper_id"] for item in results] == ["p1"]
+    assert results[0]["paper_relevance_score"] == pytest.approx(0.9)
+    kb._lexical_index.close()
+
+
+def test_filtered_empty_results_do_not_trigger_jsonl_reflow(tmp_path: Path):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            enable_hypothetical_retrieval=False,
+            rerank_model="fake",
+            retrieval_min_relevance_score=0.5,
+        ),
+    )
+    kb._chroma_client = object()
+    kb._chunk_collection = object()
+    kb._summary_collection = object()
+    kb._question_collection = object()
+    kb._retrieve_dense_hybrid = AsyncMock(return_value=[{
+        "chunk_id": "p1:0",
+        "paper_id": "p1",
+        "text": "irrelevant chunk",
+        "score": 1.0,
+        "score_type": "weighted_rrf",
+    }])
+    kb._retrieve_jsonl_multiquery = AsyncMock(return_value=[{
+        "chunk_id": "p1:0",
+        "paper_id": "p1",
+        "text": "must not reflow",
+    }])
+    kb.rerank_pairs = AsyncMock(return_value=[0.1])
+
+    results = asyncio.run(kb.retrieve_by_hypothetical_questions(
+        query="解释强化学习方法",
+        top_k=5,
+    ))
+
+    assert results == []
+    kb._retrieve_jsonl_multiquery.assert_not_awaited()
+    kb._lexical_index.close()
+
+
+def test_relevance_filter_fails_closed_when_reranker_errors(tmp_path: Path):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            enable_hypothetical_retrieval=False,
+            rerank_model="missing",
+            retrieval_relevance_fail_closed=True,
+        ),
+    )
+    kb.rerank_pairs = AsyncMock(side_effect=RuntimeError("reranker unavailable"))
+
+    results = asyncio.run(kb.rerank_and_filter_retrieval_results(
+        [{
+            "chunk_id": "p1:0",
+            "paper_id": "p1",
+            "text": "unverified evidence",
+            "score": 1.0,
+        }],
+        queries=["query"],
+        top_k=5,
+        per_paper_limit=3,
+    ))
+
+    assert results == []
+    kb._lexical_index.close()
+
+
+def test_jsonl_pair_commit_restores_previous_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, enable_hypothetical_retrieval=False),
+    )
+    previous_doc = {"paper_id": "p1", "title": "old"}
+    previous_chunk = {"paper_id": "p1", "chunk_id": "p1:0", "text": "old text"}
+    kb._write_jsonl(kb.docs_file, [previous_doc])
+    kb._write_jsonl(kb.chunks_file, [previous_chunk])
+    original_write = kb._write_jsonl
+    failed = False
+
+    def _flaky_write(path: Path, rows: list[dict]) -> None:
+        nonlocal failed
+        if (
+            path == kb.chunks_file
+            and not failed
+            and any(row.get("text") == "new text" for row in rows)
+        ):
+            failed = True
+            raise OSError("simulated chunks commit failure")
+        original_write(path, rows)
+
+    monkeypatch.setattr(kb, "_write_jsonl", _flaky_write)
+    with pytest.raises(OSError, match="simulated chunks commit failure"):
+        asyncio.run(kb._persist_paper_rows(
+            doc_row={"paper_id": "p1", "title": "new"},
+            chunk_rows=[{"paper_id": "p1", "chunk_id": "p1:0", "text": "new text"}],
+        ))
+
+    assert kb._read_jsonl(kb.docs_file) == [previous_doc]
+    assert kb._read_jsonl(kb.chunks_file) == [previous_chunk]
+
+
+def test_chroma_multi_collection_failure_restores_previous_vectors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class _Collection:
+        def __init__(self, records: list[dict], *, fail_next: bool = False):
+            self.records = {record["id"]: dict(record) for record in records}
+            self.fail_next = fail_next
+
+        def get(self, *, where: dict, include=None):
+            selected = [
+                record for record in self.records.values()
+                if record["metadata"].get("paper_id") == where.get("paper_id")
+            ]
+            return {
+                "ids": [record["id"] for record in selected],
+                "embeddings": [record["embedding"] for record in selected],
+                "documents": [record["document"] for record in selected],
+                "metadatas": [record["metadata"] for record in selected],
+            }
+
+        def delete(self, *, ids: list[str]):
+            for record_id in ids:
+                self.records.pop(record_id, None)
+
+        def upsert(self, *, ids, embeddings, documents, metadatas):
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("simulated summary upsert failure")
+            for index, record_id in enumerate(ids):
+                self.records[record_id] = {
+                    "id": record_id,
+                    "embedding": list(embeddings[index]),
+                    "document": documents[index],
+                    "metadata": dict(metadatas[index]),
+                }
+
+    def _old_record(record_id: str, document: str) -> dict:
+        return {
+            "id": record_id,
+            "embedding": [1.0, 0.0],
+            "document": document,
+            "metadata": {"paper_id": "p1"},
+        }
+
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, min_chunk_chars=10),
+    )
+    chunks = _Collection([_old_record("p1:0", "old chunk")])
+    summaries = _Collection(
+        [_old_record("p1:0:summary", "old summary")],
+        fail_next=True,
+    )
+    questions = _Collection([_old_record("p1:0:q0", "old question")])
+    kb._chroma_client = object()
+    kb._chunk_collection = chunks
+    kb._summary_collection = summaries
+    kb._question_collection = questions
+
+    async def _direct_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr("nanobot.agent.paper_kb.asyncio.to_thread", _direct_to_thread)
+
+    async def _embed(texts: list[str]) -> list[list[float]]:
+        return [[0.0, 1.0] for _ in texts]
+
+    kb.embed_texts = _embed
+    with pytest.raises(RuntimeError, match="simulated summary upsert failure"):
+        asyncio.run(kb.upsert_semantic_chunks(
+            {"paper_id": "p1", "title": "new paper"},
+            [{
+                "section": "Method",
+                "heading_path": "Method",
+                "text": "new chunk content long enough",
+            }],
+            [{
+                "summary": "new summary",
+                "hypothetical_questions": ["new question"],
+            }],
+        ))
+
+    assert set(chunks.records) == {"p1:0"}
+    assert chunks.records["p1:0"]["document"] == "old chunk"
+    assert summaries.records["p1:0:summary"]["document"] == "old summary"
+    assert questions.records["p1:0:q0"]["document"] == "old question"
 
 
 class TestMarkdownSemanticChunking:
@@ -657,6 +1195,83 @@ class TestChunkMetadataGeneration:
         assert len(result["hypothetical_questions"]) == 3
         assert "machine learning" in result["keywords"]
 
+    def test_singleton_list_response_is_normalized(self):
+        """Accept a common LLM shape variation without invoking fallback."""
+        mock_provider = MagicMock()
+        mock_response = MagicMock()
+        mock_response.content = json.dumps([{
+            "summary": "Wrapped metadata object.",
+            "hypothetical_questions": ["What is wrapped?"],
+            "keywords": ["metadata"],
+            "entities": ["JSON"],
+            "claims": ["The response uses a singleton array."],
+        }])
+        mock_provider.chat_with_retry = AsyncMock(return_value=mock_response)
+
+        result = asyncio.run(_generate_chunk_metadata(
+            text="This chunk describes a singleton JSON metadata response.",
+            section="Method",
+            provider=mock_provider,
+            model="test-model",
+            num_questions=1,
+        ))
+
+        assert result["summary"] == "Wrapped metadata object."
+        assert result["keywords"] == ["metadata"]
+        assert result["entities"] == ["JSON"]
+
+    def test_visible_reasoning_before_fenced_json_is_ignored(self):
+        payload = {
+            "summary": "Grounded result.",
+            "hypothetical_questions": ["What result is reported?"],
+            "keywords": ["result"],
+            "entities": [],
+            "claims": [],
+        }
+        raw = "Thinking Process:\n1. analyze\n```json\n" + json.dumps(payload) + "\n```"
+
+        assert _decode_chunk_metadata_json(raw) == payload
+
+    def test_truncated_reasoning_retries_with_shorter_input(self):
+        mock_provider = MagicMock()
+        truncated = MagicMock(
+            content=None,
+            reasoning_content="thinking without a closing token" * 20,
+            finish_reason="length",
+            usage={"completion_tokens": 1600},
+        )
+        recovered = MagicMock(
+            content=json.dumps({
+                "summary": "Recovered metadata.",
+                "hypothetical_questions": ["How was metadata recovered?"],
+                "keywords": ["metadata"],
+                "entities": [],
+                "claims": [],
+            }),
+            reasoning_content=None,
+            finish_reason="stop",
+            usage={"completion_tokens": 80},
+        )
+        mock_provider.chat_with_retry = AsyncMock(side_effect=[truncated, recovered])
+
+        result = asyncio.run(_generate_chunk_metadata(
+            text="long evidence " * 400,
+            section="Results",
+            provider=mock_provider,
+            model="Qwen3.5-9B",
+            num_questions=1,
+        ))
+
+        assert result["summary"] == "Recovered metadata."
+        assert mock_provider.chat_with_retry.await_count == 2
+        first_call, second_call = mock_provider.chat_with_retry.await_args_list
+        assert first_call.kwargs["max_tokens"] == 1600
+        assert second_call.kwargs["max_tokens"] == 2000
+        assert len(second_call.kwargs["messages"][1]["content"]) < len(
+            first_call.kwargs["messages"][1]["content"]
+        )
+        assert first_call.kwargs["reasoning_effort"] is None
+
     @pytest.mark.asyncio
     async def test_invalid_json_fallback(self):
         """Test fallback when LLM returns invalid JSON."""
@@ -688,6 +1303,7 @@ class TestPaperKnowledgeBaseWithChroma:
         return PaperKbConfig(
             enabled=True,
             embedding_model="",  # Will use hash embeddings
+            retrieval_relevance_filter_enabled=False,
             num_hypothetical_questions=3,
             enable_hypothetical_retrieval=True,
             chroma_persist_dir=str(tmp_path / "chroma"),
@@ -771,6 +1387,18 @@ class TestPaperKnowledgeBaseWithChroma:
         assert paper_kb._question_collection.count() >= 6
         assert result["lexical"]["document_count"] == 2
         assert paper_kb._lexical_index.count() == 2
+        parent_meta = paper_kb._chunk_collection.get(
+            ids=["test-paper-001:0"], include=["metadatas"]
+        )["metadatas"][0]
+        summary_meta = paper_kb._summary_collection.get(
+            ids=["test-paper-001:0:summary"], include=["metadatas"]
+        )["metadatas"][0]
+        question_meta = paper_kb._question_collection.get(
+            ids=["test-paper-001:0:q0"], include=["metadatas"]
+        )["metadatas"][0]
+        assert parent_meta["chunk_index"] == 0
+        assert summary_meta["chunk_index"] == 0
+        assert question_meta["chunk_index"] == 0
         jsonl_chunks = paper_kb._read_jsonl(paper_kb.chunks_file)
         assert sum(1 for chunk in jsonl_chunks if chunk.get("paper_id") == "test-paper-001") == 2
 
@@ -819,6 +1447,7 @@ class TestPaperKnowledgeBaseWithChroma:
         assert "text" in results[0]
         assert "chunk_id" in results[0]
         assert "matched_by" in results[0]  # Should show whether matched by question or summary
+        assert "embedding" not in results[0]  # Internal MMR vectors must not reach prompts
 
     @pytest.mark.asyncio
     async def test_jsonl_fallback_keeps_semantic_chunks_retrievable(

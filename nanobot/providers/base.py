@@ -285,6 +285,14 @@ class LLMProvider(ABC):
         """
         pass
 
+    def _disable_thinking_request_kwargs(
+        self,
+        model: str | None,
+    ) -> dict[str, Any]:
+        """Provider-specific options for a direct, non-thinking response."""
+        del model
+        return {}
+
     @classmethod
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
@@ -564,6 +572,7 @@ class LLMProvider(ABC):
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
+        disable_thinking: bool = False,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
@@ -582,16 +591,51 @@ class LLMProvider(ABC):
             temperature = self.generation.temperature
         if reasoning_effort is self._SENTINEL:
             reasoning_effort = self.generation.reasoning_effort
+        if disable_thinking:
+            reasoning_effort = None
 
         kw: dict[str, Any] = dict(
             messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
         )
+        if disable_thinking:
+            kw.update(self._disable_thinking_request_kwargs(model))
         return await self._run_with_retry(
             self._safe_chat,
             kw,
             messages,
+            retry_mode=retry_mode,
+            on_retry_wait=on_retry_wait,
+        )
+
+    async def chat_structured_with_retry(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        json_schema: dict[str, Any],
+        model: str | None = None,
+        max_tokens: int = 1600,
+        temperature: float = 0.2,
+        disable_thinking: bool = False,
+        retry_mode: str = "standard",
+        on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Generate structured content, with a prompt-only compatibility fallback.
+
+        Providers with native constrained decoding should override this method.
+        Explicitly passing ``reasoning_effort=None`` prevents a global thinking
+        setting from consuming the output budget for short extraction tasks.
+        """
+        del json_schema, disable_thinking
+        return await self.chat_with_retry(
+            messages=messages,
+            tools=None,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=None,
+            tool_choice=None,
             retry_mode=retry_mode,
             on_retry_wait=on_retry_wait,
         )

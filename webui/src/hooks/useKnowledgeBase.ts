@@ -1,5 +1,9 @@
 import { useCallback, useRef, useState } from "react";
-import { fetchKBStats, uploadPapers } from "@/lib/kb-api";
+import {
+  deletePaper as requestPaperDeletion,
+  fetchKBStats,
+  uploadPapers,
+} from "@/lib/kb-api";
 import type { KBStats, UploadResult } from "@/lib/types";
 
 export interface UploadState {
@@ -13,11 +17,18 @@ export function useKnowledgeBase() {
     error: null,
   });
   const [stats, setStats] = useState<KBStats | null>(null);
+  const [deletingPaperId, setDeletingPaperId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const resultsRef = useRef<UploadResult[]>([]);
   // Monotonically increasing batch counter; each doUpload call gets a unique
   // batchId so we can locate its pending entries even if another batch starts
   // before the current one finishes.
   const batchCounter = useRef(0);
+
+  const refreshStats = useCallback(async () => {
+    const s = await fetchKBStats();
+    if (s) setStats(s);
+  }, []);
 
   const doUpload = useCallback(async (files: File[]) => {
     if (files.length === 0) return;
@@ -60,17 +71,41 @@ export function useKnowledgeBase() {
       resultsRef.current = updated;
       setUploadState({ results: resultsRef.current, error: message });
     }
-  }, []);
+  }, [refreshStats]);
 
   const clearResults = useCallback(() => {
     resultsRef.current = [];
     setUploadState({ results: [], error: null });
   }, []);
 
-  const refreshStats = useCallback(async () => {
-    const s = await fetchKBStats();
-    if (s) setStats(s);
+  const deletePaperById = useCallback(async (paperId: string) => {
+    setDeletingPaperId(paperId);
+    setDeleteError(null);
+    try {
+      await requestPaperDeletion(paperId);
+      await refreshStats();
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "Unknown delete error";
+      setDeleteError(message);
+      throw error;
+    } finally {
+      setDeletingPaperId(null);
+    }
+  }, [refreshStats]);
+
+  const clearDeleteError = useCallback(() => {
+    setDeleteError(null);
   }, []);
 
-  return { uploadState, stats, doUpload, clearResults, refreshStats } as const;
+  return {
+    uploadState,
+    stats,
+    deletingPaperId,
+    deleteError,
+    doUpload,
+    deletePaperById,
+    clearDeleteError,
+    clearResults,
+    refreshStats,
+  } as const;
 }

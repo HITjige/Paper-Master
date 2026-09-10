@@ -9,6 +9,8 @@ from pathlib import Path
 import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.context_budget import ContextBudgetManager
+from nanobot.config.schema import MemoryConfig
 
 
 class _FakeDatetime(real_datetime):
@@ -146,6 +148,73 @@ def test_partial_dream_processing_shows_only_remainder(tmp_path) -> None:
     assert "old conversation about Rust" not in prompt
     assert "recent question about Docker" in prompt
     assert "recent question about K8s" in prompt
+
+
+def test_session_scoped_memory_does_not_leak_recent_history(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(
+        workspace,
+        memory_config=MemoryConfig(scope_mode="session"),
+    )
+    builder.memory.append_history("Alice private note", session_key="cli:alice")
+    builder.memory.append_history("Bob private note", session_key="cli:bob")
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="continue",
+        channel="cli",
+        chat_id="alice",
+    )
+    prompt = messages[0]["content"]
+    assert "Alice private note" in prompt
+    assert "Bob private note" not in prompt
+
+
+def test_query_retrieves_only_relevant_structured_memory(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(
+        workspace,
+        memory_config=MemoryConfig(scope_mode="session"),
+    )
+    builder.memory.upsert_memory_record(
+        scope="cli:alice",
+        kind="preference",
+        content="Use dark mode in development tools",
+        confidence=0.9,
+    )
+    builder.memory.upsert_memory_record(
+        scope="cli:alice",
+        kind="fact",
+        content="The vacation destination is Lisbon",
+        confidence=0.9,
+    )
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="Which development theme should I use?",
+        channel="cli",
+        chat_id="alice",
+    )
+    prompt = messages[0]["content"]
+    assert "# Relevant Memory" in prompt
+    assert "dark mode" in prompt
+    assert "Lisbon" not in prompt
+
+
+def test_system_prompt_obeys_shared_token_budget(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    (workspace / "AGENTS.md").write_text("critical instruction " * 4000, encoding="utf-8")
+    builder = ContextBuilder(
+        workspace,
+        context_window_tokens=4000,
+        max_completion_tokens=1000,
+        memory_config=MemoryConfig(system_prompt_max_ratio=0.5),
+    )
+
+    prompt = builder.build_system_prompt()
+    cap = int(builder.context_budget.budget.prompt_tokens * 0.5)
+
+    assert ContextBudgetManager.text_tokens(prompt) <= cap
 
 
 def test_execution_rules_in_system_prompt(tmp_path) -> None:

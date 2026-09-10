@@ -131,6 +131,62 @@ def test_onboard_help_shows_workspace_and_config_options():
     assert "--dir" not in stripped_output
 
 
+def test_paper_index_commands_are_exposed():
+    result = runner.invoke(app, ["paper", "--help"])
+
+    assert result.exit_code == 0
+    output = _strip_ansi(result.stdout)
+    assert "index-status" in output
+    assert "reindex" in output
+
+
+def test_paper_index_status_reports_required_migration(monkeypatch):
+    class _FakeKB:
+        async def inspect_vector_index(self, *, probe_embedding: bool):
+            assert probe_embedding is False
+            return {
+                "compatible": False,
+                "reindex_required": True,
+                "reason": "mixed_collection_dimensions",
+            }
+
+    monkeypatch.setattr(
+        "nanobot.cli.commands._load_runtime_config",
+        lambda config=None, workspace=None: object(),
+    )
+    monkeypatch.setattr(
+        "nanobot.cli.commands._paper_kb_from_config",
+        lambda config: _FakeKB(),
+    )
+
+    result = runner.invoke(app, ["paper", "index-status", "--no-probe"])
+
+    assert result.exit_code == 2
+    assert "mixed_collection_dimensions" in result.stdout
+
+
+def test_paper_reindex_runs_without_confirmation_with_yes(monkeypatch):
+    class _FakeKB:
+        async def rebuild_vector_index(self, *, keep_backup: bool):
+            assert keep_backup is True
+            return {"status": "ok", "dimension": 1024}
+
+    monkeypatch.setattr(
+        "nanobot.cli.commands._load_runtime_config",
+        lambda config=None, workspace=None: object(),
+    )
+    monkeypatch.setattr(
+        "nanobot.cli.commands._paper_kb_from_config",
+        lambda config: _FakeKB(),
+    )
+
+    result = runner.invoke(app, ["paper", "reindex", "--yes"])
+
+    assert result.exit_code == 0
+    assert '"dimension": 1024' in result.stdout
+    assert "rebuilt successfully" in _strip_ansi(result.stdout)
+
+
 def test_onboard_interactive_discard_does_not_save_or_create_workspace(mock_paths, monkeypatch):
     config_file, workspace_dir, _ = mock_paths
 
@@ -1385,39 +1441,40 @@ def test_gateway_health_endpoint_binds_and_serves_expected_responses(
     monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
     monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCronService)
     monkeypatch.setattr("nanobot.heartbeat.service.HeartbeatService", _FakeHeartbeatService)
-    monkeypatch.setattr("asyncio.start_server", _fake_start_server)
+    from aiohttp import web as _web
+
+    class _FakeAppRunner:
+        def __init__(self, api_app) -> None:
+            captured["app"] = api_app
+
+        async def setup(self) -> None:
+            return None
+
+        async def cleanup(self) -> None:
+            return None
+
+    class _FakeTCPSite:
+        def __init__(self, _runner, host: str, port: int) -> None:
+            captured["host"] = host
+            captured["port"] = port
+
+        async def start(self) -> None:
+            raise _StopGatewayError("stop after bind")
+
+    monkeypatch.setattr(_web, "AppRunner", _FakeAppRunner)
+    monkeypatch.setattr(_web, "TCPSite", _FakeTCPSite)
 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
     assert result.exit_code == 0
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 18791
-    assert "Health endpoint: http://127.0.0.1:18791/health" in result.stdout
-
-    def _call_handler(path: str) -> tuple[str, _FakeWriter]:
-        request = f"GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode()
-        writer = _FakeWriter()
-        handler = captured["handler"]
-        assert callable(handler)
-        asyncio.run(handler(_FakeReader(request), writer))
-        return writer.output.decode(), writer
-
-    root_response, root_writer = _call_handler("/")
-    assert root_writer.closed is True
-    assert "HTTP/1.0 404 Not Found" in root_response
-    assert root_response.endswith("\r\n\r\nNot Found")
-
-    health_response, health_writer = _call_handler("/health")
-    assert health_writer.closed is True
-    assert "HTTP/1.0 200 OK" in health_response
-    health_body = json.loads(health_response.split("\r\n\r\n", 1)[1])
-    assert health_body == {"status": "ok"}
-
-    missing_response, missing_writer = _call_handler("/missing")
-    assert missing_writer.closed is True
-    assert "HTTP/1.0 404 Not Found" in missing_response
-    assert missing_response.endswith("\r\n\r\nNot Found")
-
+    resources = [resource.canonical for resource in captured["app"].router.resources()]
+    assert "/health" in resources
+    assert "/api/papers/upload" in resources
+    assert "/api/papers/jobs/{job_id}" in resources
+    assert "/api/papers/{paper_id}" in resources
+    assert "/api/kb/stats" in resources
 
 def test_serve_uses_api_config_defaults_and_workspace_override(
     monkeypatch, tmp_path: Path

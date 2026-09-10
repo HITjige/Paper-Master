@@ -42,6 +42,28 @@ TELEGRAM_TOKEN=your-token-here
 IMAP_PASSWORD=your-password-here
 ```
 
+Paper tools use the same environment-variable expansion. For example, MinerU
+can be enabled without storing its token directly in the configuration file:
+
+```json
+{
+  "tools": {
+    "paper": {
+      "enable": true,
+      "mineruApiToken": "${MINERU_API_TOKEN}",
+      "mineruLanguage": "auto",
+      "enablePdfOcr": false,
+      "metadataConcurrency": 4
+    }
+  }
+}
+```
+
+`MINERU_API_TOKEN` must be present in the environment of the process that
+starts nanobot. Restart the gateway after changing either the configuration or
+the environment. Paper option names use camelCase in JSON; snake_case is also
+accepted.
+
 ## Providers
 
 > [!TIP]
@@ -807,3 +829,49 @@ Disabled skills are excluded from the main agent's skill summary, from always-on
 | Option | Default | Description |
 |--------|---------|-------------|
 | `agents.defaults.disabledSkills` | `[]` | List of skill directory names to exclude from loading. Applies to both built-in skills and workspace skills. |
+
+### Skill lifecycle and feedback
+
+The model still selects Skills from their descriptions and loads `SKILL.md` on
+demand. Generated Skills use a separate lifecycle: paper workflows and Dream
+may write validated drafts under `skills/.candidates/`, while only promoted
+Skills appear in the active catalog. Replaced versions are retained under
+`skills/.history/`; activation and turn outcomes are counted in
+`skills/.usage.sqlite3`.
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "skills": {
+        "trackUsage": true,
+        "autoExtractFromPapers": true,
+        "autoPromote": false,
+        "minEvidenceItems": 2,
+        "maxSkillChars": 128000,
+        "maxSkillLines": 500
+      }
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `agents.defaults.skills.trackUsage` | `true` | Count successful model-initiated `SKILL.md` reads and their turn outcomes. |
+| `agents.defaults.skills.autoExtractFromPapers` | `true` | Analyze completed, critic-approved paper workflows in the background. |
+| `agents.defaults.skills.autoPromote` | `false` | Publish validated new-name candidates immediately. Update candidates always require review. |
+| `agents.defaults.skills.minEvidenceItems` | `2` | Minimum distinct papers/citations required for paper-derived proposals. |
+| `agents.defaults.skills.maxSkillChars` | `128000` | Maximum generated `SKILL.md` size. |
+| `agents.defaults.skills.maxSkillLines` | `500` | Maximum generated `SKILL.md` line count. |
+
+Review and publish drafts from the local CLI:
+
+```bash
+nanobot skills candidates --status draft
+nanobot skills show <candidate-id>
+nanobot skills promote <candidate-id>
+# or keep the audit record without publishing it
+nanobot skills reject <candidate-id> --reason "duplicates an existing workflow"
+nanobot skills stats
+```

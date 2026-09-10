@@ -85,14 +85,17 @@ def retrieval_conditional(state: MultiAgentState) -> Literal["synthesis", "resea
     return "research"
 
 
-def research_phase_conditional(state: MultiAgentState) -> Literal["wait_for_selection", "continue_ingest", "skip_to_retrieval"]:
+def research_phase_conditional(state: MultiAgentState) -> Literal[
+    "wait_for_selection", "continue_ingest", "to_retrieval", "to_synthesis"
+]:
     """Route from Research node based on current phase.
     
     Phases:
     - search: Just completed search, need to wait for user selection
     - select: Waiting for external input (user selection) - returns to synthesis with selection prompt
     - ingest: User made selection, continue with ingestion (self-loop in research node)
-    - complete: Ingestion done or skipped, proceed to retrieval
+    - complete: Retrieve only after a successful ingest; otherwise synthesize
+      from external results or report the terminal search outcome.
     
     In resume mode, skip directly to ingest phase if user has already made a selection.
     
@@ -100,7 +103,7 @@ def research_phase_conditional(state: MultiAgentState) -> Literal["wait_for_sele
         state: Current workflow state with research_phase set
         
     Returns:
-        Next action: "wait_for_selection", "continue_ingest", or "skip_to_retrieval"
+        Next action for selection, ingestion, retrieval, or synthesis
     """
     phase = state.get("research_phase", "search")
     search_completed = state.get("search_completed", False)
@@ -118,8 +121,9 @@ def research_phase_conditional(state: MultiAgentState) -> Literal["wait_for_sele
     if resume_mode:
         if phase == "ingest":
             return "continue_ingest"
-        # "search"/"select"/"complete" — ingest already done or irrelevant
-        return "skip_to_retrieval"
+        if state.get("post_research_retrieval"):
+            return "to_retrieval"
+        return "to_synthesis"
     
     # After search phase completes and user hasn't made selection yet, 
     # go to synthesis to show selection prompt (wait_for_selection)
@@ -130,8 +134,9 @@ def research_phase_conditional(state: MultiAgentState) -> Literal["wait_for_sele
     if phase == "ingest" or (user_made_selection and phase != "complete"):
         return "continue_ingest"
     
-    # Complete or search with no results - skip to retrieval
-    return "skip_to_retrieval"
+    if state.get("post_research_retrieval"):
+        return "to_retrieval"
+    return "to_synthesis"
 
 
 def critic_conditional(state: MultiAgentState) -> Literal["complete", "rewrite", "research"]:

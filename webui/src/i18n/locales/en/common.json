@@ -92,6 +92,10 @@
     "recent": "Recent Papers",
     "refresh": "Refresh stats",
     "uploading": "Uploading {fileName}{extra}...",
-    "clearHistory": "Clear history"
+    "clearHistory": "Clear history",
+    "deletePaper": "Delete paper",
+    "deletePaperDescription": "Metadata, chunks, indexes, and managed local files will be removed. This cannot be undone.",
+    "deletingPaper": "Deleting…",
+    "deleteFailed": "Failed to delete paper"
   }
 }

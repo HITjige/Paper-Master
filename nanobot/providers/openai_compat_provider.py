@@ -210,6 +210,38 @@ class OpenAICompatProvider(LLMProvider):
         self._responses_failures: dict[str, int] = {}
         self._responses_tripped_at: dict[str, float] = {}
 
+    def _disable_thinking_request_kwargs(
+        self,
+        model: str | None,
+    ) -> dict[str, Any]:
+        """Return the supported hard switch for Qwen direct-answer calls."""
+        model_name = model or self.default_model
+        if "qwen" not in model_name.lower():
+            return {}
+
+        effective_base = (self._effective_base or "").lower()
+        is_dashscope = (
+            self._spec is not None
+            and self._spec.name == "dashscope"
+            and "dashscope" in effective_base
+        )
+        if is_dashscope:
+            return {"extra_body": {"enable_thinking": False}}
+
+        is_local_qwen = (
+            self._spec is None
+            or self._spec.is_local
+            or self._spec.name == "custom"
+            or any(host in effective_base for host in ("localhost", "127.0.0.1"))
+        )
+        if is_local_qwen:
+            return {
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": False},
+                }
+            }
+        return {}
+
     def _setup_env(self, api_key: str, api_base: str | None) -> None:
         """Set environment variables based on provider spec."""
         spec = self._spec
@@ -352,6 +384,9 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
+        *,
+        extra_body: dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         model_name = model or self.default_model
         spec = self._spec
@@ -420,6 +455,17 @@ class OpenAICompatProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
+
+        if response_format:
+            kwargs["response_format"] = response_format
+        if extra_body:
+            merged_extra = dict(kwargs.get("extra_body") or {})
+            for key, value in extra_body.items():
+                if isinstance(value, dict) and isinstance(merged_extra.get(key), dict):
+                    merged_extra[key] = {**merged_extra[key], **value}
+                else:
+                    merged_extra[key] = value
+            kwargs["extra_body"] = merged_extra
 
         return kwargs
 
@@ -949,6 +995,52 @@ class OpenAICompatProvider(LLMProvider):
     # Public API
     # ------------------------------------------------------------------
 
+    async def chat_structured_with_retry(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        json_schema: dict[str, Any],
+        model: str | None = None,
+        max_tokens: int = 1600,
+        temperature: float = 0.2,
+        disable_thinking: bool = False,
+        retry_mode: str = "standard",
+        on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Use OpenAI/vLLM JSON Schema constrained decoding when available."""
+        extra_body: dict[str, Any] = {}
+        if disable_thinking:
+            extra_body = dict(
+                self._disable_thinking_request_kwargs(model).get("extra_body") or {}
+            )
+
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "structured_response",
+                "strict": True,
+                "schema": json_schema,
+            },
+        }
+        kw: dict[str, Any] = {
+            "messages": messages,
+            "tools": None,
+            "model": model,
+            "max_tokens": max(1, max_tokens),
+            "temperature": temperature,
+            "reasoning_effort": None,
+            "tool_choice": None,
+            "extra_body": extra_body or None,
+            "response_format": response_format,
+        }
+        return await self._run_with_retry(
+            self._safe_chat,
+            kw,
+            messages,
+            retry_mode=retry_mode,
+            on_retry_wait=on_retry_wait,
+        )
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -958,9 +1050,15 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
         try:
-            if self._should_use_responses_api(model, reasoning_effort):
+            if (
+                not extra_body
+                and not response_format
+                and self._should_use_responses_api(model, reasoning_effort)
+            ):
                 try:
                     body = self._build_responses_body(
                         messages, tools, model, max_tokens, temperature,
@@ -977,6 +1075,8 @@ class OpenAICompatProvider(LLMProvider):
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature,
                 reasoning_effort, tool_choice,
+                extra_body=extra_body,
+                response_format=response_format,
             )
             return self._parse(await self._client.chat.completions.create(**kwargs))
         except Exception as e:

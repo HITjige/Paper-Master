@@ -740,6 +740,98 @@ def test_dashscope_no_extra_body_when_reasoning_effort_none() -> None:
     assert "extra_body" not in kw
 
 
+def test_vllm_structured_call_disables_qwen_thinking_and_applies_schema() -> None:
+    spec = find_by_name("vllm")
+    schema = {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+    }
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="k",
+            api_base="http://127.0.0.1:8010/v1",
+            default_model="Qwen3.5-9B",
+            spec=spec,
+        )
+    provider._client.chat.completions.create = AsyncMock(
+        return_value=_fake_chat_response('{"summary":"ok"}')
+    )
+
+    result = asyncio.run(provider.chat_structured_with_retry(
+        messages=[{"role": "user", "content": "extract"}],
+        json_schema=schema,
+        model="Qwen3.5-9B",
+        max_tokens=1600,
+        disable_thinking=True,
+    ))
+
+    assert result.content == '{"summary":"ok"}'
+    kwargs = provider._client.chat.completions.create.await_args.kwargs
+    assert kwargs["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    assert kwargs["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "structured_response",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+    assert kwargs["max_tokens"] == 1600
+    assert "reasoning_effort" not in kwargs
+
+
+def test_vllm_regular_retry_can_disable_qwen_thinking() -> None:
+    spec = find_by_name("vllm")
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="k",
+            api_base="http://127.0.0.1:8010/v1",
+            default_model="Qwen3.5-9B",
+            spec=spec,
+        )
+    provider._client.chat.completions.create = AsyncMock(
+        return_value=_fake_chat_response("final answer")
+    )
+
+    result = asyncio.run(provider.chat_with_retry(
+        messages=[{"role": "user", "content": "answer directly"}],
+        model="Qwen3.5-9B",
+        disable_thinking=True,
+    ))
+
+    assert result.content == "final answer"
+    kwargs = provider._client.chat.completions.create.await_args.kwargs
+    assert kwargs["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    assert "reasoning_effort" not in kwargs
+
+
+def test_dashscope_structured_call_uses_dashscope_thinking_switch() -> None:
+    spec = find_by_name("dashscope")
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="k",
+            default_model="qwen3.5-plus",
+            spec=spec,
+        )
+    provider._client.chat.completions.create = AsyncMock(
+        return_value=_fake_chat_response('{"summary":"ok"}')
+    )
+
+    asyncio.run(provider.chat_structured_with_retry(
+        messages=[{"role": "user", "content": "extract"}],
+        json_schema={"type": "object"},
+        disable_thinking=True,
+    ))
+
+    kwargs = provider._client.chat.completions.create.await_args.kwargs
+    assert kwargs["extra_body"] == {"enable_thinking": False}
+
+
 def test_volcengine_thinking_enabled() -> None:
     kw = _build_kwargs_for("volcengine", "doubao-seed-2-0-pro", reasoning_effort="high")
     assert kw["extra_body"] == {"thinking": {"type": "enabled"}}

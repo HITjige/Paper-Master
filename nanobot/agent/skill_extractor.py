@@ -1,12 +1,8 @@
-"""Skill Extractor — background agent that distills paper discussions into reusable skills.
-
-Runs asynchronously after multi-agent workflows, following the same pattern as Dream:
-Phase 1: Analyze conversation + paper content → determine if skill-worthy
-Phase 2: Delegate to AgentRunner to create/edit SKILL.md files
-"""
+"""Distil successful paper workflows into validated Skill candidates."""
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -14,9 +10,8 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
-from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
-from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.skill_lifecycle import SkillCandidateManager
+from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.prompt_templates import render_template
 
 if TYPE_CHECKING:
@@ -25,15 +20,12 @@ if TYPE_CHECKING:
 
 
 class SkillExtractor:
-    """Background agent that creates/updates skills from paper-driven discussions.
+    """Create reviewable Skill proposals from a completed paper-agent trace.
 
-    Reuses the same two-phase pattern as Dream:
-    1. Plain LLM call analyzes the conversation for reusable insights
-    2. AgentRunner with file tools creates or edits SKILL.md files
-
-    Usage:
-        extractor = SkillExtractor(store, provider, model, workspace)
-        await extractor.extract(multi_agent_result)
+    The extractor deliberately has no filesystem tools. The model produces a
+    structured proposal; deterministic code renders, validates and stages it.
+    This prevents an extraction prompt from editing arbitrary workspace files
+    or immediately changing the active Skill catalog.
     """
 
     def __init__(
@@ -43,208 +35,224 @@ class SkillExtractor:
         model: str,
         workspace: Path,
         *,
+        candidate_manager: SkillCandidateManager | None = None,
+        min_evidence_items: int = 2,
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
     ):
+        # Kept for compatibility with older callers. Extraction is now one
+        # structured LLM call without filesystem tools.
+        del max_iterations, max_tool_result_chars
         self.store = store
         self.provider = provider
         self.model = model
-        self.workspace = workspace
-        self.max_iterations = max_iterations
-        self.max_tool_result_chars = max_tool_result_chars
-        self._runner = AgentRunner(provider)
-        self._tools = self._build_tools()
+        self.workspace = workspace.resolve()
+        self.candidate_manager = candidate_manager or SkillCandidateManager(self.workspace)
+        self.min_evidence_items = max(1, min_evidence_items)
+        self.last_candidate: dict[str, Any] | None = None
 
-    # -- tool registry -------------------------------------------------------
-
-    def _build_tools(self) -> ToolRegistry:
-        """Build a minimal tool registry for the Skill Extractor agent.
-
-        Same tool set as Dream: read_file for reference, edit_file for
-        updating existing skills, write_file (restricted to skills/) for
-        creating new ones.
-        """
-        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
-
-        tools = ToolRegistry()
-        extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
-        tools.register(
-            ReadFileTool(
-                workspace=self.workspace,
-                allowed_dir=self.workspace,
-                extra_allowed_dirs=extra_read,
-            )
-        )
-        tools.register(EditFileTool(workspace=self.workspace, allowed_dir=self.workspace))
-        skills_dir = self.workspace / "skills"
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=skills_dir))
-        return tools
-
-    # -- skill listing --------------------------------------------------------
+    @staticmethod
+    def _parse_json_object(content: str) -> dict[str, Any] | None:
+        raw = content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def _list_existing_skills(self) -> list[str]:
-        """List existing skills as 'name — description' for dedup context."""
-        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+        loader = SkillsLoader(self.workspace)
+        entries: list[str] = []
+        for skill in loader.list_skills(filter_unavailable=False):
+            name = skill["name"]
+            metadata = loader.get_skill_metadata(name) or {}
+            description = str(metadata.get("description") or name).strip()
+            entries.append(f"{name} — {description}")
+        for candidate in self.candidate_manager.list_candidates(status="draft"):
+            entries.append(
+                f"{candidate.get('name', '')} [draft] — "
+                f"{candidate.get('description', '')}"
+            )
+        return sorted(entries)
 
-        _DESC_RE = re.compile(r"^description:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
-        entries: dict[str, str] = {}
-        for base in (self.workspace / "skills", BUILTIN_SKILLS_DIR):
-            if not base.exists():
+    @staticmethod
+    def _evidence(result: dict[str, Any]) -> list[dict[str, Any]]:
+        evidence: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(kind: str, identifier: Any, title: Any = "") -> None:
+            value = str(identifier or "").strip()
+            key = value.casefold()
+            if not value or key in seen:
+                return
+            seen.add(key)
+            item = {"kind": kind, "id": value}
+            if str(title or "").strip():
+                item["title"] = str(title).strip()[:300]
+            evidence.append(item)
+
+        for chunk in result.get("retrieval_results", []) or []:
+            if not isinstance(chunk, dict):
                 continue
-            for d in base.iterdir():
-                if not d.is_dir():
-                    continue
-                skill_md = d / "SKILL.md"
-                if not skill_md.exists():
-                    continue
-                if d.name in entries and base == BUILTIN_SKILLS_DIR:
-                    continue
-                content = skill_md.read_text(encoding="utf-8")[:500]
-                m = _DESC_RE.search(content)
-                desc = m.group(1).strip() if m else "(no description)"
-                entries[d.name] = desc
-        return [f"{name} — {desc}" for name, desc in sorted(entries.items())]
+            add(
+                "paper",
+                chunk.get("paper_id") or chunk.get("chunk_id"),
+                chunk.get("paper_title") or chunk.get("title"),
+            )
+        for paper in result.get("external_papers", []) or []:
+            if not isinstance(paper, dict):
+                continue
+            add("paper", paper.get("paper_id") or paper.get("id"), paper.get("title"))
+        for citation in result.get("citations", []) or []:
+            citation_text = str(citation or "").strip()
+            match = re.match(r"^\[([^\]]+)\]", citation_text)
+            add("paper" if match else "citation", match.group(1) if match else citation_text)
+        return evidence[:40]
 
-    # -- main entry ----------------------------------------------------------
+    @staticmethod
+    def _format_trace(result: dict[str, Any]) -> str:
+        """Format state transitions, outcomes and bounded evidence for analysis."""
+        trace = {
+            "routing": {
+                "decision": result.get("routing_decision"),
+                "reasoning": result.get("routing_reasoning"),
+            },
+            "query_processing": {
+                "rewritten_queries": result.get("rewritten_queries", []),
+                "sub_queries": result.get("sub_queries_detail", []),
+                "entities": result.get("extracted_entities", []),
+                "fallback_used": result.get("rewrite_fallback_used", False),
+            },
+            "retrieval": {
+                "quality": result.get("retrieval_quality"),
+                "internal_result_count": len(result.get("retrieval_results", []) or []),
+                "external_paper_count": len(result.get("external_papers", []) or []),
+                "ingested_papers": result.get("ingested_papers", []),
+            },
+            "critic": {
+                "verdict": result.get("critic_verdict"),
+                "issues": result.get("critic_issues", []),
+                "suggestion": result.get("critic_suggestion", ""),
+                "feedback": result.get("critic_feedback", ""),
+            },
+            "outcome": {
+                "complete": result.get("is_complete"),
+                "iterations": result.get("iteration_count", 0),
+                "invalid_citations": result.get("invalid_citations", []),
+                "citations": result.get("citations", []),
+            },
+        }
+        return json.dumps(trace, ensure_ascii=False, indent=2, default=str)[:16_000]
+
+    @staticmethod
+    def _format_paper_context(result: dict[str, Any]) -> str:
+        parts: list[str] = []
+        seen: set[str] = set()
+        for chunk in result.get("retrieval_results", []) or []:
+            if not isinstance(chunk, dict):
+                continue
+            if len(parts) >= 8:
+                break
+            paper_id = chunk.get("paper_id") or chunk.get("chunk_id", "")
+            title = chunk.get("paper_title") or chunk.get("title", "unknown")
+            text = str(chunk.get("text", ""))[:600]
+            parts.append(f"{len(parts) + 1}. [{paper_id}] {title}\n{text}")
+            if paper_id:
+                seen.add(str(paper_id).casefold())
+        for paper in result.get("external_papers", []) or []:
+            if not isinstance(paper, dict) or len(parts) >= 8:
+                continue
+            paper_id = paper.get("paper_id") or paper.get("id", "")
+            if paper_id and str(paper_id).casefold() in seen:
+                continue
+            title = paper.get("title", "unknown")
+            abstract = str(paper.get("abstract", ""))[:600]
+            parts.append(f"{len(parts) + 1}. [{paper_id}] {title}\n{abstract}")
+            if paper_id:
+                seen.add(str(paper_id).casefold())
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _successful_trace(result: dict[str, Any]) -> bool:
+        if result.get("is_complete") is not True:
+            return False
+        verdict = str(result.get("critic_verdict", "")).strip().lower()
+        if verdict != "passed":
+            return False
+        if result.get("invalid_citations"):
+            return False
+        return bool(str(result.get("final_answer", "")).strip())
 
     async def extract(self, multi_agent_result: dict[str, Any]) -> bool:
-        """Analyze a multi-agent conversation and create/update skills if warranted.
-
-        Args:
-            multi_agent_result: Dict from MultiAgentGraph.run() containing at least:
-                - user_query: original user question
-                - final_answer: synthesized response
-                - retrieval_results: KB chunks (optional)
-                - external_papers: external paper metadata (optional)
-
-        Returns:
-            True if a skill was created/updated, False otherwise.
-        """
-        user_query = str(multi_agent_result.get("user_query", ""))
-        final_answer = str(multi_agent_result.get("final_answer", ""))
-        if not user_query or not final_answer:
+        """Stage a candidate when a successful trace contains reusable procedure."""
+        user_query = str(multi_agent_result.get("user_query", "")).strip()
+        final_answer = str(multi_agent_result.get("final_answer", "")).strip()
+        if not user_query or not final_answer or not self._successful_trace(multi_agent_result):
             return False
 
-        current_memory = self.store.read_memory() or "(empty)"
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        paper_context = self._format_paper_context(multi_agent_result)
+        evidence = self._evidence(multi_agent_result)
+        if len(evidence) < self.min_evidence_items:
+            logger.info(
+                "SkillExtractor: only {} evidence item(s), need {}; skipping",
+                len(evidence),
+                self.min_evidence_items,
+            )
+            return False
 
-        # ---- Phase 1: Analyze -----------------------------------------------
-        phase1_prompt = (
-            f"## Current Date\n{current_date}\n\n"
-            f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory[:8000]}\n\n"
-            f"## User Query\n{user_query}\n\n"
+        existing = self._list_existing_skills()
+        prompt = (
+            f"## Current Date\n{datetime.now().strftime('%Y-%m-%d')}\n\n"
+            f"## Existing Skill Catalog\n"
+            + ("\n".join(f"- {item}" for item in existing) or "(empty)")
+            + f"\n\n## User Query\n{user_query[:4000]}\n\n"
+            f"## Successful Workflow Trace\n{self._format_trace(multi_agent_result)}\n\n"
+            f"## Grounded Paper Excerpts\n{self._format_paper_context(multi_agent_result)}\n\n"
+            f"## Final Answer Excerpt\n{final_answer[:5000]}"
         )
-        if paper_context:
-            phase1_prompt += f"## Retrieved Paper Context\n{paper_context}\n\n"
-        phase1_prompt += f"## Synthesized Answer\n{final_answer[:4000]}"
-
         try:
-            phase1_response = await self.provider.chat_with_retry(
+            response = await self.provider.chat_with_retry(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
-                        "content": render_template(
-                            "agent/skill_extract_phase1.md",
-                            strip=True,
-                        ),
+                        "content": render_template("agent/skill_extract_phase1.md", strip=True),
                     },
-                    {"role": "user", "content": phase1_prompt},
+                    {"role": "user", "content": prompt},
                 ],
                 tools=None,
                 tool_choice=None,
             )
-            analysis = phase1_response.content or ""
-            logger.debug(
-                "SkillExtractor Phase 1 ({} chars): {}",
-                len(analysis),
-                analysis[:500],
-            )
+            if response.finish_reason == "error":
+                raise RuntimeError(f"Skill extraction returned an error: {response.content}")
+            payload = self._parse_json_object(response.content or "")
         except Exception:
-            logger.exception("SkillExtractor Phase 1 failed")
+            logger.exception("SkillExtractor analysis failed")
             return False
 
-        if "[SKIP]" in analysis[:500] and "[SKILL]" not in analysis[:500]:
-            logger.info("SkillExtractor: nothing skill-worthy, skipping")
+        if not payload or str(payload.get("decision", "")).lower() != "candidate":
+            logger.info("SkillExtractor: trace did not justify a reusable Skill")
             return False
-
-        # ---- Phase 2: Delegate to AgentRunner -------------------------------
-        existing_skills = self._list_existing_skills()
-        skills_section = (
-            "\n".join(f"- {s}" for s in existing_skills)
-            if existing_skills
-            else "(no existing skills)"
-        )
-
-        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
-
-        skill_creator_path = str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md")
-        memory_preview = current_memory[:4000]
-
-        phase2_prompt = (
-            f"## Analysis\n{analysis}\n\n"
-            f"## Existing Skills\n{skills_section}\n\n"
-            f"## Current MEMORY.md\n{memory_preview}"
-        )
+        proposal = payload.get("proposal")
+        if not isinstance(proposal, dict):
+            logger.warning("SkillExtractor returned candidate without a proposal")
+            return False
 
         try:
-            result = await self._runner.run(
-                AgentRunSpec(
-                    initial_messages=[
-                        {
-                            "role": "system",
-                            "content": render_template(
-                                "agent/skill_extract_phase2.md",
-                                strip=True,
-                                skill_creator_path=skill_creator_path,
-                            ),
-                        },
-                        {"role": "user", "content": phase2_prompt},
-                    ],
-                    tools=self._tools,
-                    model=self.model,
-                    max_iterations=self.max_iterations,
-                    max_tool_result_chars=self.max_tool_result_chars,
-                    error_message="Skill extraction encountered an error.",
-                    workspace=self.workspace,
-                )
+            self.last_candidate = self.candidate_manager.stage(
+                proposal,
+                source="paper_multi_agent",
+                evidence=evidence,
             )
-            tools_used = result.tools_used or []
-            logger.info(
-                "SkillExtractor Phase 2 complete: {} tools called ({})",
-                len(tools_used),
-                ", ".join(tools_used[:10]),
-            )
-            return len(tools_used) > 0
-        except Exception:
-            logger.exception("SkillExtractor Phase 2 failed")
+        except (OSError, ValueError):
+            logger.exception("SkillExtractor candidate validation/staging failed")
             return False
-
-    # -- helpers -------------------------------------------------------------
-
-    @staticmethod
-    def _format_paper_context(result: dict[str, Any]) -> str:
-        """Format retrieved paper chunks and external papers for the prompt."""
-        parts: list[str] = []
-
-        retrieval_results = result.get("retrieval_results", []) or []
-        if retrieval_results:
-            parts.append("### Internal KB Chunks")
-            for i, r in enumerate(retrieval_results[:8], 1):
-                title = r.get("paper_title") or r.get("title", "unknown")
-                pid = r.get("paper_id", "")
-                text = str(r.get("text", ""))[:600]
-                parts.append(f"{i}. [{pid}] {title}\n   {text}")
-
-        external_papers = result.get("external_papers", []) or []
-        if external_papers:
-            parts.append("### External Papers (from arXiv)")
-            for i, p in enumerate(external_papers[:8], 1):
-                title = p.get("title", "unknown")
-                pid = p.get("paper_id", "")
-                abstract = str(p.get("abstract", ""))[:400]
-                parts.append(f"{i}. [{pid}] {title}\n   {abstract}")
-
-        return "\n\n".join(parts) if parts else ""
+        logger.info(
+            "SkillExtractor staged {} candidate {} ({})",
+            self.last_candidate["status"],
+            self.last_candidate["candidate_id"],
+            self.last_candidate["name"],
+        )
+        return True

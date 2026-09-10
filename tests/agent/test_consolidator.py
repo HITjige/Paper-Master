@@ -55,10 +55,13 @@ class TestConsolidatorSummarize:
         mock_provider.chat_with_retry.side_effect = Exception("API error")
         messages = [{"role": "user", "content": "hello"}]
         result = await consolidator.archive(messages)
-        assert result is None  # no summary on raw dump fallback
+        assert result is not None
+        assert "DEGRADED CHECKPOINT" in result
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
-        assert "[RAW]" in entries[0]["content"]
+        assert entries[0]["kind"] == "degraded_checkpoint"
+        artifact = entries[0]["evidence"]["artifact"]
+        assert (store.workspace / artifact).exists()
 
     async def test_summarize_skips_empty_messages(self, consolidator):
         result = await consolidator.archive([])
@@ -82,10 +85,11 @@ class TestConsolidatorArchiveErrorHandling:
             {"role": "assistant", "content": "Done, fixed the race condition."},
         ]
         result = await consolidator.archive(messages)
-        assert result is None
+        assert result is not None
+        assert "DEGRADED CHECKPOINT" in result
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
-        assert "[RAW]" in entries[0]["content"]
+        assert entries[0]["kind"] == "degraded_checkpoint"
         assert "Error:" not in entries[0]["content"]
 
     async def test_archive_preserves_summary_on_success(self, consolidator, mock_provider, store):

@@ -39,6 +39,9 @@ Use this skill when the user asks for:
 5. Retrieve from KB and answer with evidence:
 - **ALWAYS call `kb_retrieve` after `paper_ingest` to get grounded evidence.**
 - Call `kb_retrieve` when answering domain questions that need citations.
+- Use `retrieval_mode="hybrid"` for detailed explanations, performance metrics,
+  experiments, ablations, or comparisons; reserve `hypothetical` for broad
+  natural-language discovery questions.
 - Every key claim should include citations (paper_id + title + url or chunk_id).
 - If both KB and web results exist, prioritize KB-grounded evidence.
 

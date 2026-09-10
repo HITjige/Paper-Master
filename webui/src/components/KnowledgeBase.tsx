@@ -10,9 +10,10 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { DeleteConfirm } from "@/components/DeleteConfirm";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { KBStats, UploadResult } from "@/lib/types";
+import type { KBPaper, KBStats, UploadResult } from "@/lib/types";
 
 interface KnowledgeBaseProps {
   onUpload: (files: File[]) => void;
@@ -21,6 +22,10 @@ interface KnowledgeBaseProps {
     error: string | null;
   };
   stats: KBStats | null;
+  deletingPaperId: string | null;
+  deleteError: string | null;
+  onDelete: (paperId: string) => Promise<void>;
+  onClearDeleteError: () => void;
   onRefresh: () => void;
   onClearResults: () => void;
 }
@@ -29,12 +34,27 @@ export function KnowledgeBase({
   onUpload,
   uploadState,
   stats,
+  deletingPaperId,
+  deleteError,
+  onDelete,
+  onClearDeleteError,
   onRefresh,
   onClearResults,
 }: KnowledgeBaseProps) {
   const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<KBPaper | null>(null);
+
+  const confirmPaperDeletion = useCallback(async () => {
+    if (!pendingDelete) return;
+    try {
+      await onDelete(pendingDelete.paper_id);
+      setPendingDelete(null);
+    } catch {
+      // Keep the confirmation open so the API error remains visible.
+    }
+  }, [onDelete, pendingDelete]);
 
   const handleFiles = useCallback(
     (files: FileList | File[]) => {
@@ -188,19 +208,64 @@ export function KnowledgeBase({
               <p className="text-[11px] font-medium text-muted-foreground">
                 {t("kb.recent", "Recent Papers")}
               </p>
-              {stats.recent_papers.slice(0, 5).map((p) => (
+              {stats.recent_papers.map((p) => (
                 <div
                   key={p.paper_id}
-                  className="flex items-center gap-1.5 truncate text-xs"
+                  className="group flex items-center gap-1.5 text-xs"
                 >
                   <FileText className="h-3 w-3 shrink-0 text-muted-foreground/60" />
-                  <span className="truncate">{p.title || p.paper_id}</span>
+                  <span className="min-w-0 flex-1 truncate" title={p.title || p.paper_id}>
+                    {p.title || p.paper_id}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 shrink-0 text-muted-foreground opacity-70 hover:text-destructive sm:opacity-0 sm:group-hover:opacity-100"
+                    onClick={() => {
+                      onClearDeleteError();
+                      setPendingDelete(p);
+                    }}
+                    disabled={deletingPaperId !== null}
+                    aria-label={t("kb.deletePaper", "Delete paper")}
+                    title={t("kb.deletePaper", "Delete paper")}
+                  >
+                    {deletingPaperId === p.paper_id ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
                 </div>
               ))}
+              {deleteError && (
+                <p className="pt-1 text-xs text-destructive" role="alert">
+                  {t("kb.deleteFailed", "Failed to delete paper")}: {deleteError}
+                </p>
+              )}
             </div>
           )}
         </div>
       )}
+
+      <DeleteConfirm
+        open={pendingDelete !== null}
+        title={pendingDelete?.title || pendingDelete?.paper_id || ""}
+        description={t(
+          "kb.deletePaperDescription",
+          "Metadata, chunks, indexes, and managed local files will be removed. This cannot be undone.",
+        )}
+        confirmLabel={
+          deletingPaperId
+            ? t("kb.deletingPaper", "Deleting…")
+            : t("deleteConfirm.confirm", "Delete")
+        }
+        busy={deletingPaperId !== null}
+        onCancel={() => {
+          onClearDeleteError();
+          setPendingDelete(null);
+        }}
+        onConfirm={confirmPaperDeletion}
+      />
     </div>
   );
 }

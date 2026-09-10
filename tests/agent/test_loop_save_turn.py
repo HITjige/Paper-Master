@@ -8,6 +8,7 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.providers.base import LLMResponse
 from nanobot.session.manager import Session
 
 
@@ -576,6 +577,266 @@ def test_subagent_followup_skips_empty_content() -> None:
 
     assert loop._persist_subagent_followup(session, msg) is False
     assert session.messages == []
+
+
+def test_recent_paper_session_routes_referential_performance_followup(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop._multi_agent_graph = MagicMock()
+    session = Session(key="websocket:paper-followup")
+    session.add_message("user", "详细解读第一篇论文")
+    session.add_message("assistant", "ATM 是该论文使用的 EEG 编码模型。")
+    session.metadata[AgentLoop._MULTI_AGENT_LAST_ROUTING_KEY] = "internal"
+    session.metadata[AgentLoop._MULTI_AGENT_CONTEXT_MESSAGE_COUNT_KEY] = len(session.messages)
+    session.metadata[AgentLoop._MULTI_AGENT_ACTIVE_PAPERS_KEY] = [
+        {"paper_id": "atm-paper", "title": "ATM"}
+    ]
+
+    use_multi, context = asyncio.run(
+        loop._decide_multi_agent_with_orchestrator("详细讲一下该模型的性能", session)
+    )
+
+    assert use_multi is True
+    assert context["orchestrator_decision"] == "multi_agent"
+    assert "follow-up" in context["orchestrator_reasoning"]
+
+    use_multi, context = asyncio.run(
+        loop._decide_multi_agent_with_orchestrator("具体的优化算法是怎么设计的", session)
+    )
+    assert use_multi is True
+    assert context["orchestrator_decision"] == "multi_agent"
+
+    use_multi, context = asyncio.run(
+        loop._decide_multi_agent_with_orchestrator("谢谢", session)
+    )
+    assert use_multi is False
+    assert context["orchestrator_reasoning"] == "simple acknowledgement"
+
+
+def test_recent_paper_route_fails_open_when_structured_classifier_is_empty(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop._multi_agent_graph = MagicMock()
+    loop.provider.chat_structured_with_retry = AsyncMock(return_value=LLMResponse(
+        content=None,
+        reasoning_content="unfinished classifier reasoning",
+    ))
+    session = Session(key="websocket:paper-route-empty")
+    session.add_message("user", "解读 ATM 论文")
+    session.add_message("assistant", "ATM 方法概览。")
+    session.metadata[AgentLoop._MULTI_AGENT_CONTEXT_MESSAGE_COUNT_KEY] = len(
+        session.messages
+    )
+
+    use_multi, context = asyncio.run(
+        loop._decide_multi_agent_with_orchestrator("为什么会这样", session)
+    )
+
+    assert use_multi is True
+    assert context["orchestrator_decision"] == "multi_agent"
+    assert "preserve recent paper context" in context["orchestrator_reasoning"]
+    kwargs = loop.provider.chat_structured_with_retry.await_args.kwargs
+    assert kwargs["disable_thinking"] is True
+    assert kwargs["json_schema"]["properties"]["decision"]["enum"] == [
+        "multi_agent",
+        "single_agent",
+    ]
+
+
+def test_recent_paper_route_allows_high_confidence_topic_change(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop._multi_agent_graph = MagicMock()
+    loop.provider.chat_structured_with_retry = AsyncMock(return_value=LLMResponse(
+        content=(
+            '{"decision":"single_agent","confidence":0.95,'
+            '"reasoning":"clear topic change"}'
+        ),
+    ))
+    session = Session(key="websocket:paper-route-topic-change")
+    session.add_message("user", "解读 ATM 论文")
+    session.add_message("assistant", "ATM 方法概览。")
+    session.metadata[AgentLoop._MULTI_AGENT_CONTEXT_MESSAGE_COUNT_KEY] = len(
+        session.messages
+    )
+
+    use_multi, context = asyncio.run(
+        loop._decide_multi_agent_with_orchestrator("帮我写一个请假邮件", session)
+    )
+
+    assert use_multi is False
+    assert context["orchestrator_decision"] == "single_agent"
+
+
+def test_single_agent_paper_tool_refreshes_multi_agent_context(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        loop = _make_full_loop(tmp_path)
+        loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        loop.tools_config.paper.multi_agent_orchestrator_enabled = False
+        loop._run_agent_loop = AsyncMock(return_value=(
+            "论文已经入库。",
+            ["paper_ingest"],
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "请处理这个文件"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "ingest-1",
+                        "type": "function",
+                        "function": {
+                            "name": "paper_ingest",
+                            "arguments": "{}",
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "ingest-1",
+                    "name": "paper_ingest",
+                    "content": (
+                        '{"status":"ok","paper_id":"atm-1",'
+                        '"title":"ATM: EEG-to-image"}'
+                    ),
+                },
+                {"role": "assistant", "content": "论文已经入库。"},
+            ],
+            "completed",
+            False,
+        ))  # type: ignore[method-assign]
+
+        result = await loop._process_message(InboundMessage(
+            channel="websocket",
+            sender_id="u1",
+            chat_id="single-paper-tool",
+            content="请处理这个文件",
+        ))
+
+        assert result is not None
+        session = loop.sessions.get_or_create("websocket:single-paper-tool")
+        assert session.metadata[AgentLoop._MULTI_AGENT_LAST_ROUTING_KEY] == (
+            "single_agent_paper_tools"
+        )
+        assert session.metadata[AgentLoop._MULTI_AGENT_ACTIVE_PAPERS_KEY] == [
+            {"paper_id": "atm-1", "title": "ATM: EEG-to-image"}
+        ]
+
+        loop.tools_config.paper.multi_agent_orchestrator_enabled = True
+        loop._multi_agent_graph = MagicMock()
+        use_multi, _context = await loop._decide_multi_agent_with_orchestrator(
+            "具体的优化算法是怎么设计的",
+            session,
+        )
+        assert use_multi is True
+
+    asyncio.run(scenario())
+
+
+def test_three_turn_paper_followup_stays_on_multi_agent_path(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        loop = _make_full_loop(tmp_path)
+        loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        graph = MagicMock()
+        graph.run = AsyncMock(side_effect=[
+            {
+                "final_answer": "找到 ATM 论文。",
+                "routing_decision": "external",
+                "iteration_count": 1,
+                "external_papers": [{"paper_id": "atm-1", "title": "ATM"}],
+                "retrieval_results": [],
+                "citations": ["[atm-1] ATM"],
+                "discovery_request": True,
+                "resolved_topic": "EEG-to-image",
+            },
+            {
+                "final_answer": "ATM 方法解读。",
+                "routing_decision": "internal",
+                "iteration_count": 1,
+                "external_papers": [],
+                "retrieval_results": [{
+                    "paper_id": "atm-1",
+                    "paper_title": "ATM",
+                    "text": "method",
+                }],
+                "citations": ["atm-1"],
+            },
+            {
+                "final_answer": "ATM 性能解读。",
+                "routing_decision": "internal",
+                "iteration_count": 1,
+                "external_papers": [],
+                "retrieval_results": [{
+                    "paper_id": "atm-1",
+                    "paper_title": "ATM",
+                    "text": "performance",
+                }],
+                "citations": ["atm-1"],
+            },
+        ])
+        loop._multi_agent_graph = graph
+
+        for content in (
+            "EEG-to-image有什么论文",
+            "详细解读第一篇论文",
+            "详细讲一下该模型的性能",
+        ):
+            await loop._process_message(InboundMessage(
+                channel="websocket",
+                sender_id="u1",
+                chat_id="paper-three-turns",
+                content=content,
+            ))
+
+        assert graph.run.await_count == 3
+        third_call = graph.run.call_args_list[2].kwargs
+        assert third_call["last_routing_decision"] == "internal"
+        assert third_call["referenced_papers"][0]["paper_id"] == "atm-1"
+        assert third_call["presented_paper_ids"] == ["atm-1"]
+        assert third_call["last_search_topic"] == "EEG-to-image"
+
+    asyncio.run(scenario())
+
+
+def test_novelty_query_abandons_paused_selection_and_starts_fresh(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        loop = _make_full_loop(tmp_path)
+        loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        graph = MagicMock()
+        graph.run = AsyncMock(return_value={
+            "final_answer": "没有发现新的论文。",
+            "routing_decision": "internal",
+            "iteration_count": 0,
+            "external_papers": [],
+            "retrieval_results": [],
+            "citations": [],
+            "novelty_required": True,
+        })
+        graph.resume = AsyncMock(return_value={"final_answer": "should not resume"})
+        loop._multi_agent_graph = graph
+
+        session = loop.sessions.get_or_create("websocket:novelty-after-selection")
+        session.metadata["multi_agent_paused_state"] = {
+            "user_query": "强化学习论文",
+            "research_phase": "select",
+            "papers_for_selection": [{"paper_id": "old-1", "title": "Old"}],
+        }
+        loop.sessions.save(session)
+
+        result = await loop.process_with_multi_agent(
+            "还有没有其他相关论文？",
+            session_key="websocket:novelty-after-selection",
+            channel="websocket",
+            chat_id="novelty-after-selection",
+        )
+
+        assert result is not None
+        graph.resume.assert_not_awaited()
+        graph.run.assert_awaited_once()
+        assert "multi_agent_paused_state" not in session.metadata
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.asyncio

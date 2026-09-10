@@ -229,7 +229,8 @@ Find and ingest up to {ingest_limit} most relevant papers.
 
 # Synthesis Agent Prompt
 SYNTHESIS_SYSTEM_PROMPT = """<role>
-You are an academic writing expert responsible for synthesizing comprehensive answers.
+You are a rigorous scientific literature and paper knowledge Q&A expert responsible for synthesizing comprehensive answers.
+Your primary responsibility is to answer from retrieved paper evidence rather than unsupported model memory.
 </role>
 
 <objective>
@@ -251,6 +252,15 @@ Write high-quality, evidence-based answers using retrieved information.
   <source>Both internal and external sources in hybrid mode.</source>
   <source>No sources in direct mode; use general knowledge only then.</source>
 </input_sources>
+
+<evidence_discipline>
+  <rule>For every paper-specific claim, use the supplied sources and cite the supporting paper.</rule>
+  <rule>Distinguish full-text evidence from abstract-only evidence and do not imply that an abstract-only source supports details it does not contain.</rule>
+  <rule>Never invent paper titles, authors, methods, datasets, experimental settings, metrics, ablations, or conclusions.</rule>
+  <rule>Clearly distinguish what a paper states, what its experiments demonstrate, and what you infer from the evidence.</rule>
+  <rule>If evidence is missing, conflicting, or insufficient, state the limitation explicitly instead of filling the gap from assumption.</rule>
+  <rule>When comparing papers, align tasks, datasets, metrics, baselines, compute settings, and evidence levels before drawing conclusions.</rule>
+</evidence_discipline>
 
 <writing_guidelines>
   <guideline id="language_match">Detect the user's language from the query and answer in that language.</guideline>
@@ -705,6 +715,7 @@ You are an expert academic search query optimizer. Your task is to analyze the u
 <rule id="target-paper">
 - ONLY output `target_paper` when the user **explicitly** references a specific paper (by arXiv ID, title, or resolved ordinal reference like "第一篇论文").
 - If the user's query is a general topic search with no specific paper reference, set `target_paper` to an empty dict `{{}}` or omit it entirely.
+- Requests for "其他/更多/还有" papers refer to the previous search topic, not to the previously shown paper itself. Resolve the topic from context but keep `target_paper` empty so the old paper does not become a hard retrieval filter.
 - `target_paper` format: `{{"paper_id": "arXiv ID or other identifier (e.g., a1836846a2a6)", "title": "full paper title"}}`. Either field may be empty string if only one is known.
 - When the user compares multiple papers, each paper gets its own sub-query with its own `target_paper`.
 </rule>
@@ -891,6 +902,22 @@ def format_sources_section(
     def _esc(text: str) -> str:
         return saxutils.escape(str(text))
 
+    def _as_int(value: Any) -> int | None:
+        try:
+            return int(value) if value not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    def _chunk_source_order(chunk: dict[str, Any]) -> tuple[int, int, int, str]:
+        chunk_id = str(chunk.get("chunk_id", ""))
+        chunk_index = _as_int(chunk.get("chunk_index"))
+        if chunk_index is None:
+            chunk_index = _as_int(chunk_id.rsplit(":", 1)[-1])
+        page_start = _as_int(chunk.get("page_start"))
+        if chunk_index is not None:
+            return (0, chunk_index, page_start if page_start is not None else 10**9, chunk_id)
+        return (1, page_start if page_start is not None else 10**9, 10**9, chunk_id)
+
     parts: list[str] = []
     full_text_ids: set[str] = set()
 
@@ -920,7 +947,11 @@ def format_sources_section(
             year = meta.get("year") or group["chunks"][0].get("paper_year", "")
             abstract = meta.get("abstract", "")
 
-            chunks = sorted(group["chunks"], key=lambda c: c.get("score", 0), reverse=True)
+            # Retrieval relevance decides which chunks enter the context. Once
+            # selected, chunks from the same paper follow source order so the
+            # model sees the paper's argument rather than a relevance-shuffled
+            # sequence.
+            chunks = sorted(group["chunks"], key=_chunk_source_order)
 
             parts.append(f'  <paper id="{_esc(pid)}" evidence_level="full_text">')
             parts.append('    <metadata>')
@@ -940,8 +971,20 @@ def format_sources_section(
             for chunk in chunks:
                 section = chunk.get("heading_path", chunk.get("section", ""))
                 text = str(chunk.get("text", ""))
-                score = chunk.get("score", 0)
-                parts.append(f'      <chunk section="{_esc(section)}" score="{score:.3f}">')
+                score = float(chunk.get("score", 0) or 0)
+                chunk_index = _as_int(chunk.get("chunk_index"))
+                if chunk_index is None:
+                    chunk_index = _as_int(str(chunk.get("chunk_id", "")).rsplit(":", 1)[-1])
+                page_start = _as_int(chunk.get("page_start"))
+                order_attributes = ""
+                if chunk_index is not None:
+                    order_attributes += f' chunk_index="{chunk_index}"'
+                if page_start is not None:
+                    order_attributes += f' page_start="{page_start}"'
+                parts.append(
+                    f'      <chunk section="{_esc(section)}" score="{score:.3f}"'
+                    f'{order_attributes}>'
+                )
                 parts.append(f'        {_esc(text)}')
                 parts.append('      </chunk>')
             parts.append('    </retrieved_chunks>')

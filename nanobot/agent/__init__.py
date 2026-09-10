@@ -5,6 +5,7 @@ from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.memory import Dream, MemoryStore
 from nanobot.agent.skill_extractor import SkillExtractor
+from nanobot.agent.skill_lifecycle import SkillCandidateManager, SkillUsageStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.subagent import SubagentManager
 
@@ -17,6 +18,8 @@ __all__ = [
     "Dream",
     "MemoryStore",
     "SkillExtractor",
+    "SkillCandidateManager",
+    "SkillUsageStore",
     "SkillsLoader",
     "SubagentManager",
 ]

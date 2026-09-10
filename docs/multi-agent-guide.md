@@ -155,7 +155,10 @@ Add to `~/.nanobot/config.json` (the MinerU token is optional):
 
 If MinerU is not used, omit `mineruApiToken`. If it is used, export
 `MINERU_API_TOKEN` before starting nanobot; unresolved `${...}` variables are
-treated as configuration errors.
+treated as configuration errors. The Paper configuration accepts camelCase
+(recommended), snake_case, and `MINERU_API_TOKEN` as a compatibility alias for
+the token key. In all cases, prefer keeping the secret in the environment and
+using `"mineruApiToken": "${MINERU_API_TOKEN}"` in the JSON file.
 
 For production retrieval, configure either an embedding API key or a local
 SentenceTransformer directory. `embeddingFallback: "error"` prevents startup

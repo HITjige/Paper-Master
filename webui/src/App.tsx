@@ -52,10 +52,11 @@ export default function App() {
         const boot = await fetchBootstrap();
         if (cancelled) return;
 
-        // Expose API server URL for KB upload endpoints (production mode).
+        // Expose the authenticated KB endpoint discovered during bootstrap.
         if (boot.api_url) {
           (window as unknown as Record<string, unknown>).__NANOBOT_API_URL__ = boot.api_url;
         }
+        (window as unknown as Record<string, unknown>).__NANOBOT_API_TOKEN__ = boot.token;
 
         const url = deriveWsUrl(boot.ws_path, boot.token);
         const client = new NanobotClient({
@@ -63,6 +64,10 @@ export default function App() {
           onReauth: async () => {
             try {
               const refreshed = await fetchBootstrap();
+              if (refreshed.api_url) {
+                (window as unknown as Record<string, unknown>).__NANOBOT_API_URL__ = refreshed.api_url;
+              }
+              (window as unknown as Record<string, unknown>).__NANOBOT_API_TOKEN__ = refreshed.token;
               return deriveWsUrl(refreshed.ws_path, refreshed.token);
             } catch {
               return null;
@@ -161,7 +166,17 @@ function Shell() {
   const { t, i18n } = useTranslation();
   const { theme, toggle } = useTheme();
   const { sessions, loading, refresh, createChat, deleteChat } = useSessions();
-  const { uploadState, stats, doUpload, clearResults, refreshStats } = useKnowledgeBase();
+  const {
+    uploadState,
+    stats,
+    deletingPaperId,
+    deleteError,
+    doUpload,
+    deletePaperById,
+    clearDeleteError,
+    clearResults,
+    refreshStats,
+  } = useKnowledgeBase();
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [showKB, setShowKB] = useState(false);
   const [desktopSidebarOpen, setDesktopSidebarOpen] =
@@ -345,6 +360,10 @@ function Shell() {
             onUpload={doUpload}
             uploadState={uploadState}
             stats={stats}
+            deletingPaperId={deletingPaperId}
+            deleteError={deleteError}
+            onDelete={deletePaperById}
+            onClearDeleteError={clearDeleteError}
             onRefresh={refreshStats}
             onClearResults={clearResults}
           />

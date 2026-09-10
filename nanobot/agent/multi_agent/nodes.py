@@ -87,10 +87,15 @@ class AgentNodes:
             score_type = str(item.get("score_type", "unknown"))
             dense_score = item.get("dense_score")
             bm25_score = item.get("bm25_score")
+            evidence = re.sub(
+                r"\s+",
+                " ",
+                str(item.get("matched_text") or item.get("text") or ""),
+            ).strip()[:500]
             lines.append(
                 f"{idx}. score={score:.3f} ({score_type}); "
                 f"dense={dense_score}; bm25={bm25_score}; "
-                f"section={section}; title={title[:120]}"
+                f"section={section}; title={title[:120]}; evidence={evidence}"
             )
         return "\n".join(lines)
 
@@ -305,6 +310,138 @@ class AgentNodes:
             if not re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", query)
         ]
         return non_cjk_queries or queries
+
+    @staticmethod
+    def _canonical_paper_identity(value: Any) -> str:
+        """Normalize arXiv versions for cross-turn identity comparisons."""
+        paper_id = re.sub(
+            r"^arxiv:\s*", "", str(value or "").strip(), flags=re.IGNORECASE
+        )
+        versioned = re.fullmatch(
+            r"(?P<base>(?:\d{4}\.\d{4,5}|[a-z.-]+/\d{7}))v\d+",
+            paper_id,
+            flags=re.IGNORECASE,
+        )
+        return (versioned.group("base") if versioned else paper_id).casefold()
+
+    @staticmethod
+    def _extract_explicit_arxiv_ids(value: Any) -> list[str]:
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9])"
+            r"(?:arxiv:\s*)?"
+            r"((?:\d{4}\.\d{4,5}|[a-z.-]+/\d{7})(?:v\d+)?)"
+            r"(?![A-Za-z0-9])",
+            re.IGNORECASE,
+        )
+        return list(dict.fromkeys(
+            match.group(1).rstrip(".,;:!?)]}，。；：！？）】")
+            for match in pattern.finditer(str(value or ""))
+        ))
+
+    def _ensure_query_intent(self, state: MultiAgentState) -> None:
+        """Populate deterministic routing/retrieval controls from the raw query."""
+        query = str(state.get("user_query", "") or "").strip()
+        lowered = query.casefold()
+        explicit_ids = self._extract_explicit_arxiv_ids(query)
+        novelty_required = bool(re.search(
+            r"(?:还有|其他|其它|更多|另外|再(?:找|来|推荐))"
+            r"|\b(?:other|another|more|additional|else)\b",
+            lowered,
+            re.IGNORECASE,
+        ))
+        external_requested = bool(re.search(
+            r"(?:外部|联网|网上|网络搜索|arxiv)"
+            r"|\b(?:external|online search|search online)\b",
+            lowered,
+            re.IGNORECASE,
+        ))
+        discovery_request = bool(re.search(
+            r"(?:论文|文献|文章|papers?|literature|articles?)",
+            lowered,
+            re.IGNORECASE,
+        )) and bool(re.search(
+            r"(?:有没有|有哪些|找|搜索|检索|推荐|列出|其他|更多|还有)"
+            r"|\b(?:find|search|recommend|list|other|more)\b",
+            lowered,
+            re.IGNORECASE,
+        ))
+
+        state["explicit_paper_ids"] = explicit_ids
+        state["external_search_requested"] = external_requested
+        state["novelty_required"] = novelty_required
+        state["discovery_request"] = discovery_request
+
+        if novelty_required and state.get("last_search_topic"):
+            state["resolved_topic"] = str(state["last_search_topic"]).strip()
+        elif discovery_request:
+            cleaned = self._rule_based_rewrite(query)
+            cleaned = re.sub(
+                r"^(?:还有没有|还有|其他|其它|更多|另外|再(?:找|来|推荐))\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            ).strip()
+            state["resolved_topic"] = cleaned
+
+    def _finalize_prepared_queries(
+        self,
+        user_query: str,
+        state: MultiAgentState,
+        queries: list[Any],
+    ) -> list[str]:
+        """Apply deterministic IDs, topic carry-over and novelty semantics."""
+        prepared = self._merge_query_variants(user_query, queries)
+        explicit_ids = list(state.get("explicit_paper_ids", []) or [])
+
+        if state.get("novelty_required"):
+            topic = str(
+                state.get("last_search_topic")
+                or state.get("resolved_topic")
+                or ""
+            ).strip()
+            if topic:
+                prepared = self._merge_query_variants(user_query, [topic, *prepared])
+
+            # "Other papers" refers to the previous topic, not to the previous
+            # paper as a hard entity filter. Explicit IDs remain authoritative.
+            explicit_keys = {
+                self._canonical_paper_identity(paper_id) for paper_id in explicit_ids
+            }
+            state["extracted_entities"] = [
+                entity for entity in state.get("extracted_entities", [])
+                if self._canonical_paper_identity(entity.get("paper_id"))
+                in explicit_keys
+            ]
+
+        existing_entities = list(state.get("extracted_entities", []) or [])
+        existing_keys = {
+            self._canonical_paper_identity(entity.get("paper_id"))
+            for entity in existing_entities
+            if entity.get("paper_id")
+        }
+        for paper_id in explicit_ids:
+            key = self._canonical_paper_identity(paper_id)
+            if key and key not in existing_keys:
+                existing_entities.append({
+                    "paper_id": paper_id,
+                    "title": "",
+                    "queries": [paper_id],
+                })
+                existing_keys.add(key)
+        state["extracted_entities"] = existing_entities
+
+        if state.get("discovery_request") and not state.get("novelty_required"):
+            translated = next((
+                query for query in prepared
+                if not re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", query)
+                and not self._extract_explicit_arxiv_ids(query)
+            ), "")
+            state["resolved_topic"] = (
+                translated or str(state.get("resolved_topic", "")).strip()
+            )
+
+        state["rewritten_queries"] = prepared
+        return prepared
 
     @staticmethod
     def _resolve_external_time_range(
@@ -1080,29 +1217,48 @@ class AgentNodes:
         # Return cached queries if already prepared
         cached = state.get("rewritten_queries")
         if cached and isinstance(cached, list) and len(cached) > 0:
-            cached = self._merge_query_variants(user_query, cached)
-            state["rewritten_queries"] = cached
+            cached = self._finalize_prepared_queries(user_query, state, cached)
             logger.info(
                 "_prepare_queries: reusing cached {} queries",
                 len(cached),
             )
             return cached
+
+        if (
+            state.get("explicit_paper_ids")
+            and state.get("external_search_requested")
+        ):
+            paper_ids = list(state.get("explicit_paper_ids", []))
+            prepared = self._finalize_prepared_queries(
+                user_query,
+                state,
+                paper_ids,
+            )
+            state["sub_queries_detail"] = [{
+                "rewritten_queries": paper_ids,
+                "target_paper": {"paper_id": paper_id, "title": ""},
+                "keywords": [],
+                "time_filter": None,
+            } for paper_id in paper_ids]
+            state["rewrite_reasoning"] = "deterministic exact arXiv ID lookup"
+            state["rewrite_confidence"] = 1.0
+            state["rewrite_fallback_used"] = False
+            return prepared
         
         query_rewrite_enabled = state.get("query_rewrite_enabled", True)
         if not query_rewrite_enabled:
-            prepared = self._merge_query_variants(user_query)
-            state["rewritten_queries"] = prepared
+            prepared = self._finalize_prepared_queries(user_query, state, [])
             return prepared
         
         query_rewrite_use_llm = state.get("query_rewrite_use_llm", True)
         if query_rewrite_use_llm:
             # Unified single LLM call: rewrite + decompose + entity extract
             result = await self._unified_query_rewrite(user_query, state)
-            all_queries = self._merge_query_variants(
+            all_queries = self._finalize_prepared_queries(
                 user_query,
+                state,
                 result.get("rewritten_queries", []),
             )
-            state["rewritten_queries"] = all_queries
             logger.info(
                 "_prepare_queries: unified rewrite produced {} queries, confidence={:.2f}",
                 len(all_queries),
@@ -1111,8 +1267,7 @@ class AgentNodes:
             return all_queries
         else:
             # LLM disabled — only rule-based cleaning
-            prepared = self._merge_query_variants(user_query)
-            state["rewritten_queries"] = prepared
+            prepared = self._finalize_prepared_queries(user_query, state, [])
             state["sub_queries_detail"] = [{
                 "rewritten_queries": prepared,
                 "target_paper": {},
@@ -1206,6 +1361,25 @@ class AgentNodes:
         await self._emit_progress("🧭 分析用户意图，判断执行路径...")
         
         user_query = state.get("user_query", "")
+        self._ensure_query_intent(state)
+
+        # Source scope and cross-turn novelty are deterministic control
+        # semantics. Do not ask the route LLM to rediscover or override them.
+        if state.get("external_search_requested"):
+            state["routing_decision"] = "external"
+            state["routing_reasoning"] = (
+                "User explicitly requested external/arXiv search"
+            )
+            await self._emit_progress("📋 路由决策: external — 用户明确要求外部检索")
+            return state
+        if state.get("novelty_required"):
+            state["routing_decision"] = "internal"
+            state["routing_reasoning"] = (
+                "Search unseen local papers first, then fall back to arXiv if needed"
+            )
+            await self._emit_progress("📋 路由决策: internal — 优先检索未展示论文，必要时转外部")
+            return state
+
         session_memory_short = state.get("router_memory_short", "") or "(empty)"
         session_memory_long = state.get("router_memory_long", "") or "(empty)"
         recent_dialog = state.get("recent_dialog_context", "") or "(empty)"
@@ -1255,7 +1429,7 @@ class AgentNodes:
             )
             
             await self._emit_progress(
-                f"📋 路由决策: {state['routing_decision']} — {state.get('routing_reasoning', '')[:100]}"
+                f"📋 路由决策: {state['routing_decision']} — {state.get('routing_reasoning', '')}"
             )
             
         except Exception as e:
@@ -1286,6 +1460,7 @@ class AgentNodes:
         logger.info("Retrieval Agent: Querying knowledge base")
         
         user_query = state.get("user_query", "")
+        self._ensure_query_intent(state)
         retrieval_history_context = state.get("retrieval_history_context", "") or "(empty)"
         recent_dialog = state.get("recent_dialog_context", "") or "(empty)"
         long_term_memory = state.get("long_term_memory_context", "") or "(empty)"
@@ -1305,10 +1480,9 @@ class AgentNodes:
             # Prepare queries (shared rewrite + decomposition, cached on first call)
             if not state.get("rewritten_queries", ""):
                 await self._emit_progress("✏️ 优化查询关键词...")
-                all_queries = await self._prepare_queries(user_query, state)
-            else:
-                # Post-research: reuse cached queries without re-invoking LLM
-                all_queries = state.get("rewritten_queries", [user_query])
+            # Cached variants are finalized again without an LLM call so
+            # deterministic novelty/entity rules also apply on resumed flows.
+            all_queries = await self._prepare_queries(user_query, state)
 
             logger.info("Retrieval Agent: all queries = {}", all_queries)
             
@@ -1334,6 +1508,9 @@ class AgentNodes:
             # Retrieve: entity-aware if specific papers targeted, else multi-query
             logger.info("Retrieval Agent: entities {}", state.get("extracted_entities", []))
             entities = state.get("extracted_entities", [])
+            novelty_required = bool(state.get("novelty_required"))
+            retrieval_top_k = max(self.top_k * 4, 20) if novelty_required else self.top_k
+            retrieval_per_paper_limit = 4 if entities else 3
             if entities:
                 logger.info(
                     "Retrieval Agent: entity-aware retrieval for {} entities",
@@ -1345,18 +1522,42 @@ class AgentNodes:
                 results = await self.kb.retrieve_by_hypothetical_questions(
                     entities=entities,
                     queries=all_queries,
-                    top_k=self.top_k,
-                    per_paper_limit=4,  # More per-paper for targeted retrieval
+                    top_k=retrieval_top_k,
+                    per_paper_limit=max(4, retrieval_per_paper_limit),
                     search_mode="hybrid",
                     use_hybrid=self.kb.config.use_hybrid_retrieval,
                 )
             else:
                 results = await self.kb.retrieve_by_hypothetical_questions(
                     queries=all_queries,
-                    top_k=self.top_k,
-                    per_paper_limit=3,
+                    top_k=retrieval_top_k,
+                    per_paper_limit=retrieval_per_paper_limit,
                     search_mode="hybrid",
                     use_hybrid=self.kb.config.use_hybrid_retrieval,
+                )
+
+            if novelty_required:
+                explicit_keys = {
+                    self._canonical_paper_identity(paper_id)
+                    for paper_id in state.get("explicit_paper_ids", [])
+                }
+                excluded_keys = {
+                    self._canonical_paper_identity(paper_id)
+                    for paper_id in state.get("presented_paper_ids", [])
+                    if self._canonical_paper_identity(paper_id)
+                } - explicit_keys
+                before_filter = len(results)
+                results = [
+                    result for result in results
+                    if self._canonical_paper_identity(result.get("paper_id"))
+                    not in excluded_keys
+                ][: self.top_k]
+                excluded_count = before_filter - len(results)
+                state["novelty_excluded_count"] = excluded_count
+                logger.info(
+                    "Retrieval Agent: novelty filter excluded {} chunks from {} presented papers",
+                    excluded_count,
+                    len(excluded_keys),
                 )
             
             state["retrieval_results"] = results
@@ -1370,25 +1571,7 @@ class AgentNodes:
                 state["retrieval_results"] = []
                 logger.warning("Retrieval Agent: No results found")
             else:
-                # ---- Relevance filter: drop chunks below 30% of best score ----
                 best_score = max(r.get("score", 0) for r in results)
-                min_score = best_score * 0.3
-                filtered = [r for r in results if r.get("score", 0) >= min_score]
-                if len(filtered) < len(results):
-                    logger.info(
-                        "Retrieval Agent: Filtered {} low-relevance chunks (best={:.3f}, cutoff={:.3f})",
-                        len(results) - len(filtered), best_score, min_score,
-                    )
-                results = filtered
-                state["retrieval_results"] = results
-                
-                if not results:
-                    state["retrieval_quality"] = "insufficient"
-                    logger.warning("Retrieval Agent: All results filtered out (below relevance threshold)")
-                    return state
-                
-                best_score = max(r.get("score", 0) for r in results)
-                # ---- End relevance filter ----
                 try:
                     margin = float(state.get("retrieval_judge_margin", 0.02) or 0.02)
                 except (TypeError, ValueError):
@@ -1401,7 +1584,14 @@ class AgentNodes:
                     result.get("score_type") == "weighted_rrf"
                     for result in results
                 )
-                thresholds_unavailable = embedding_degraded or score_is_rank_based
+                score_is_cross_encoder = all(
+                    result.get("score_type") == "cross_encoder_relevance"
+                    for result in results
+                )
+                thresholds_unavailable = (
+                    score_is_rank_based
+                    or (embedding_degraded and not score_is_cross_encoder)
+                )
                 if thresholds_unavailable:
                     logger.warning(
                         "Retrieval Agent: Semantic score thresholds unavailable "
@@ -1491,6 +1681,18 @@ class AgentNodes:
                             await self._emit_progress(
                                 f"📚 知识库检索完成: {len(results)} 条结果 (best={best_score:.3f})"
                             )
+
+            # A set-level quality rejection is an evidence boundary, not just
+            # a routing hint. Do not let rejected local chunks leak into a
+            # later external-search or Synthesis context.
+            if state.get("retrieval_quality") != "sufficient":
+                rejected_count = len(state.get("retrieval_results", []))
+                state["retrieval_results"] = []
+                if rejected_count:
+                    logger.info(
+                        "Retrieval Agent: Suppressed {} chunks after insufficient quality verdict",
+                        rejected_count,
+                    )
             
         except Exception as e:
             logger.error("Retrieval Agent failed: {}", e)
@@ -1530,11 +1732,32 @@ class AgentNodes:
         await self._emit_progress("🔍 正在搜索 arXiv 外部论文...")
         
         user_query = state.get("user_query", "")
-        already_ingested = set(state.get("ingested_papers", []))
+        self._ensure_query_intent(state)
+        known_kb_ids = set(state.get("ingested_papers", []))
         try:
-            already_ingested.update(self.kb.load_docs_meta().keys())
+            docs_meta = self.kb.load_docs_meta()
+            known_kb_ids.update(docs_meta.keys())
+            known_kb_ids.update(
+                str(meta.get("arxiv_id") or "")
+                for meta in docs_meta.values()
+                if isinstance(meta, dict) and meta.get("arxiv_id")
+            )
         except Exception as exc:
-            logger.debug("Research Agent: failed to load persistent KB IDs for exclusion: {}", exc)
+            logger.debug("Research Agent: failed to load persistent KB IDs: {}", exc)
+
+        explicit_keys = {
+            self._canonical_paper_identity(paper_id)
+            for paper_id in state.get("explicit_paper_ids", [])
+        }
+        novelty_exclusions = (
+            list(state.get("presented_paper_ids", []))
+            if state.get("novelty_required")
+            else []
+        )
+        novelty_exclusions = [
+            paper_id for paper_id in novelty_exclusions
+            if self._canonical_paper_identity(paper_id) not in explicit_keys
+        ]
         
         try:
             search_tool = self.tools.get("paper_search")
@@ -1543,14 +1766,20 @@ class AgentNodes:
                 state["error_message"] = "Paper search tool not available"
                 state["external_search_completed"] = True
                 state["research_phase"] = "complete"
+                state["research_outcome"] = "provider_error"
+                state["post_research_retrieval"] = False
                 return state
             
             # Prepare queries (shared rewrite + decomposition, cached on first call)
             await self._emit_progress("✏️ 优化搜索关键词...")
-            if not state.get("rewritten_queries"):
-                all_queries = await self._prepare_queries(user_query, state)
-            else:
-                all_queries = state.get("rewritten_queries", [user_query])
+            all_queries = await self._prepare_queries(user_query, state)
+            exact_lookup_ids = list(state.get("explicit_paper_ids", []) or [])
+            if not state.get("novelty_required"):
+                for entity in state.get("extracted_entities", []):
+                    exact_lookup_ids.extend(
+                        self._extract_explicit_arxiv_ids(entity.get("paper_id"))
+                    )
+            exact_lookup_ids = list(dict.fromkeys(exact_lookup_ids))
             
             # ---- Extract keywords and time_filter from sub_queries_detail ----
             sub_queries_detail = state.get("sub_queries_detail", [])
@@ -1623,8 +1852,9 @@ class AgentNodes:
             sr = await search_tool.execute(
                 query=user_query,
                 candidate_queries=search_queries,
+                explicit_paper_ids=exact_lookup_ids,
                 keywords=aligned_keywords if any(aligned_keywords) else None,
-                exclude_paper_ids=sorted(already_ingested),
+                exclude_paper_ids=novelty_exclusions,
                 from_year=from_year,
                 to_year=to_year,
                 sort_mode="auto",
@@ -1641,13 +1871,15 @@ class AgentNodes:
                 not all_papers
                 and len(search_queries) > 1
                 and search_data.get("search_status") == "ok"
+                and not exact_lookup_ids
             ):
                 logger.warning("Research Agent: Multi-query search returned 0 results, falling back")
                 fallback_query = min(search_queries, key=len)
                 fallback_sr = await search_tool.execute(
                     query=user_query,
                     candidate_queries=[fallback_query],
-                    exclude_paper_ids=sorted(already_ingested),
+                    explicit_paper_ids=exact_lookup_ids,
+                    exclude_paper_ids=novelty_exclusions,
                     from_year=from_year,
                     to_year=to_year,
                     sort_mode="auto",
@@ -1675,10 +1907,14 @@ class AgentNodes:
                         "arXiv search was unavailable or only partially completed; "
                         "an empty result is not evidence that no relevant papers exist."
                     )
+                    state["research_outcome"] = "provider_error"
+                else:
+                    state["research_outcome"] = "no_new_results"
                 state["papers_for_selection"] = []
                 state["external_papers"] = []
                 state["search_completed"] = True
                 state["external_search_completed"] = True
+                state["post_research_retrieval"] = False
                 state["research_phase"] = "complete"
                 await self._emit_progress(
                     "⚠️ arXiv 检索未完整完成，请稍后重试"
@@ -1686,12 +1922,23 @@ class AgentNodes:
                     else "❌ 未找到相关论文"
                 )
                 return state
+
+            known_kb_keys = {
+                self._canonical_paper_identity(paper_id)
+                for paper_id in known_kb_ids
+            }
+            for paper in all_papers:
+                paper["in_kb"] = (
+                    self._canonical_paper_identity(paper.get("paper_id"))
+                    in known_kb_keys
+                )
             
             # Store results and wait for user selection
             state["papers_for_selection"] = all_papers[:20]  # Limit to 20 for selection
             state["external_papers"] = all_papers  # Keep full list for compatibility
             state["search_completed"] = True
             state["external_search_completed"] = True
+            state["research_outcome"] = "found"
 
             # A Critic-triggered supplementary search is fully automatic: its
             # abstracts are already usable as explicitly labelled evidence, so
@@ -1721,6 +1968,8 @@ class AgentNodes:
             state["error_message"] = str(e)
             state["external_search_completed"] = True
             state["research_phase"] = "complete"
+            state["research_outcome"] = "provider_error"
+            state["post_research_retrieval"] = False
         
         return state
 
@@ -1736,6 +1985,7 @@ class AgentNodes:
             logger.info("Research Agent: User skipped ingest or no papers selected")
             await self._emit_progress("⏭️ 用户跳过论文摄取")
             state["research_phase"] = "complete"
+            state["research_outcome"] = "skipped"
             return await self._research_complete_phase(state)
         
         # Filter selected papers
@@ -1747,16 +1997,26 @@ class AgentNodes:
         if not papers_to_ingest:
             logger.warning("Research Agent: No matching papers found for selected IDs")
             state["research_phase"] = "complete"
+            state["research_outcome"] = "skipped"
             return await self._research_complete_phase(state)
         
         # Deduplicate against KB
         orig_count = len(papers_to_ingest)
         try:
             existing_docs = self.kb._read_jsonl(self.kb.docs_file)
-            existing_pids = {d.get("paper_id", "") for d in existing_docs}
+            existing_pids = {
+                self._canonical_paper_identity(identifier)
+                for document in existing_docs
+                for identifier in (
+                    document.get("paper_id", ""),
+                    document.get("arxiv_id", ""),
+                )
+                if self._canonical_paper_identity(identifier)
+            }
             papers_to_ingest = [
                 p for p in papers_to_ingest
-                if str(p.get("paper_id", "")) not in existing_pids
+                if self._canonical_paper_identity(p.get("paper_id"))
+                not in existing_pids
             ]
             if len(papers_to_ingest) < orig_count:
                 logger.info(
@@ -1769,6 +2029,8 @@ class AgentNodes:
         if not papers_to_ingest:
             logger.info("Research Agent: All selected papers already in KB")
             await self._emit_progress("✓ 所选论文已在知识库中")
+            state["ingested_papers"] = list(selected_ids)
+            state["research_outcome"] = "ingested"
             state["research_phase"] = "complete"
             return await self._research_complete_phase(state)
         
@@ -1778,6 +2040,7 @@ class AgentNodes:
             if not ingest_tool:
                 logger.error("Research Agent: Ingest tool not available")
                 state["error_message"] = "Paper ingest tool not available"
+                state["research_outcome"] = "ingest_error"
                 state["research_phase"] = "complete"
                 return await self._research_complete_phase(state)
             
@@ -1801,7 +2064,7 @@ class AgentNodes:
             ]
             
             state["ingested_papers"] = ingested
-            state["post_research_retrieval"] = True
+            state["research_outcome"] = "ingested" if ingested else "ingest_error"
             
             await self._emit_progress(f"✅ 成功入库 {len(ingested)} 篇论文")
             
@@ -1813,6 +2076,7 @@ class AgentNodes:
         except Exception as e:
             logger.error("Research ingest phase failed: {}", e)
             state["error_message"] = str(e)
+            state["research_outcome"] = "ingest_error"
         
         state["research_phase"] = "complete"
         return await self._research_complete_phase(state)
@@ -1821,7 +2085,10 @@ class AgentNodes:
         """Phase 3: Finalize research and set loop guard."""
         state["research_phase"] = "complete"
         state["external_search_completed"] = True
-        state["post_research_retrieval"] = True
+        state["post_research_retrieval"] = bool(
+            state.get("research_outcome") == "ingested"
+            and state.get("ingested_papers")
+        )
         current_guard = int(state.get("loop_guard_count", 0) or 0)
         state["loop_guard_count"] = current_guard + 1
         return state
@@ -1859,6 +2126,8 @@ class AgentNodes:
             lines.append(f"- **ID**: `{paper_id}`")
             lines.append(f"- **年份**: {year}")
             lines.append(f"- **作者**: {authors_str}")
+            if p.get("in_kb"):
+                lines.append("- **状态**: 已在知识库中，可直接选择进行全文检索")
             lines.append(f"- **摘要**: {abstract}\n")
         
         lines.extend([
@@ -2039,6 +2308,43 @@ class AgentNodes:
         ):
             logger.info("Synthesis Agent: Using existing draft_answer: {}", state["draft_answer"][:100])
             return state
+
+        research_outcome = state.get("research_outcome", "")
+        if research_outcome in {"no_new_results", "provider_error", "ingest_error"}:
+            explicit_ids = list(state.get("explicit_paper_ids", []) or [])
+            if research_outcome == "provider_error":
+                answer = (
+                    "本次 arXiv 外部检索未能完整完成，因此暂时无法判断是否存在"
+                    "更多相关论文。请稍后重试。"
+                )
+            elif research_outcome == "ingest_error":
+                answer = "论文已经找到，但入库或全文解析失败。请稍后重新选择并尝试入库。"
+            elif explicit_ids:
+                answer = (
+                    "未在 arXiv 中找到指定论文："
+                    + "、".join(f"`{paper_id}`" for paper_id in explicit_ids)
+                    + "。请检查 ID 是否正确，或确认该记录是否已公开。"
+                )
+            elif state.get("novelty_required"):
+                topic = str(
+                    state.get("resolved_topic")
+                    or state.get("last_search_topic")
+                    or "该主题"
+                )
+                answer = (
+                    f"排除本轮对话中已经展示的论文后，知识库和本次 arXiv "
+                    f"检索都没有发现新的“{topic}”相关论文。"
+                )
+            else:
+                answer = "本次 arXiv 检索没有找到符合当前条件的论文。"
+            state["draft_answer"] = answer
+            state["citations"] = []
+            state["invalid_citations"] = []
+            logger.info(
+                "Synthesis Agent: deterministic terminal answer for research_outcome={}",
+                research_outcome,
+            )
+            return state
         
         user_query = state.get("user_query", "")
         retrieval_results = state.get("retrieval_results", [])
@@ -2169,6 +2475,18 @@ class AgentNodes:
             state["final_answer"] = state["draft_answer"]
             state["critic_verdict"] = "passed"
             logger.info("Critic Agent: Skipping review in select phase, using draft_answer as final_answer")
+            return state
+
+        if state.get("research_outcome") in {
+            "no_new_results", "provider_error", "ingest_error"
+        }:
+            state["final_answer"] = state.get("draft_answer", "")
+            state["critic_verdict"] = "passed"
+            state["is_complete"] = True
+            logger.info(
+                "Critic Agent: accepting deterministic terminal research outcome={}",
+                state.get("research_outcome"),
+            )
             return state
         
         await self._emit_progress("✅ 正在审查答案质量...")

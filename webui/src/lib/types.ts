@@ -93,12 +93,31 @@ export interface UploadResult {
   paper_id?: string;
   title?: string;
   status: "ok" | "error" | "pending";
+  stage?: string;
   chunk_count?: number;
+  content_sha256?: string;
+  deduplicated?: boolean;
+  degraded?: boolean;
+  error_code?: string;
   error?: string;
+  retryable?: boolean;
 }
 
 export interface KBStats {
   paper_count: number;
   chunk_count: number;
   recent_papers: KBPaper[];
+}
+
+export interface DeletePaperResult {
+  status: "deleted" | "partial";
+  deleted: true;
+  paper_id: string;
+  deleted_document_count: number;
+  deleted_chunk_count: number;
+  deleted_asset_count: number;
+  deleted_vector_count: number;
+  deleted_vectors: Record<string, number>;
+  deleted_files: string[];
+  artifact_errors: string[];
 }

@@ -1,12 +1,12 @@
 """Tests for the Dream class — two-phase memory consolidation via AgentRunner."""
 
-import pytest
-
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from nanobot.agent.memory import Dream, MemoryStore
 from nanobot.agent.runner import AgentRunResult
-from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+from nanobot.agent.skill_lifecycle import SkillCandidateManager
 from nanobot.utils.gitstore import LineAge
 
 
@@ -33,7 +33,13 @@ def mock_runner():
 
 @pytest.fixture
 def dream(store, mock_provider, mock_runner):
-    d = Dream(store=store, provider=mock_provider, model="test-model", max_batch_size=5)
+    d = Dream(
+        store=store,
+        provider=mock_provider,
+        model="test-model",
+        max_batch_size=5,
+        skill_candidates=SkillCandidateManager(store.workspace),
+    )
     d._runner = mock_runner
     return d
 
@@ -97,32 +103,32 @@ class TestDreamRun:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert all(e["cursor"] > 0 for e in entries)
 
-    async def test_skill_phase_uses_builtin_skill_creator_path(self, dream, mock_provider, mock_runner, store):
-        """Dream should point skill creation guidance at the builtin skill-creator template."""
+    async def test_skill_proposal_is_staged_not_published(self, dream, mock_provider, mock_runner, store):
+        """Dream should stage validated candidates without changing active Skills."""
         store.append_history("Repeated workflow one")
         store.append_history("Repeated workflow two")
-        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKILL] test-skill: test description")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="""{
+          "proposals": [],
+          "skills": [{
+            "action": "create",
+            "name": "test-skill",
+            "description": "Use for a repeated test workflow",
+            "when_to_use": ["The repeated test workflow is requested"],
+            "steps": ["Prepare the test input", "Run the validated test step"],
+            "completion_criteria": ["The test result is verified"]
+          }]
+        }""")
         mock_runner.run = AsyncMock(return_value=_make_run_result())
 
         await dream.run()
 
-        spec = mock_runner.run.call_args[0][0]
-        system_prompt = spec.initial_messages[0]["content"]
-        expected = str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md")
-        assert expected in system_prompt
+        mock_runner.run.assert_not_called()
+        candidates = dream.skill_candidates.list_candidates(status="draft")
+        assert [candidate["name"] for candidate in candidates] == ["test-skill"]
+        assert not (store.workspace / "skills" / "test-skill" / "SKILL.md").exists()
 
-    async def test_skill_write_tool_accepts_workspace_relative_skill_path(self, dream, store):
-        """Dream skill creation should allow skills/<name>/SKILL.md relative to workspace root."""
-        write_tool = dream._tools.get("write_file")
-        assert write_tool is not None
-
-        result = await write_tool.execute(
-            path="skills/test-skill/SKILL.md",
-            content="---\nname: test-skill\ndescription: Test\n---\n",
-        )
-
-        assert "Successfully wrote" in result
-        assert (store.workspace / "skills" / "test-skill" / "SKILL.md").exists()
+    async def test_dream_has_no_skill_write_tool(self, dream):
+        assert dream._tools.get("write_file") is None
 
     async def test_phase1_prompt_includes_line_age_annotations(self, dream, mock_provider, mock_runner, store):
         """Phase 1 prompt should have per-line age suffixes in MEMORY.md when git is available."""
@@ -255,4 +261,3 @@ class TestDreamRun:
         system_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][0]["content"]
         # The template renders with stale_threshold_days=14 → LLM must see "N>14"
         assert "N>14" in system_msg
-

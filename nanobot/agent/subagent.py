@@ -11,8 +11,8 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.skill_lifecycle import SkillUsageStore
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -23,6 +23,7 @@ from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 from nanobot.providers.base import LLMProvider
+from nanobot.utils.prompt_templates import render_template
 
 
 @dataclass(slots=True)
@@ -81,6 +82,7 @@ class SubagentManager:
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         disabled_skills: list[str] | None = None,
+        skill_usage: SkillUsageStore | None = None,
     ):
         self.provider = provider
         self.workspace = workspace
@@ -91,6 +93,7 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
+        self.skill_usage = skill_usage
         self.runner = AgentRunner(provider)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
@@ -118,7 +121,14 @@ class SubagentManager:
         self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, status)
+            self._run_subagent(
+                task_id,
+                task,
+                display_label,
+                origin,
+                status,
+                session_key=session_key,
+            )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -144,9 +154,26 @@ class SubagentManager:
         label: str,
         origin: dict[str, str],
         status: SubagentStatus,
+        session_key: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        activated_skills: set[str] = set()
+        skill_run_id = f"subagent_{task_id}"
+
+        def _record_skill_activation(path: str) -> None:
+            if self.skill_usage is None:
+                return
+            identified = self.skill_usage.identify(path)
+            if identified is None or identified[0] in activated_skills:
+                return
+            name = self.skill_usage.record_activation(
+                path,
+                session_key=session_key,
+                run_id=skill_run_id,
+            )
+            if name:
+                activated_skills.add(name)
 
         async def _on_checkpoint(payload: dict) -> None:
             status.phase = payload.get("phase", status.phase)
@@ -155,9 +182,17 @@ class SubagentManager:
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
-            allowed_dir = self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
+            allowed_dir = (
+                self.workspace
+                if (self.restrict_to_workspace or self.exec_config.sandbox)
+                else None
+            )
             extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-            tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
+            tools.register(ReadFileTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+                extra_allowed_dirs=extra_read,
+            ))
             tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
@@ -192,7 +227,17 @@ class SubagentManager:
                 error_message=None,
                 fail_on_tool_error=True,
                 checkpoint_callback=_on_checkpoint,
+                workspace=self.workspace,
+                session_key=session_key,
+                skill_activation_callback=_record_skill_activation,
             ))
+            if self.skill_usage is not None:
+                self.skill_usage.record_outcome(
+                    activated_skills,
+                    success=(result.stop_reason == "completed"),
+                    session_key=session_key,
+                    run_id=skill_run_id,
+                )
             status.phase = "done"
             status.stop_reason = result.stop_reason
 
@@ -215,6 +260,13 @@ class SubagentManager:
                 await self._announce_result(task_id, label, task, final_result, origin, "ok")
 
         except Exception as e:
+            if self.skill_usage is not None:
+                self.skill_usage.record_outcome(
+                    activated_skills,
+                    success=False,
+                    session_key=session_key,
+                    run_id=skill_run_id,
+                )
             status.phase = "error"
             status.error = str(e)
             logger.error("Subagent [{}] failed: {}", task_id, e)

@@ -67,6 +67,13 @@ class MultiAgentState(TypedDict, total=False):
     extracted_entities: List[Dict[str, str]]  # Entities extracted from the query (for entity-aware retrieval)
     sub_queries_detail: List[Dict[str, Any]]  # Full sub_queries structure from unified rewrite (each has rewritten_queries, target_paper, keywords, time_filter)
     requires_clarification: bool  # True if query references are too ambiguous to resolve
+    explicit_paper_ids: List[str]  # Version-preserving arXiv IDs extracted from the raw query
+    external_search_requested: bool  # Explicit external/arXiv/network-search request
+    novelty_required: bool  # User asks for other/additional papers
+    discovery_request: bool  # Query is asking for a paper list rather than paper details
+    presented_paper_ids: List[str]  # Papers already shown in this session
+    last_search_topic: str  # Previous discovery topic used to resolve "other papers"
+    resolved_topic: str  # Topic anchor for the current discovery request
     post_research_retrieval: bool  # True after research→retrieval loop, prevents infinite cycle
     external_search_completed: bool  # True after at least one external search attempt
     critic_triggered_research: bool  # Supplementary search requested by Critic; do not pause for selection
@@ -89,6 +96,8 @@ class MultiAgentState(TypedDict, total=False):
     # === External Research ===
     external_papers: List[Dict[str, Any]]
     ingested_papers: List[str]     # List of paper_ids successfully ingested
+    research_outcome: str          # found | no_new_results | provider_error | ingest_error | ingested | skipped
+    novelty_excluded_count: int
     external_search_top_k: int
     external_rerank_top_k: int
     
@@ -196,6 +205,13 @@ def create_initial_state(
         "rewrite_context_chars": cfg.rewrite_context_chars,
         "sub_queries_detail": [],
         "requires_clarification": False,
+        "explicit_paper_ids": [],
+        "external_search_requested": False,
+        "novelty_required": False,
+        "discovery_request": False,
+        "presented_paper_ids": kwargs.get("presented_paper_ids", []),
+        "last_search_topic": kwargs.get("last_search_topic", ""),
+        "resolved_topic": "",
         "post_research_retrieval": False,
         "external_search_completed": False,
         "critic_triggered_research": False,
@@ -211,6 +227,8 @@ def create_initial_state(
         "embedding_status": {},
         "external_papers": [],
         "ingested_papers": [],
+        "research_outcome": "",
+        "novelty_excluded_count": 0,
         "external_search_top_k": cfg.external_search_top_k,
         "external_rerank_top_k": cfg.external_rerank_top_k,
         

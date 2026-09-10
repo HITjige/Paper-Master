@@ -64,6 +64,30 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class MemoryConfig(Base):
+    """Context budgets and structured long-term memory behavior."""
+
+    scope_mode: Literal["workspace", "session"] = "workspace"
+    structured_enabled: bool = True
+    structured_top_k: int = Field(default=8, ge=0, le=50)
+    min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    pinned_memory_max_tokens: int = Field(default=4096, ge=0, le=65_536)
+    retrieved_memory_max_tokens: int = Field(default=4096, ge=0, le=65_536)
+    recent_history_max_tokens: int = Field(default=4096, ge=0, le=65_536)
+    system_prompt_max_ratio: float = Field(default=0.35, ge=0.1, le=0.8)
+
+
+class SkillConfig(Base):
+    """Generated-skill lifecycle and activation telemetry."""
+
+    track_usage: bool = True
+    auto_extract_from_papers: bool = True
+    auto_promote: bool = False
+    min_evidence_items: int = Field(default=2, ge=1, le=20)
+    max_skill_chars: int = Field(default=128_000, ge=1_000, le=1_000_000)
+    max_skill_lines: int = Field(default=500, ge=20, le=5_000)
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -89,6 +113,8 @@ class AgentDefaults(Base):
         validation_alias=AliasChoices("idleCompactAfterMinutes", "sessionTtlMinutes"),
         serialization_alias="idleCompactAfterMinutes",
     )  # Auto-compact idle threshold in minutes (0 = disabled)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    skills: SkillConfig = Field(default_factory=SkillConfig)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 
@@ -154,6 +180,8 @@ class ApiConfig(Base):
     host: str = "127.0.0.1"  # Safer default: local-only bind.
     port: int = 8900
     timeout: float = 120.0  # Per-request timeout in seconds.
+    auth_token: str = Field(default="", repr=False)
+    allowed_origins: list[str] = Field(default_factory=list)
 
 
 class GatewayConfig(Base):
@@ -217,7 +245,7 @@ class PaperToolsConfig(Base):
 
     enable: bool = True
     multi_agent_memory_mode: Literal["strict", "strict_with_citations", "debug_trace"] = "strict"
-    multi_agent_orchestrator_enabled: bool = False
+    multi_agent_orchestrator_enabled: bool = True
     multi_agent_orchestrator_confidence_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     multi_agent_retrieval_judge_margin: float = Field(default=0.02, ge=0.0, le=0.3)
     multi_agent_node_history_chars: int = Field(default=60000, ge=256, le=60000)
@@ -227,12 +255,17 @@ class PaperToolsConfig(Base):
     auto_context_retrieve: bool = False  # Auto-inject retrieved papers into runtime context for each user turn
     auto_context_top_k: int = Field(default=5, ge=1, le=10)
     retrieval_top_k: int = Field(default=5, ge=1, le=30)
-    embedding_model: str = "text-embedding-3-small"
+    embedding_model: str = "/data1/project/models/bge-m3/snapshots/model"
     embedding_api_key: str = ""
     embedding_api_base: str = "https://api.openai.com/v1"
     embedding_fallback: Literal["hash", "error"] = "hash"
     embedding_batch_size: int = Field(default=64, ge=1, le=256)
-    rerank_model: str = ""
+    rerank_model: str = "/data1/project/models/Qwen3-Reranker-0.6B"
+    rerank_score_mode: Literal["logit", "probability"] = "logit"
+    retrieval_relevance_filter_enabled: bool = True
+    retrieval_min_relevance_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    retrieval_rerank_candidate_count: int = Field(default=30, ge=1, le=200)
+    retrieval_relevance_fail_closed: bool = True
     rrf_k: int = Field(default=60, ge=1, le=1000)
     dense_rrf_weight: float = Field(default=0.5, ge=0.0, le=1.0)
     sparse_rrf_weight: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -242,6 +275,17 @@ class PaperToolsConfig(Base):
     bm25_questions_weight: float = Field(default=2.0, ge=0.0, le=20.0)
     bm25_body_weight: float = Field(default=1.0, ge=0.0, le=20.0)
     mineru_api_token: str = Field(default="", repr=False)
+    mineru_language: str = "auto"
+    enable_pdf_ocr: bool = False
+    ocr_language: str = "eng+chi_sim"
+    ocr_max_pages: int = Field(default=100, ge=1, le=500)
+    max_pdf_text_chars: int = Field(default=2_000_000, ge=100_000, le=10_000_000)
+    retain_uploaded_pdf: bool = True
+    metadata_concurrency: int = Field(default=4, ge=1, le=16)
+    max_upload_mb: int = Field(default=50, ge=1, le=500)
+    max_upload_total_mb: int = Field(default=200, ge=1, le=2000)
+    max_upload_files: int = Field(default=10, ge=1, le=50)
+    max_pdf_pages: int = Field(default=2000, ge=1, le=10000)
     max_chunk_chars: int = Field(default=4096, ge=200, le=10000)
     min_chunk_chars: int = Field(default=300, ge=50, le=5000)
 
