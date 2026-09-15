@@ -53,6 +53,8 @@
   },
   "thread": {
     "loadingConversation": "Đang tải cuộc trò chuyện…",
+    "historyLoadFailed": "Không thể tải cuộc trò chuyện này.",
+    "retryHistory": "Thử lại",
     "empty": {
       "description": "Hãy đặt câu hỏi, tiếp tục công việc cục bộ hoặc bắt đầu một luồng mới."
     },

@@ -67,6 +67,8 @@ export type InboundEvent =
       event: "stream_end";
       chat_id: string;
       stream_id?: string;
+      /** True when this model segment ended because the agent is continuing. */
+      resuming?: boolean;
     }
   | { event: "error"; chat_id?: string; detail?: string };
 

@@ -827,8 +827,14 @@ def _run_gateway(
         # Dream is an internal job — run directly, not through the agent loop.
         if job.name == "dream":
             try:
-                await agent.dream.run()
-                logger.info("Dream cron job completed")
+                committed = await agent.dream.run()
+                if committed:
+                    logger.info("Dream cron job committed successfully")
+                else:
+                    logger.warning(
+                        "Dream cron job finished without a commit "
+                        "(no pending history or transaction rolled back)"
+                    )
             except Exception:
                 logger.exception("Dream cron job failed")
             return None

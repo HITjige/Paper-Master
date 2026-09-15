@@ -870,6 +870,7 @@ class WebSocketChannel(BaseChannel):
         meta = metadata or {}
         if meta.get("_stream_end"):
             body: dict[str, Any] = {"event": "stream_end", "chat_id": chat_id}
+            body["resuming"] = bool(meta.get("_resuming", False))
         else:
             body = {
                 "event": "delta",

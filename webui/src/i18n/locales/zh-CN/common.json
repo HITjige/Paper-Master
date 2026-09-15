@@ -53,6 +53,8 @@
   },
   "thread": {
     "loadingConversation": "正在加载对话…",
+    "historyLoadFailed": "无法加载这段对话。",
+    "retryHistory": "重试",
     "empty": {
       "description": "可以提问、继续本地工作，或者开启一个新线程。"
     },

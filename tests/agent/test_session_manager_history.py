@@ -1,4 +1,5 @@
-from nanobot.session.manager import Session
+from nanobot.session.manager import Session, SessionManager
+from nanobot.utils.runtime import LENGTH_RECOVERY_PROMPT
 
 
 def _assert_no_orphans(history: list[dict]) -> None:
@@ -191,6 +192,47 @@ def test_get_history_preserves_reasoning_content():
             "content": "done",
             "reasoning_content": "hidden chain of thought",
         },
+    ]
+
+
+def test_get_history_collapses_legacy_length_recovery_messages():
+    session = Session(
+        key="websocket:legacy-length",
+        messages=[
+            {"role": "user", "content": "write a long answer"},
+            {"role": "assistant", "content": "part one "},
+            {"role": "user", "content": LENGTH_RECOVERY_PROMPT},
+            {"role": "assistant", "content": "part two "},
+            {"role": "user", "content": LENGTH_RECOVERY_PROMPT},
+            {"role": "assistant", "content": "final"},
+        ],
+    )
+
+    assert session.get_history() == [
+        {"role": "user", "content": "write a long answer"},
+        {"role": "assistant", "content": "part one part two final"},
+    ]
+
+
+def test_read_session_file_hides_legacy_length_recovery_messages(tmp_path):
+    manager = SessionManager(tmp_path)
+    session = Session(
+        key="websocket:legacy-length",
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "first "},
+            {"role": "user", "content": LENGTH_RECOVERY_PROMPT},
+            {"role": "assistant", "content": "second"},
+        ],
+    )
+    manager.save(session)
+
+    payload = manager.read_session_file(session.key)
+
+    assert payload is not None
+    assert [message["content"] for message in payload["messages"]] == [
+        "question",
+        "first second",
     ]
 
 

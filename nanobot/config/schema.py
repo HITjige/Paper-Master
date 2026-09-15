@@ -245,7 +245,7 @@ class PaperToolsConfig(Base):
 
     enable: bool = True
     multi_agent_memory_mode: Literal["strict", "strict_with_citations", "debug_trace"] = "strict"
-    multi_agent_orchestrator_enabled: bool = True
+    multi_agent_orchestrator_enabled: bool = False
     multi_agent_orchestrator_confidence_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     multi_agent_retrieval_judge_margin: float = Field(default=0.02, ge=0.0, le=0.3)
     multi_agent_node_history_chars: int = Field(default=60000, ge=256, le=60000)

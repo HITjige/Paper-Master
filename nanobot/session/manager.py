@@ -12,6 +12,49 @@ from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
 from nanobot.utils.helpers import ensure_dir, find_legal_message_start, safe_filename
+from nanobot.utils.runtime import LENGTH_RECOVERY_PROMPT
+
+
+def _collapse_legacy_length_recovery_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hide legacy auto-continue prompts and stitch their assistant chunks.
+
+    Older runners persisted the internal length-recovery prompt as a real user
+    message. Normalize it on read so existing sessions remain usable without
+    destructively rewriting their JSONL files.
+    """
+    normalized: list[dict[str, Any]] = []
+    after_recovery_prompt = False
+
+    for message in messages:
+        if (
+            message.get("role") == "user"
+            and message.get("content") == LENGTH_RECOVERY_PROMPT
+        ):
+            after_recovery_prompt = True
+            continue
+
+        if (
+            after_recovery_prompt
+            and normalized
+            and normalized[-1].get("role") == "assistant"
+            and message.get("role") == "assistant"
+            and not normalized[-1].get("tool_calls")
+            and not message.get("tool_calls")
+            and isinstance(normalized[-1].get("content"), str)
+            and isinstance(message.get("content"), str)
+        ):
+            merged = dict(normalized[-1])
+            merged["content"] = normalized[-1]["content"] + message["content"]
+            normalized[-1] = merged
+            after_recovery_prompt = False
+            continue
+
+        after_recovery_prompt = False
+        normalized.append(message)
+
+    return normalized
 
 
 @dataclass
@@ -38,7 +81,9 @@ class Session:
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary."""
-        unconsolidated = self.messages[self.last_consolidated:]
+        unconsolidated = _collapse_legacy_length_recovery_messages(
+            self.messages[self.last_consolidated:]
+        )
         sliced = unconsolidated[-max_messages:]
 
         # Avoid starting mid-turn when possible.
@@ -261,7 +306,7 @@ class SessionManager:
             "created_at": session.created_at.isoformat(),
             "updated_at": session.updated_at.isoformat(),
             "metadata": session.metadata,
-            "messages": session.messages,
+            "messages": _collapse_legacy_length_recovery_messages(session.messages),
         }
 
     def save(self, session: Session) -> None:
@@ -343,7 +388,7 @@ class SessionManager:
                 "created_at": created_at,
                 "updated_at": updated_at,
                 "metadata": metadata,
-                "messages": messages,
+                "messages": _collapse_legacy_length_recovery_messages(messages),
             }
         except Exception as e:
             logger.warning("Failed to read session {}: {}", key, e)

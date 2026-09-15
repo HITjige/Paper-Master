@@ -53,6 +53,8 @@
   },
   "thread": {
     "loadingConversation": "正在載入對話…",
+    "historyLoadFailed": "無法載入這段對話。",
+    "retryHistory": "重試",
     "empty": {
       "description": "你可以提問、延續本地工作，或是開始新的執行緒。"
     },

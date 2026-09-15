@@ -53,6 +53,8 @@
   },
   "thread": {
     "loadingConversation": "Memuat percakapan…",
+    "historyLoadFailed": "Percakapan ini tidak dapat dimuat.",
+    "retryHistory": "Coba lagi",
     "empty": {
       "description": "Ajukan pertanyaan, lanjutkan pekerjaan lokal, atau mulai thread baru."
     },

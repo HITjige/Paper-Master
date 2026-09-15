@@ -69,16 +69,21 @@ export function useNanobotStream(
 
       if (ev.event === "stream_end") {
         if (!buffer.current) {
-          setIsStreaming(false);
+          setIsStreaming(ev.resuming ?? false);
           return;
         }
         const finalId = buffer.current.messageId;
         buffer.current = null;
-        setIsStreaming(false);
+        setIsStreaming(ev.resuming ?? false);
         setMessages((prev) =>
-          prev.map((m) =>
-            m.id === finalId ? { ...m, isStreaming: false } : m,
-          ),
+          prev.flatMap((m) => {
+            if (m.id !== finalId) return [m];
+            // Reasoning/tool-call segments may contain only template
+            // whitespace. They are transport artifacts, not assistant
+            // messages, and must not remain as empty bubbles.
+            if (!m.content.trim()) return [];
+            return [{ ...m, isStreaming: false }];
+          }),
         );
         return;
       }

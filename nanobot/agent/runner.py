@@ -37,6 +37,7 @@ _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
+_TRANSIENT_MESSAGE_KEY = "_nanobot_transient"
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
@@ -62,6 +63,7 @@ class AgentRunSpec:
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    disable_thinking: bool = False
     hook: AgentHook | None = None
     error_message: str | None = _DEFAULT_ERROR_MESSAGE
     max_iterations_message: str | None = None
@@ -239,6 +241,7 @@ class AgentRunner:
         external_lookup_counts: dict[str, int] = {}
         empty_content_retries = 0
         length_recovery_count = 0
+        length_recovery_parts: list[str] = []
         had_injections = False
         injection_cycles = 0
         post_tool_continuation_message: dict[str, str] | None = None
@@ -448,6 +451,7 @@ class AgentRunner:
 
             if response.finish_reason == "length" and not is_blank_text(clean):
                 length_recovery_count += 1
+                length_recovery_parts.append(clean or "")
                 if length_recovery_count <= _MAX_LENGTH_RECOVERIES:
                     logger.info(
                         "Output truncated on turn {} for {} ({}/{}); continuing",
@@ -456,16 +460,31 @@ class AgentRunner:
                         length_recovery_count,
                         _MAX_LENGTH_RECOVERIES,
                     )
-                    if hook.wants_streaming():
-                        await hook.on_stream_end(context, resuming=True)
-                    messages.append(build_assistant_message(
+                    # A length recovery is still the same assistant reply. Keep
+                    # the transport stream open so the next model call appends
+                    # to the current UI bubble instead of creating a new one.
+                    partial_message = build_assistant_message(
                         clean,
                         reasoning_content=response.reasoning_content,
                         thinking_blocks=response.thinking_blocks,
-                    ))
-                    messages.append(build_length_recovery_message())
+                    )
+                    partial_message[_TRANSIENT_MESSAGE_KEY] = "length_recovery"
+                    messages.append(partial_message)
+                    recovery_message = build_length_recovery_message()
+                    recovery_message[_TRANSIENT_MESSAGE_KEY] = "length_recovery"
+                    messages.append(recovery_message)
                     await hook.after_iteration(context)
                     continue
+
+            # The provider returns each automatic continuation as a separate
+            # completion, but to callers and persisted history they constitute
+            # one assistant reply. Preserve byte-for-byte boundaries: the
+            # model normally emits any required whitespace itself.
+            if length_recovery_parts and response.finish_reason != "error":
+                if response.finish_reason != "length" and not is_blank_text(clean):
+                    length_recovery_parts.append(clean or "")
+                clean = "".join(length_recovery_parts)
+                length_recovery_parts.clear()
 
             assistant_message: dict[str, Any] | None = None
             if response.finish_reason != "error" and not is_blank_text(clean):
@@ -576,7 +595,9 @@ class AgentRunner:
 
         return AgentRunResult(
             final_content=final_content,
-            messages=messages,
+            # Recovery prompts and partial assistant messages are request-only
+            # context. Never expose them as canonical conversation history.
+            messages=[m for m in messages if not m.get(_TRANSIENT_MESSAGE_KEY)],
             tools_used=tools_used,
             usage=usage,
             stop_reason=stop_reason,
@@ -627,6 +648,8 @@ class AgentRunner:
                 **kwargs,
                 on_content_delta=_stream,
             )
+        if spec.disable_thinking:
+            kwargs["disable_thinking"] = True
         return await self.provider.chat_with_retry(**kwargs)
 
     async def _request_finalization_retry(

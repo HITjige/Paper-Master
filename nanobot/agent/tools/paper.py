@@ -12,8 +12,10 @@ import re
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
@@ -39,6 +41,16 @@ if TYPE_CHECKING:
 
 MAX_PAPER_DOWNLOAD_BYTES = 50 * 1024 * 1024
 MAX_ARXIV_RESPONSE_BYTES = 10 * 1024 * 1024
+ARXIV_MIN_INTERVAL_SECONDS = 3.1
+ARXIV_DEFAULT_COOLDOWN_SECONDS = 5 * 60
+ARXIV_TOPIC_CACHE_TTL_SECONDS = 6 * 60 * 60
+ARXIV_EXACT_CACHE_TTL_SECONDS = 24 * 60 * 60
+ARXIV_ERROR_CACHE_TTL_SECONDS = 60
+ARXIV_MAX_COMBINED_QUERIES = 4
+ARXIV_USER_AGENT = (
+    "nanobot-paper-search/1.1 "
+    "(+https://github.com/HITjige/Paper-Master)"
+)
 
 _ARXIV_ID_PATTERN = (
     r"(?<![A-Za-z0-9])"
@@ -92,23 +104,230 @@ class _ArxivSearchResult:
     attempts: int = 1
     latency_ms: int = 0
     error: str = ""
+    retry_after_seconds: float = 0.0
+    cached: bool = False
+
+
+class _ArxivCooldownError(RuntimeError):
+    def __init__(self, retry_after_seconds: float):
+        self.retry_after_seconds = max(0.0, retry_after_seconds)
+        super().__init__(
+            f"shared arXiv cooldown active for "
+            f"{self.retry_after_seconds:.1f}s"
+        )
+
+
+def _parse_retry_after_seconds(headers: Any) -> float:
+    """Parse numeric and HTTP-date Retry-After response headers."""
+    try:
+        raw_value = str(
+            headers.get("Retry-After", "")
+            or headers.get("retry-after", "")
+            or ""
+        ).strip()
+    except AttributeError:
+        return 0.0
+    if not raw_value:
+        return 0.0
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(raw_value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(
+            0.0,
+            (retry_at - datetime.now(timezone.utc)).total_seconds(),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
 
 
 class _ArxivRateLimiter:
-    """Serialize request starts so concurrent queries share one rate limit."""
+    """Serialize complete requests and share a process-wide 429 cooldown."""
 
-    def __init__(self, min_interval_seconds: float = 3.0):
+    def __init__(
+        self,
+        min_interval_seconds: float = ARXIV_MIN_INTERVAL_SECONDS,
+        default_cooldown_seconds: float = ARXIV_DEFAULT_COOLDOWN_SECONDS,
+    ):
         self.min_interval_seconds = max(0.0, min_interval_seconds)
+        self.default_cooldown_seconds = max(0.0, default_cooldown_seconds)
         self._lock = asyncio.Lock()
         self._last_request_at = 0.0
+        self._cooldown_until = 0.0
+        self._rate_limit_strikes = 0
+
+    def remaining_cooldown(self) -> float:
+        return max(0.0, self._cooldown_until - time.monotonic())
 
     async def wait(self) -> None:
+        """Compatibility helper for callers that only need a request slot."""
         async with self._lock:
             now = time.monotonic()
+            cooldown = self._cooldown_until - now
+            if cooldown > 0:
+                raise _ArxivCooldownError(cooldown)
             delay = self.min_interval_seconds - (now - self._last_request_at)
             if delay > 0:
                 await asyncio.sleep(delay)
             self._last_request_at = time.monotonic()
+
+    async def request(
+        self,
+        request_factory: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Run one request while holding the shared single-connection slot."""
+        async with self._lock:
+            now = time.monotonic()
+            cooldown = self._cooldown_until - now
+            if cooldown > 0:
+                raise _ArxivCooldownError(cooldown)
+            delay = self.min_interval_seconds - (now - self._last_request_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last_request_at = time.monotonic()
+            response = await request_factory()
+            status_code = getattr(response, "status_code", 200)
+            if status_code == 429:
+                self._rate_limit_strikes += 1
+                retry_after = _parse_retry_after_seconds(
+                    getattr(response, "headers", {})
+                )
+                fallback = min(
+                    15 * 60,
+                    self.default_cooldown_seconds
+                    * (2 ** min(2, self._rate_limit_strikes - 1)),
+                )
+                cooldown_seconds = max(retry_after, fallback)
+                self._cooldown_until = max(
+                    self._cooldown_until,
+                    time.monotonic() + cooldown_seconds,
+                )
+            elif status_code < 500:
+                self._rate_limit_strikes = 0
+            return response
+
+
+_ARXIV_RATE_LIMITER = _ArxivRateLimiter()
+
+
+class _ArxivSearchCache:
+    """Small shared disk cache for successful and short-lived failed routes."""
+
+    def __init__(self, path: Path, max_entries: int = 128):
+        self.path = path
+        self.max_entries = max(1, max_entries)
+        self._loaded = False
+        self._entries: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _entry_id(key: tuple[Any, ...]) -> str:
+        encoded = json.dumps(
+            key,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            entries = payload.get("entries", {})
+            if isinstance(entries, dict):
+                self._entries = {
+                    str(key): value
+                    for key, value in entries.items()
+                    if isinstance(value, dict)
+                }
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("Ignoring invalid arXiv search cache {}: {}", self.path, exc)
+
+    def get(self, key: tuple[Any, ...]) -> _ArxivSearchResult | None:
+        self._load()
+        entry_id = self._entry_id(key)
+        entry = self._entries.get(entry_id)
+        if not entry:
+            return None
+        try:
+            if float(entry.get("expires_at", 0.0)) <= time.time():
+                self._entries.pop(entry_id, None)
+                return None
+            result_data = dict(entry["result"])
+            result_data["cached"] = True
+            return _ArxivSearchResult(**result_data)
+        except (KeyError, TypeError, ValueError):
+            self._entries.pop(entry_id, None)
+            return None
+
+    def put(
+        self,
+        key: tuple[Any, ...],
+        result: _ArxivSearchResult,
+        ttl_seconds: float,
+    ) -> None:
+        if ttl_seconds <= 0:
+            return
+        self._load()
+        now = time.time()
+        self._entries = {
+            entry_id: entry
+            for entry_id, entry in self._entries.items()
+            if float(entry.get("expires_at", 0.0) or 0.0) > now
+        }
+        result_data = asdict(result)
+        result_data["cached"] = False
+        self._entries[self._entry_id(key)] = {
+            "expires_at": now + ttl_seconds,
+            "result": result_data,
+        }
+        if len(self._entries) > self.max_entries:
+            newest = sorted(
+                self._entries.items(),
+                key=lambda item: float(item[1].get("expires_at", 0.0)),
+                reverse=True,
+            )[:self.max_entries]
+            self._entries = dict(newest)
+        temporary: Path | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_text(
+                json.dumps(
+                    {"version": 1, "entries": self._entries},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            temporary.replace(self.path)
+        except OSError as exc:
+            logger.warning("Failed to persist arXiv search cache {}: {}", self.path, exc)
+            if temporary is not None:
+                with contextlib.suppress(OSError):
+                    temporary.unlink()
+
+
+_ARXIV_SEARCH_CACHES: dict[str, _ArxivSearchCache] = {}
+
+
+def _get_arxiv_search_cache(workspace: Path) -> _ArxivSearchCache:
+    cache_path = (workspace / "kb" / "arxiv_search_cache.json").resolve()
+    cache_key = str(cache_path)
+    cache = _ARXIV_SEARCH_CACHES.get(cache_key)
+    if cache is None:
+        cache = _ArxivSearchCache(cache_path)
+        _ARXIV_SEARCH_CACHES[cache_key] = cache
+    return cache
 
 
 def _escape_arxiv_term(value: str) -> str:
@@ -172,6 +391,33 @@ def _build_arxiv_query(
     return search_query
 
 
+def _build_arxiv_query_group(
+    query_variants: list[tuple[str, list[str]]],
+    *,
+    from_year: int | None = None,
+    to_year: int | None = None,
+) -> str:
+    """Combine prepared query variants into one arXiv API expression."""
+    clauses: list[str] = []
+    seen: set[str] = set()
+    for query, keywords in query_variants:
+        clause = _build_arxiv_query(query, keywords)
+        if clause not in seen:
+            seen.add(clause)
+            clauses.append(clause)
+    search_query = " OR ".join(f"({clause})" for clause in clauses) or "all:*"
+    if from_year is not None or to_year is not None:
+        lower = max(1991, int(from_year or 1991))
+        upper = min(2100, int(to_year or datetime.now().year))
+        if lower > upper:
+            lower, upper = upper, lower
+        search_query = (
+            f"({search_query}) AND "
+            f"submittedDate:[{lower}01010000 TO {upper}12312359]"
+        )
+    return search_query
+
+
 async def _parse_arxiv(
     query: str,
     keywords: list[str] | None = None,
@@ -184,12 +430,14 @@ async def _parse_arxiv(
     start: int = 0,
     client: httpx.AsyncClient | None = None,
     rate_limiter: _ArxivRateLimiter | None = None,
+    query_variants: list[tuple[str, list[str]]] | None = None,
 ) -> _ArxivSearchResult:
     """Search arXiv with connection reuse, shared throttling and diagnostics."""
     if client is None:
         async with httpx.AsyncClient(
             timeout=20.0,
-            headers={"User-Agent": "nanobot-paper-search/1.0"},
+            headers={"User-Agent": ARXIV_USER_AGENT},
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
         ) as owned_client:
             return await _parse_arxiv(
                 query,
@@ -201,7 +449,8 @@ async def _parse_arxiv(
                 to_year=to_year,
                 start=start,
                 client=owned_client,
-                rate_limiter=rate_limiter or _ArxivRateLimiter(),
+                rate_limiter=rate_limiter or _ARXIV_RATE_LIMITER,
+                query_variants=query_variants,
             )
 
     normalized_sort = "submittedDate" if sort_by == "submittedDate" else "relevance"
@@ -218,12 +467,19 @@ async def _parse_arxiv(
             "max_results": min(100, len(exact_ids)),
         }
     else:
-        search_query = _build_arxiv_query(
-            query,
-            keywords,
-            from_year=from_year,
-            to_year=to_year,
-        )
+        if query_variants:
+            search_query = _build_arxiv_query_group(
+                query_variants,
+                from_year=from_year,
+                to_year=to_year,
+            )
+        else:
+            search_query = _build_arxiv_query(
+                query,
+                keywords,
+                from_year=from_year,
+                to_year=to_year,
+            )
         params = {
             "search_query": search_query,
             "start": max(0, int(start)),
@@ -232,15 +488,16 @@ async def _parse_arxiv(
             "sortOrder": "descending",
         }
     url = f"https://export.arxiv.org/api/query?{urlencode(params)}"
-    limiter = rate_limiter or _ArxivRateLimiter()
-    max_retries = 5
+    limiter = rate_limiter or _ARXIV_RATE_LIMITER
+    max_retries = 3
     started_at = time.monotonic()
     last_error = ""
+    last_status_code: int | None = None
+    retry_after_seconds = 0.0
 
     for attempt in range(1, max_retries + 1):
         try:
-            await limiter.wait()
-            response = await client.get(url)
+            response = await limiter.request(lambda: client.get(url))
             if len(response.content) > MAX_ARXIV_RESPONSE_BYTES:
                 raise ValueError("arXiv response exceeded size limit")
             response.raise_for_status()
@@ -302,6 +559,11 @@ async def _parse_arxiv(
                 attempts=attempt,
                 latency_ms=int((time.monotonic() - started_at) * 1000),
             )
+        except _ArxivCooldownError as exc:
+            retry_after_seconds = exc.retry_after_seconds
+            last_status_code = 429
+            last_error = str(exc)
+            break
         except ET.ParseError as exc:
             last_error = f"parse_error: {exc}"
             break
@@ -312,19 +574,26 @@ async def _parse_arxiv(
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None
                 else None
             )
+            last_status_code = status_code
+            if status_code == 429:
+                retry_after_seconds = limiter.remaining_cooldown()
+                logger.warning(
+                    "arXiv rate limited; shared cooldown {:.1f}s, not retrying "
+                    "immediately: {}",
+                    retry_after_seconds,
+                    exc,
+                )
+                break
             retryable = (
-                status_code in {429, 500, 502, 503, 504}
+                status_code in {500, 502, 503, 504}
                 or isinstance(exc, httpx.RequestError)
             )
             if not retryable or attempt >= max_retries:
                 break
             retry_after = 0.0
             if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
-                try:
-                    retry_after = float(exc.response.headers.get("Retry-After", "0") or 0)
-                except ValueError:
-                    retry_after = 0.0
-            delay = max(retry_after, min(30.0, 2.0 ** (attempt - 1)))
+                retry_after = _parse_retry_after_seconds(exc.response.headers)
+            delay = max(retry_after, min(30.0, 3.0 * (2 ** (attempt - 1))))
             delay += random.uniform(0.0, 0.5)
             logger.warning(
                 "arXiv request failed (attempt {}/{}), retrying in {:.1f}s: {}",
@@ -338,7 +607,7 @@ async def _parse_arxiv(
     if last_error.startswith("parse_error:"):
         status = "parse_error"
     else:
-        status = "rate_limited" if "429" in last_error else "request_error"
+        status = "rate_limited" if last_status_code == 429 else "request_error"
     logger.warning("arXiv search failed for query='{}': {}", query[:60], last_error)
     return _ArxivSearchResult(
         papers=[],
@@ -348,6 +617,7 @@ async def _parse_arxiv(
         attempts=attempt,
         latency_ms=int((time.monotonic() - started_at) * 1000),
         error=last_error,
+        retry_after_seconds=round(retry_after_seconds, 1),
     )
 
 
@@ -780,7 +1050,7 @@ def _query_requests_recency(query: str) -> bool:
 def _extract_keywords_from_query(query: str, top_n: int = 8) -> list[str]:
     ignore = {"paper", "papers", "latest", "recent", "survey", "about", "for", "with", "from", "that", 
     "论文", "文章", "最新", "最近", "近期", "综述", "有关", "关于", "领域", "的"}
-    toks = [t for t in _tok(query) if t not in ignore]
+    toks = sorted(t for t in _tok(query) if t not in ignore)
     uniq: list[str] = []
     for t in toks:
         if t not in uniq:
@@ -870,9 +1140,7 @@ class PaperSearchTool(_PaperTool):
         model: str | None = None,
     ):
         super().__init__(workspace=workspace, kb=kb, provider=provider, model=model)
-        self._search_cache: dict[
-            tuple[Any, ...], tuple[float, _ArxivSearchResult]
-        ] = {}
+        self._search_cache = _get_arxiv_search_cache(workspace)
 
     async def execute(
         self,
@@ -951,9 +1219,21 @@ class PaperSearchTool(_PaperTool):
         )
         if exact_lookup:
             sort_routes = [("exact_id", 1.0)]
+        # Candidate rewrites are OR-combined inside each sort route. This keeps
+        # their recall benefit without multiplying API requests by query count.
+        query_variants: list[tuple[str, list[str]]] = []
+        if not exact_lookup:
+            for search_query in search_queries[:ARXIV_MAX_COMBINED_QUERIES]:
+                keyword_key = re.sub(
+                    r"\s+", " ", search_query
+                ).strip().casefold()
+                route_keywords = (
+                    keyword_by_query.get(keyword_key)
+                    or _extract_keywords_from_query(search_query)
+                )
+                query_variants.append((search_query, route_keywords))
         route_specs = [
-            (search_query, sort_by, weight)
-            for search_query in search_queries
+            (query, sort_by, weight)
             for sort_by, weight in sort_routes
         ]
         per_route_topk = max(
@@ -970,45 +1250,48 @@ class PaperSearchTool(_PaperTool):
         }
         # An explicit request always wins over historical novelty exclusions.
         excluded_ids.difference_update(requested_canonical_ids)
-        limiter = _ArxivRateLimiter()
-        cache_ttl_seconds = 15 * 60
 
         async with httpx.AsyncClient(
             timeout=20.0,
-            headers={"User-Agent": "nanobot-paper-search/1.0"},
+            headers={"User-Agent": ARXIV_USER_AGENT},
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
         ) as client:
             async def _search_one_route(
                 search_query: str,
                 sort_by: str,
             ) -> _ArxivSearchResult:
-                keyword_key = re.sub(r"\s+", " ", search_query).strip().casefold()
-                route_keywords = (
-                    [] if exact_lookup
-                    else keyword_by_query.get(keyword_key)
-                    or _extract_keywords_from_query(search_query)
+                variants_key = tuple(
+                    (
+                        re.sub(r"\s+", " ", variant_query).strip().casefold(),
+                        tuple(variant_keywords),
+                    )
+                    for variant_query, variant_keywords in query_variants
                 )
                 cache_key = (
                     "exact_id" if exact_lookup else "topic",
-                    keyword_key,
-                    tuple(route_keywords),
+                    tuple(
+                        paper_id.casefold()
+                        for paper_id in requested_ids
+                    ) if exact_lookup else variants_key,
                     sort_by,
-                    from_year,
-                    to_year,
+                    None if exact_lookup else from_year,
+                    None if exact_lookup else to_year,
                     per_route_topk,
                 )
                 cached = self._search_cache.get(cache_key)
-                if cached and cached[0] > time.monotonic():
-                    return cached[1]
+                if cached is not None:
+                    return cached
                 route_result = await _parse_arxiv(
                     search_query,
-                    route_keywords,
+                    [],
                     max_results=per_route_topk,
-                    paper_ids=[search_query] if exact_lookup else None,
+                    paper_ids=requested_ids if exact_lookup else None,
                     sort_by="relevance" if exact_lookup else sort_by,
                     from_year=None if exact_lookup else from_year,
                     to_year=None if exact_lookup else to_year,
                     client=client,
-                    rate_limiter=limiter,
+                    rate_limiter=_ARXIV_RATE_LIMITER,
+                    query_variants=query_variants or None,
                 )
                 # Keep compatibility with light-weight injected test/search adapters.
                 if isinstance(route_result, list):
@@ -1019,23 +1302,53 @@ class PaperSearchTool(_PaperTool):
                         sort_by=sort_by,
                     )
                 if route_result.status == "ok":
-                    self._search_cache[cache_key] = (
-                        time.monotonic() + cache_ttl_seconds,
+                    self._search_cache.put(
+                        cache_key,
                         route_result,
+                        ARXIV_EXACT_CACHE_TTL_SECONDS
+                        if exact_lookup
+                        else ARXIV_TOPIC_CACHE_TTL_SECONDS,
                     )
-                    if len(self._search_cache) > 256:
-                        now = time.monotonic()
-                        self._search_cache = {
-                            key: value
-                            for key, value in self._search_cache.items()
-                            if value[0] > now
-                        }
+                elif route_result.status == "rate_limited":
+                    self._search_cache.put(
+                        cache_key,
+                        route_result,
+                        max(
+                            ARXIV_ERROR_CACHE_TTL_SECONDS,
+                            route_result.retry_after_seconds,
+                        ),
+                    )
+                elif route_result.status == "request_error":
+                    self._search_cache.put(
+                        cache_key,
+                        route_result,
+                        ARXIV_ERROR_CACHE_TTL_SECONDS,
+                    )
                 return route_result
 
-            route_results = await asyncio.gather(*[
-                _search_one_route(search_query, sort_by)
-                for search_query, sort_by, _weight in route_specs
-            ])
+            route_results: list[_ArxivSearchResult] = []
+            for route_index, (search_query, sort_by, _weight) in enumerate(
+                route_specs
+            ):
+                route_result = await _search_one_route(search_query, sort_by)
+                route_results.append(route_result)
+                if route_result.status != "rate_limited":
+                    continue
+                # A 429 applies to the shared arXiv endpoint. Do not send the
+                # remaining sort route while the global cooldown is active.
+                for pending_query, pending_sort, _pending_weight in route_specs[
+                    route_index + 1:
+                ]:
+                    route_results.append(_ArxivSearchResult(
+                        papers=[],
+                        status="rate_limited",
+                        query=pending_query,
+                        sort_by=pending_sort,
+                        attempts=0,
+                        error="skipped because shared arXiv cooldown is active",
+                        retry_after_seconds=route_result.retry_after_seconds,
+                    ))
+                break
 
         raw_total = sum(len(result.papers) for result in route_results)
         excluded_total = 0
@@ -1080,7 +1393,11 @@ class PaperSearchTool(_PaperTool):
         if failed_routes and successful_routes:
             search_status = "partial"
         elif failed_routes:
-            search_status = "error"
+            search_status = (
+                "rate_limited"
+                if all(result.status == "rate_limited" for result in failed_routes)
+                else "error"
+            )
         else:
             search_status = "ok"
         route_diagnostics = [
@@ -1092,7 +1409,16 @@ class PaperSearchTool(_PaperTool):
         ]
 
         if not all_papers:
-            reason = "search_failed" if search_status == "error" else "no_results"
+            reason = (
+                "rate_limited"
+                if search_status == "rate_limited"
+                else "search_failed" if search_status == "error"
+                else "no_results"
+            )
+            retry_after_seconds = max(
+                (result.retry_after_seconds for result in failed_routes),
+                default=0.0,
+            )
             logger.info("paper_search: query='{}' source={} results=0 status={}", query, source, search_status)
             return json.dumps(
                 {
@@ -1105,9 +1431,14 @@ class PaperSearchTool(_PaperTool):
                         "balanced" if prefer_recent else "relevance"
                     ),
                     "search_status": search_status,
+                    "retry_after_seconds": retry_after_seconds,
                     "route_diagnostics": route_diagnostics,
                     "embedding": self.kb.get_embedding_status(),
-                    "workflow_hint": "Broaden query and retry only when the search completed successfully with no results.",
+                    "workflow_hint": (
+                        "Wait for retry_after_seconds before trying arXiv again."
+                        if search_status == "rate_limited"
+                        else "Broaden query and retry only when the search completed successfully with no results."
+                    ),
                 },
                 ensure_ascii=False,
             )

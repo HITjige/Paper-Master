@@ -1,5 +1,6 @@
 """Tests for the Dream class — two-phase memory consolidation via AgentRunner."""
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,6 +24,13 @@ def store(tmp_path):
 def mock_provider():
     p = MagicMock()
     p.chat_with_retry = AsyncMock()
+
+    async def structured_proxy(**kwargs):
+        forwarded = dict(kwargs)
+        forwarded.pop("json_schema", None)
+        return await p.chat_with_retry(**forwarded)
+
+    p.chat_structured_with_retry = AsyncMock(side_effect=structured_proxy)
     return p
 
 
@@ -60,6 +68,30 @@ def _make_run_result(
     )
 
 
+def _phase1_analysis(*, proposals=None, skills=None) -> str:
+    return json.dumps(
+        {
+            "proposals": proposals or [],
+            "skills": skills or [],
+        }
+    )
+
+
+def _user_proposal(content: str = "The user prefers dark mode") -> dict:
+    return {
+        "action": "upsert",
+        "target": "USER",
+        "kind": "preference",
+        "subject": "display preference",
+        "content": content,
+        "old_content": "",
+        "confidence": 0.95,
+        "valid_from": None,
+        "expires_at": None,
+        "reason": "The user stated this preference",
+    }
+
+
 class TestDreamRun:
     async def test_noop_when_no_unprocessed_history(self, dream, mock_provider, mock_runner, store):
         """Dream should not call LLM when there's nothing to process."""
@@ -71,7 +103,9 @@ class TestDreamRun:
     async def test_calls_runner_for_unprocessed_entries(self, dream, mock_provider, mock_runner, store):
         """Dream should call AgentRunner when there are unprocessed history entries."""
         store.append_history("User prefers dark mode")
-        mock_provider.chat_with_retry.return_value = MagicMock(content="New fact")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content=_phase1_analysis(proposals=[_user_proposal()])
+        )
         mock_runner.run = AsyncMock(return_value=_make_run_result(
             tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
         ))
@@ -86,7 +120,9 @@ class TestDreamRun:
         """Dream should advance the cursor after processing."""
         store.append_history("event 1")
         store.append_history("event 2")
-        mock_provider.chat_with_retry.return_value = MagicMock(content="Nothing new")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content=_phase1_analysis()
+        )
         mock_runner.run = AsyncMock(return_value=_make_run_result())
         await dream.run()
         assert store.get_last_dream_cursor() == 2
@@ -96,7 +132,9 @@ class TestDreamRun:
         store.append_history("event 1")
         store.append_history("event 2")
         store.append_history("event 3")
-        mock_provider.chat_with_retry.return_value = MagicMock(content="Nothing new")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content=_phase1_analysis()
+        )
         mock_runner.run = AsyncMock(return_value=_make_run_result())
         await dream.run()
         # After Dream, cursor is advanced and 3, compact keeps last max_history_entries
@@ -126,6 +164,112 @@ class TestDreamRun:
         candidates = dream.skill_candidates.list_candidates(status="draft")
         assert [candidate["name"] for candidate in candidates] == ["test-skill"]
         assert not (store.workspace / "skills" / "test-skill" / "SKILL.md").exists()
+
+    async def test_phase1_uses_constrained_json_and_disables_thinking(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("nothing durable")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content=_phase1_analysis(),
+            finish_reason="stop",
+        )
+
+        assert await dream.run() is True
+
+        kwargs = mock_provider.chat_structured_with_retry.call_args.kwargs
+        assert kwargs["json_schema"]["required"] == ["proposals", "skills"]
+        assert kwargs["max_tokens"] == 4096
+        assert kwargs["disable_thinking"] is True
+        mock_runner.run.assert_not_called()
+
+    async def test_invalid_phase1_json_retains_cursor_without_editing(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("User prefers dark mode")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="Let me analyze the conversation first...",
+            finish_reason="stop",
+        )
+
+        assert await dream.run() is False
+        assert store.get_last_dream_cursor() == 0
+        mock_runner.run.assert_not_called()
+
+    async def test_truncated_phase1_retains_cursor_without_editing(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("User prefers dark mode")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content=_phase1_analysis(proposals=[_user_proposal()]),
+            finish_reason="length",
+        )
+
+        assert await dream.run() is False
+        assert store.get_last_dream_cursor() == 0
+        mock_runner.run.assert_not_called()
+
+    async def test_phase2_restores_snapshot_before_retry(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("User prefers dark mode")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content=_phase1_analysis(proposals=[_user_proposal()])
+        )
+        original_user = store.read_user()
+        attempts = 0
+
+        async def run_phase2(_spec):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                store.write_user("# User\n- partial edit")
+                return _make_run_result(tool_events=[{
+                    "name": "edit_file",
+                    "status": "error",
+                    "detail": "wrong path",
+                }])
+            assert store.read_user() == original_user
+            store.write_user("# User\n- Prefers dark mode")
+            return _make_run_result(tool_events=[{
+                "name": "edit_file",
+                "status": "ok",
+                "detail": "USER.md",
+            }])
+
+        mock_runner.run = AsyncMock(side_effect=run_phase2)
+
+        assert await dream.run() is True
+        assert mock_runner.run.await_count == 2
+        assert store.read_user() == "# User\n- Prefers dark mode"
+        retry_spec = mock_runner.run.await_args_list[1].args[0]
+        assert retry_spec.disable_thinking is True
+        assert "Previous attempt errors" in retry_spec.initial_messages[1]["content"]
+
+    async def test_memory_edit_alias_is_normalized(self, dream, store):
+        edit_tool = dream._tools.get("edit_file")
+        assert edit_tool is not None
+
+        result = await edit_tool.execute(
+            path="MEMORY.md",
+            old_text="- Project X active",
+            new_text="- Project X completed",
+        )
+
+        assert "Successfully edited" in result
+        assert "- Project X completed" in store.read_memory()
+
+    async def test_disallowed_edit_reports_attempted_path(self, dream):
+        edit_tool = dream._tools.get("edit_file")
+        assert edit_tool is not None
+
+        result = await edit_tool.execute(
+            path="skills/generated/SKILL.md",
+            old_text="old",
+            new_text="new",
+        )
+
+        assert "skills/generated/SKILL.md" in result
+        assert "is not allowed" in result
 
     async def test_dream_has_no_skill_write_tool(self, dream):
         assert dream._tools.get("write_file") is None

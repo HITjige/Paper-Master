@@ -53,6 +53,8 @@
   },
   "thread": {
     "loadingConversation": "Loading conversation…",
+    "historyLoadFailed": "Couldn't load this conversation.",
+    "retryHistory": "Retry",
     "empty": {
       "description": "Ask questions, continue local work, or start a new thread."
     },

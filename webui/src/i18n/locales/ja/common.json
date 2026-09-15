@@ -53,6 +53,8 @@
   },
   "thread": {
     "loadingConversation": "会話を読み込み中…",
+    "historyLoadFailed": "この会話を読み込めませんでした。",
+    "retryHistory": "再試行",
     "empty": {
       "description": "質問したり、ローカル作業を続けたり、新しいスレッドを始めたりできます。"
     },

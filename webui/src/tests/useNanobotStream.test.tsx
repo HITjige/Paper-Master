@@ -50,6 +50,54 @@ function wrap(client: ReturnType<typeof fakeClient>["client"]) {
 }
 
 describe("useNanobotStream", () => {
+  it("drops whitespace-only tool segments while keeping the run active", () => {
+    const fake = fakeClient();
+    const { result } = renderHook(() => useNanobotStream("chat-t", []), {
+      wrapper: wrap(fake.client),
+    });
+
+    act(() => {
+      fake.emit("chat-t", {
+        event: "delta",
+        chat_id: "chat-t",
+        text: "\n\n",
+        stream_id: "segment-0",
+      });
+    });
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.isStreaming).toBe(true);
+
+    act(() => {
+      fake.emit("chat-t", {
+        event: "stream_end",
+        chat_id: "chat-t",
+        stream_id: "segment-0",
+        resuming: true,
+      });
+    });
+    expect(result.current.messages).toHaveLength(0);
+    expect(result.current.isStreaming).toBe(true);
+
+    act(() => {
+      fake.emit("chat-t", {
+        event: "delta",
+        chat_id: "chat-t",
+        text: "Final answer",
+        stream_id: "segment-1",
+      });
+      fake.emit("chat-t", {
+        event: "stream_end",
+        chat_id: "chat-t",
+        stream_id: "segment-1",
+        resuming: false,
+      });
+    });
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0].content).toBe("Final answer");
+    expect(result.current.messages[0].isStreaming).toBe(false);
+    expect(result.current.isStreaming).toBe(false);
+  });
+
   it("collapses consecutive tool_hint frames into one trace row", () => {
     const fake = fakeClient();
     const { result } = renderHook(() => useNanobotStream("chat-t", []), {

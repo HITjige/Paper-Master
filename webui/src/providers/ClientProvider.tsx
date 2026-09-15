@@ -1,5 +1,13 @@
-import { createContext, useContext, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 
+import { runtimeToken, subscribeRuntimeToken } from "@/lib/auth";
 import type { NanobotClient } from "@/lib/nanobot-client";
 
 interface ClientContextValue {
@@ -21,8 +29,20 @@ export function ClientProvider({
   modelName?: string | null;
   children: ReactNode;
 }) {
+  const [activeToken, setActiveToken] = useState(() => runtimeToken(token));
+
+  useEffect(() => {
+    setActiveToken(runtimeToken(token));
+    return subscribeRuntimeToken(setActiveToken);
+  }, [token]);
+
+  const value = useMemo(
+    () => ({ client, token: activeToken, modelName }),
+    [activeToken, client, modelName],
+  );
+
   return (
-    <ClientContext.Provider value={{ client, token, modelName }}>
+    <ClientContext.Provider value={value}>
       {children}
     </ClientContext.Provider>
   );

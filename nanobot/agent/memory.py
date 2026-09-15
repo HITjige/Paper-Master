@@ -1264,12 +1264,96 @@ class Consolidator:
 # Keep code and prompt aligned — if you bump this, the LLM's instruction string
 # updates automatically.
 _STALE_THRESHOLD_DAYS = 14
+_DREAM_PHASE1_MAX_TOKENS = 4096
+_DREAM_PHASE2_ATTEMPTS = 2
+_DREAM_PHASE1_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "proposals": {
+            "type": "array",
+            "maxItems": 30,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["upsert", "remove"]},
+                    "target": {"type": "string", "enum": ["USER", "SOUL", "MEMORY"]},
+                    "kind": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "content": {"type": "string"},
+                    "old_content": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "valid_from": {"type": ["string", "null"]},
+                    "expires_at": {"type": ["string", "null"]},
+                    "reason": {"type": "string"},
+                },
+                "required": [
+                    "action",
+                    "target",
+                    "kind",
+                    "subject",
+                    "content",
+                    "old_content",
+                    "confidence",
+                    "valid_from",
+                    "expires_at",
+                    "reason",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "skills": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "update"]},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "when_to_use": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "completion_criteria": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "failure_recovery": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "examples": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "action",
+                    "name",
+                    "description",
+                    "when_to_use",
+                    "steps",
+                    "completion_criteria",
+                    "failure_recovery",
+                    "examples",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["proposals", "skills"],
+    "additionalProperties": False,
+}
 
 
 class Dream:
     """Two-phase memory processor with reviewable Skill discovery.
 
-    Phase 1 produces an analysis summary (plain LLM call).
+    Phase 1 produces a schema-constrained proposal document.
     Phase 2 delegates to AgentRunner with read_file / edit_file tools so the
     LLM can make targeted, incremental edits instead of replacing entire files.
     Skill proposals are rendered and staged separately by deterministic
@@ -1330,12 +1414,29 @@ class Dream:
             async def execute(self, path: str | None = None, **kwargs: Any) -> str:
                 if not path:
                     return "Error: Unknown path"
+                requested_path = path
+                normalized_path = path.strip().replace("\\", "/")
+                # Some models shorten the documented memory/MEMORY.md path to
+                # MEMORY.md. It is unambiguous in Dream's three-file sandbox,
+                # so normalize only this exact legacy alias.
+                if normalized_path in {"MEMORY.md", "./MEMORY.md"}:
+                    path = "memory/MEMORY.md"
+                else:
+                    candidate = Path(normalized_path).expanduser()
+                    if (
+                        candidate.is_absolute()
+                        and candidate.resolve() == (workspace / "MEMORY.md").resolve()
+                    ):
+                        path = "memory/MEMORY.md"
                 try:
                     resolved = self._resolve(path)
                 except PermissionError as exc:
                     return f"Error: {exc}"
                 if resolved not in allowed_memory_files:
-                    return "Error: Dream may only edit SOUL.md, USER.md, and memory/MEMORY.md"
+                    return (
+                        f"Error: Dream edit path {requested_path!r} is not allowed; "
+                        "use exactly SOUL.md, USER.md, or memory/MEMORY.md"
+                    )
                 return await super().execute(path=path, **kwargs)
 
         tools.register(_MemoryOnlyEditFileTool(workspace=workspace, allowed_dir=workspace))
@@ -1522,6 +1623,43 @@ class Dream:
             and not payload.get("proposals")
         )
 
+    @staticmethod
+    def _normalize_analysis_json(analysis: str) -> str | None:
+        """Return canonical Phase 1 JSON, or None when output is malformed."""
+        raw = strip_think(analysis).strip()
+        if raw.upper() == "[SKIP]":
+            return json.dumps({"proposals": [], "skills": []})
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            legacy_proposals = Dream._analysis_memory_candidates(raw)
+            if not legacy_proposals:
+                return None
+            return json.dumps(
+                {"proposals": legacy_proposals, "skills": []},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        if not isinstance(payload, dict):
+            return None
+        proposals = payload.get("proposals")
+        skills = payload.get("skills")
+        if (
+            not isinstance(proposals, list)
+            or not isinstance(skills, list)
+            or any(not isinstance(item, dict) for item in proposals)
+            or any(not isinstance(item, dict) for item in skills)
+        ):
+            return None
+        return json.dumps(
+            {"proposals": proposals, "skills": skills},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
     async def _run_once(self) -> bool:
         """Process unprocessed history entries. Returns True if work was done."""
         last_cursor = self.store.get_last_dream_cursor()
@@ -1583,11 +1721,10 @@ class Dream:
             f"## Conversation History\n{history_text}\n\n{file_context}{skills_section}"
         )
 
-        # Phase 1 不调用任何文件工具，单纯让大模型（结合 agent/dream_phase1.md 的系统提示词）做阅读理解。
-        # 大模型会对比“短期流水账”和“现有长期记忆”，给出一份文本分析报告
-        # 如“我发现用户的偏好发生了 X 改变，需要修改 USER.md；有一条 30 天前的记忆已经失效，需要删除……”
+        # Phase 1 不调用文件工具；它对比短期历史和现有长期记忆，并通过
+        # JSON Schema 返回可验证的 memory / skill proposals。
         try:
-            phase1_response = await self.provider.chat_with_retry(
+            phase1_response = await self.provider.chat_structured_with_retry(
                 model=self.model,
                 messages=[
                     {
@@ -1600,13 +1737,31 @@ class Dream:
                     },
                     {"role": "user", "content": phase1_prompt},
                 ],
-                tools=None,
-                tool_choice=None,
+                json_schema=_DREAM_PHASE1_SCHEMA,
+                max_tokens=_DREAM_PHASE1_MAX_TOKENS,
+                temperature=0.1,
+                disable_thinking=True,
             )
-            if phase1_response.finish_reason == "error":
-                raise RuntimeError(f"Dream Phase 1 returned an error: {phase1_response.content}")
-            analysis = phase1_response.content or ""
-            logger.debug("Dream Phase 1 analysis ({} chars): {}", len(analysis), analysis[:500])
+            if phase1_response.finish_reason in {"error", "length"}:
+                raise RuntimeError(
+                    "Dream Phase 1 did not complete "
+                    f"(finish_reason={phase1_response.finish_reason}): "
+                    f"{phase1_response.content}"
+                )
+            raw_analysis = phase1_response.content or ""
+            analysis = self._normalize_analysis_json(raw_analysis)
+            if analysis is None:
+                logger.warning(
+                    "Dream Phase 1 returned invalid JSON ({} chars); "
+                    "retaining cursor for retry",
+                    len(raw_analysis),
+                )
+                return False
+            logger.debug(
+                "Dream Phase 1 analysis ({} chars): {}",
+                len(analysis),
+                analysis[:500],
+            )
         except Exception:
             logger.exception("Dream Phase 1 failed")
             return False
@@ -1637,40 +1792,8 @@ class Dream:
             for path in managed_paths
         }
         explicit_skip = self._analysis_is_skip(analysis)
-        result = None
-        if not explicit_skip:
-            try:
-                result = await self._runner.run(AgentRunSpec(
-                    initial_messages=messages,
-                    tools=tools,
-                    model=self.model,
-                    max_iterations=self.max_iterations,
-                    max_tool_result_chars=self.max_tool_result_chars,
-                    fail_on_tool_error=False,
-                ))
-                logger.debug(
-                    "Dream Phase 2 complete: stop_reason={}, tool_events={}",
-                    result.stop_reason, len(result.tool_events),
-                )
-                for ev in (result.tool_events or []):
-                    logger.info(
-                        "Dream tool_event: name={}, status={}, detail={}",
-                        ev.get("name"),
-                        ev.get("status"),
-                        ev.get("detail", "")[:200],
-                    )
-            except Exception:
-                logger.exception("Dream Phase 2 failed")
 
-        failed_events = [
-            event
-            for event in (result.tool_events if result else [])
-            if event.get("status") != "ok"
-        ]
-        phase2_succeeded = explicit_skip or bool(
-            result and result.stop_reason == "completed" and not failed_events
-        )
-        if not phase2_succeeded:
+        def restore_snapshots() -> None:
             for path, snapshot in snapshots.items():
                 if snapshot is None:
                     path.unlink(missing_ok=True)
@@ -1679,6 +1802,88 @@ class Dream:
                         path,
                         snapshot.decode("utf-8", errors="replace"),
                     )
+
+        result = None
+        phase2_succeeded = explicit_skip
+        if not explicit_skip:
+            attempt_messages = messages
+            for attempt in range(1, _DREAM_PHASE2_ATTEMPTS + 1):
+                try:
+                    result = await self._runner.run(AgentRunSpec(
+                        initial_messages=attempt_messages,
+                        tools=tools,
+                        model=self.model,
+                        max_iterations=self.max_iterations,
+                        max_tool_result_chars=self.max_tool_result_chars,
+                        fail_on_tool_error=False,
+                        disable_thinking=True,
+                    ))
+                except Exception:
+                    result = None
+                    logger.exception(
+                        "Dream Phase 2 attempt {}/{} failed",
+                        attempt,
+                        _DREAM_PHASE2_ATTEMPTS,
+                    )
+
+                failed_events = [
+                    event
+                    for event in (result.tool_events if result else [])
+                    if event.get("status") != "ok"
+                ]
+                logger.debug(
+                    "Dream Phase 2 attempt {}/{} complete: "
+                    "stop_reason={}, tool_events={}, failed_events={}",
+                    attempt,
+                    _DREAM_PHASE2_ATTEMPTS,
+                    result.stop_reason if result else "exception",
+                    len(result.tool_events) if result else 0,
+                    len(failed_events),
+                )
+                for ev in (result.tool_events if result else []):
+                    logger.info(
+                        "Dream tool_event (attempt {}/{}): "
+                        "name={}, status={}, detail={}",
+                        attempt,
+                        _DREAM_PHASE2_ATTEMPTS,
+                        ev.get("name"),
+                        ev.get("status"),
+                        ev.get("detail", "")[:200],
+                    )
+
+                if result and result.stop_reason == "completed" and not failed_events:
+                    phase2_succeeded = True
+                    break
+
+                restore_snapshots()
+                if attempt < _DREAM_PHASE2_ATTEMPTS:
+                    failure_details = "\n".join(
+                        f"- {event.get('name')}: {event.get('detail', '')}"
+                        for event in failed_events
+                    ) or "- Phase 2 did not complete"
+                    logger.warning(
+                        "Dream Phase 2 attempt {}/{} incomplete; "
+                        "restored snapshots and retrying",
+                        attempt,
+                        _DREAM_PHASE2_ATTEMPTS,
+                    )
+                    attempt_messages = [
+                        messages[0],
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{phase2_prompt}\n\n"
+                                "## Previous attempt errors\n"
+                                f"{failure_details}\n\n"
+                                "Retry the complete proposal transaction from the "
+                                "original file contents. Use only the exact relative "
+                                "paths SOUL.md, USER.md, and memory/MEMORY.md."
+                            ),
+                        },
+                    ]
+
+        if not phase2_succeeded:
+            restore_snapshots()
             reason = result.stop_reason if result else "exception"
             logger.warning(
                 "Dream incomplete ({}); restored memory files and retained cursor {}",

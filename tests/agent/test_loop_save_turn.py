@@ -91,6 +91,31 @@ def test_save_turn_keeps_tool_results_under_16k() -> None:
     assert session.messages[0]["content"] == content
 
 
+def test_save_turn_skips_transient_length_recovery_messages() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:length-recovery")
+
+    loop._save_turn(
+        session,
+        [
+            {
+                "role": "assistant",
+                "content": "partial",
+                "_nanobot_transient": "length_recovery",
+            },
+            {
+                "role": "user",
+                "content": "internal continuation prompt",
+                "_nanobot_transient": "length_recovery",
+            },
+            {"role": "assistant", "content": "partialfinal"},
+        ],
+        skip=0,
+    )
+
+    assert [message["content"] for message in session.messages] == ["partialfinal"]
+
+
 def test_restore_runtime_checkpoint_rehydrates_completed_and_pending_tools() -> None:
     loop = _mk_loop()
     session = Session(

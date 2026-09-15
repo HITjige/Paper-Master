@@ -1,46 +1,8 @@
 import type { DeletePaperResult, KBStats, UploadResult } from "./types";
-import { fetchBootstrap } from "./bootstrap";
-
-/** Resolve the KB API discovered during bootstrap, with a dev-server fallback. */
-function kbApiConfig(): { base: string; headers: Record<string, string> } {
-  const globals = window as unknown as Record<string, unknown>;
-  const base =
-    typeof globals.__NANOBOT_API_URL__ === "string"
-      ? globals.__NANOBOT_API_URL__.replace(/\/$/, "")
-      : "http://127.0.0.1:18790";
-  const token = globals.__NANOBOT_API_TOKEN__;
-  return {
-    base,
-    headers:
-      typeof token === "string" && token
-        ? { Authorization: `Bearer ${token}` }
-        : {},
-  };
-}
-
-async function refreshKbApiConfig(): Promise<ReturnType<typeof kbApiConfig>> {
-  const boot = await fetchBootstrap();
-  const globals = window as unknown as Record<string, unknown>;
-  if (boot.api_url) globals.__NANOBOT_API_URL__ = boot.api_url;
-  globals.__NANOBOT_API_TOKEN__ = boot.token;
-  return kbApiConfig();
-}
+import { authenticatedFetch, runtimeApiBase } from "./auth";
 
 async function kbFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  let api = kbApiConfig();
-  const request = () => {
-    const headers = new Headers(init.headers);
-    for (const [name, value] of Object.entries(api.headers)) {
-      headers.set(name, value);
-    }
-    return fetch(`${api.base}${path}`, { ...init, headers });
-  };
-  let response = await request();
-  if (response.status === 401) {
-    api = await refreshKbApiConfig();
-    response = await request();
-  }
-  return response;
+  return authenticatedFetch(() => `${runtimeApiBase()}${path}`, init);
 }
 
 /**

@@ -977,6 +977,55 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
 
 
 @pytest.mark.asyncio
+async def test_loop_stream_filter_suppresses_whitespace_only_tool_segment(tmp_path):
+    loop = _make_loop(tmp_path)
+    deltas: list[str] = []
+    endings: list[bool] = []
+    call_count = 0
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            await on_content_delta("\n\n")
+            return LLMResponse(
+                content="\n\n",
+                tool_calls=[ToolCallRequest(
+                    id="kb-1",
+                    name="kb_retrieve",
+                    arguments={"query": "EEG-to-image"},
+                )],
+                finish_reason="tool_calls",
+                usage={},
+            )
+        await on_content_delta("Final answer")
+        return LLMResponse(content="Final answer", tool_calls=[], usage={})
+
+    loop.provider.chat_stream_with_retry = chat_stream_with_retry
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.tools.prepare_call = MagicMock(
+        return_value=(None, {"query": "EEG-to-image"}, None)
+    )
+    loop.tools.execute = AsyncMock(return_value='{"results":[{"title":"EEG paper"}]}')
+
+    async def on_stream(delta: str) -> None:
+        deltas.append(delta)
+
+    async def on_stream_end(*, resuming: bool = False) -> None:
+        endings.append(resuming)
+
+    final_content, _, _, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "Find EEG-to-image papers"}],
+        on_stream=on_stream,
+        on_stream_end=on_stream_end,
+    )
+
+    assert final_content == "Final answer"
+    assert deltas == ["Final answer"]
+    assert endings == [True, False]
+
+
+@pytest.mark.asyncio
 async def test_loop_retries_think_only_final_response(tmp_path):
     loop = _make_loop(tmp_path)
     call_count = {"n": 0}
@@ -1061,6 +1110,44 @@ async def test_streamed_flag_not_set_on_llm_error(tmp_path):
     assert "503" in result.content
     assert not result.metadata.get("_streamed"), \
         "_streamed must not be set when stop_reason is error"
+
+
+@pytest.mark.asyncio
+async def test_streamed_flag_not_set_on_empty_final_response(tmp_path):
+    """The synthesized fallback must be delivered as a regular message."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+    from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    empty = LLMResponse(
+        content=None,
+        finish_reason="stop",
+        tool_calls=[],
+        reasoning_content="reasoning without a visible answer",
+        usage={},
+    )
+    loop.provider.chat_stream_with_retry = AsyncMock(return_value=empty)
+    loop.provider.chat_with_retry = AsyncMock(return_value=empty)
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    msg = InboundMessage(
+        channel="websocket", sender_id="u1", chat_id="c1", content="hi",
+    )
+    result = await loop._process_message(
+        msg,
+        on_stream=AsyncMock(),
+        on_stream_end=AsyncMock(),
+    )
+
+    assert result is not None
+    assert result.content == EMPTY_FINAL_RESPONSE_MESSAGE
+    assert not result.metadata.get("_streamed"), \
+        "fallback was synthesized after stream end and still needs delivery"
 
 
 @pytest.mark.asyncio
@@ -1273,8 +1360,10 @@ async def test_length_recovery_continues_from_truncated_output():
 
     provider = MagicMock()
     call_count = {"n": 0}
+    captured_messages: list[list[dict]] = []
 
     async def chat_with_retry(*, messages, **kwargs):
+        captured_messages.append(messages)
         call_count["n"] += 1
         if call_count["n"] <= 2:
             return LLMResponse(
@@ -1298,16 +1387,21 @@ async def test_length_recovery_continues_from_truncated_output():
     ))
 
     assert result.stop_reason == "completed"
-    assert result.final_content == "final"
+    assert result.final_content == "part1 part2 final"
     assert call_count["n"] == 3
-    roles = [m["role"] for m in result.messages if m["role"] == "user"]
-    assert len(roles) >= 3  # original + 2 recovery prompts
+    assert result.messages == [
+        {"role": "user", "content": "write a long essay"},
+        {"role": "assistant", "content": "part1 part2 final"},
+    ]
+    assert any(
+        m.get("role") == "user" and "Output limit reached" in m.get("content", "")
+        for m in captured_messages[1]
+    )
 
 
 @pytest.mark.asyncio
 async def test_length_recovery_streaming_calls_on_stream_end_with_resuming():
-    """During length recovery with streaming, on_stream_end should be called
-    with resuming=True so the hook knows the conversation is continuing."""
+    """Length recovery remains one continuous transport stream."""
     from nanobot.agent.hook import AgentHook, AgentHookContext
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
@@ -1345,9 +1439,35 @@ async def test_length_recovery_streaming_calls_on_stream_end_with_resuming():
         hook=StreamHook(),
     ))
 
-    assert len(stream_end_calls) == 2
-    assert stream_end_calls[0] is True   # length recovery: resuming
-    assert stream_end_calls[1] is False  # final response: done
+    assert stream_end_calls == [False]
+
+
+@pytest.mark.asyncio
+async def test_runner_disables_thinking_for_non_streaming_request():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    captured: dict = {}
+
+    async def chat_with_retry(**kwargs):
+        captured.update(kwargs)
+        return LLMResponse(content="done", finish_reason="stop", usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "go"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        disable_thinking=True,
+    ))
+
+    assert result.final_content == "done"
+    assert captured["disable_thinking"] is True
 
 
 @pytest.mark.asyncio
@@ -1380,7 +1500,13 @@ async def test_length_recovery_gives_up_after_max_retries():
     ))
 
     assert call_count["n"] == _MAX_LENGTH_RECOVERIES + 1
-    assert result.final_content is not None
+    assert result.final_content == "".join(
+        f"chunk{i}" for i in range(1, _MAX_LENGTH_RECOVERIES + 2)
+    )
+    assert all(
+        "Output limit reached" not in str(message.get("content", ""))
+        for message in result.messages
+    )
 
 
 # ---------------------------------------------------------------------------

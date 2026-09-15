@@ -107,7 +107,12 @@ class _LoopHook(AgentHook):
         self._stream_buf += delta
         new_clean = strip_think(self._stream_buf)
         incremental = new_clean[len(prev_clean) :]
-        if incremental and self._on_stream:
+        # Tool-call responses from reasoning models can contain only the
+        # template separator (usually ``"\n\n"``).  Do not create a visible
+        # stream until the model has produced non-whitespace content.  Once a
+        # stream has started, whitespace-only deltas are still forwarded so
+        # normal word spacing is preserved.
+        if incremental and new_clean.strip() and self._on_stream:
             await self._on_stream(incremental)
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
@@ -1029,7 +1034,10 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        if on_stream is not None and stop_reason != "error":
+        # ``empty_final_response`` is synthesized after the model stream has
+        # ended, so it was not delivered as deltas.  Leave it unmarked and let
+        # ChannelManager send the fallback as a regular message.
+        if on_stream is not None and stop_reason not in {"error", "empty_final_response"}:
             meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel,
@@ -1083,6 +1091,8 @@ class AgentLoop:
         from datetime import datetime
 
         for m in messages[skip:]:
+            if m.get("_nanobot_transient"):
+                continue
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):

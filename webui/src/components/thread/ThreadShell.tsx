@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { ThreadComposer } from "@/components/thread/ThreadComposer";
 import { ThreadHeader } from "@/components/thread/ThreadHeader";
 import { ThreadViewport } from "@/components/thread/ThreadViewport";
+import { Button } from "@/components/ui/button";
 import { useNanobotStream } from "@/hooks/useNanobotStream";
 import { useSessionHistory } from "@/hooks/useSessions";
 import type { ChatSummary, UIMessage } from "@/lib/types";
@@ -37,7 +38,12 @@ export function ThreadShell({
   const { t } = useTranslation();
   const chatId = session?.chatId ?? null;
   const historyKey = session?.key ?? null;
-  const { messages: historical, loading } = useSessionHistory(historyKey);
+  const {
+    messages: historical,
+    loading,
+    error: historyError,
+    retry: retryHistory,
+  } = useSessionHistory(historyKey);
   const { client, modelName } = useClient();
   const [booting, setBooting] = useState(false);
   const pendingFirstRef = useRef<string | null>(null);
@@ -51,7 +57,7 @@ export function ThreadShell({
     chatId,
     initial,
   );
-  const showHeroComposer = messages.length === 0 && !loading;
+  const showHeroComposer = messages.length === 0 && !loading && !historyError;
 
   useEffect(() => {
     if (!chatId || loading) return;
@@ -108,6 +114,21 @@ export function ThreadShell({
   const emptyState = loading ? (
     <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
       {t("thread.loadingConversation")}
+    </div>
+  ) : historyError ? (
+    <div
+      role="alert"
+      className="flex w-full flex-col items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-4"
+    >
+      <div>
+        <p className="text-sm font-medium text-foreground">
+          {t("thread.historyLoadFailed")}
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">{historyError}</p>
+      </div>
+      <Button variant="outline" size="sm" onClick={retryHistory}>
+        {t("thread.retryHistory")}
+      </Button>
     </div>
   ) : (
     <div className="flex w-full max-w-[40rem] flex-col gap-2 text-left animate-in fade-in-0 slide-in-from-bottom-2 duration-500">

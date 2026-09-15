@@ -52,6 +52,8 @@ function httpJson(body: unknown) {
 
 describe("ThreadShell", () => {
   beforeEach(() => {
+    delete (window as unknown as Record<string, unknown>).__NANOBOT_API_TOKEN__;
+    delete (window as unknown as Record<string, unknown>).__NANOBOT_API_URL__;
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -320,5 +322,54 @@ describe("ThreadShell", () => {
 
     await waitFor(() => expect(screen.getByText("from chat b")).toBeInTheDocument());
     expect(screen.queryByText("from chat a")).not.toBeInTheDocument();
+  });
+
+  it("shows a history error and retries without looking like a new chat", async () => {
+    const client = makeClient();
+    const onNewChat = vi.fn().mockResolvedValue("chat-a");
+    let attempts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (!String(input).includes("websocket%3Achat-a/messages")) {
+          return { ok: false, status: 404, json: async () => ({}) };
+        }
+        attempts += 1;
+        if (attempts === 1) {
+          return { ok: false, status: 503, json: async () => ({}) };
+        }
+        return httpJson({
+          key: "websocket:chat-a",
+          created_at: null,
+          updated_at: null,
+          messages: [{ role: "assistant", content: "history restored" }],
+        });
+      }),
+    );
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-a")}
+          title="Chat chat-a"
+          onToggleSidebar={() => {}}
+          onGoHome={() => {}}
+          onNewChat={onNewChat}
+        />,
+      ),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Couldn't load this conversation.",
+    );
+    expect(screen.getByText("HTTP 503")).toBeInTheDocument();
+    expect(screen.queryByText("Ask questions, continue local work, or start a new thread."))
+      .not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByText("history restored")).toBeInTheDocument();
+    expect(attempts).toBe(2);
   });
 });

@@ -1,4 +1,5 @@
 import type { ChatSummary } from "./types";
+import { authenticatedFetch } from "./auth";
 
 export class ApiError extends Error {
   status: number;
@@ -14,14 +15,7 @@ async function request<T>(
   token: string,
   init?: RequestInit,
 ): Promise<T> {
-  const res = await fetch(url, {
-    ...(init ?? {}),
-    headers: {
-      ...(init?.headers ?? {}),
-      Authorization: `Bearer ${token}`,
-    },
-    credentials: "same-origin",
-  });
+  const res = await authenticatedFetch(url, init, token);
   if (!res.ok) {
     throw new ApiError(res.status, `HTTP ${res.status}`);
   }

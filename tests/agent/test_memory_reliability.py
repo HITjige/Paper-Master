@@ -29,6 +29,7 @@ def test_dream_failure_restores_files_and_retains_cursor(tmp_path):
         content="[MEMORY] uncommitted candidate",
         finish_reason="stop",
     ))
+    provider.chat_structured_with_retry = provider.chat_with_retry
     dream = Dream(store=store, provider=provider, model="test")
 
     async def _failed_run(_spec):
@@ -77,6 +78,7 @@ def test_successful_dream_commits_scoped_structured_memory(tmp_path):
         content="[MEMORY] Project Atlas stores memory in SQLite",
         finish_reason="stop",
     ))
+    provider.chat_structured_with_retry = provider.chat_with_retry
     dream = Dream(store=store, provider=provider, model="test")
     dream._runner.run = AsyncMock(return_value=_run_result("completed"))
 

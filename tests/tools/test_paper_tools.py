@@ -3,9 +3,11 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from nanobot.agent.paper_kb import PaperKbConfig, PaperKnowledgeBase
+from nanobot.agent.tools import paper as paper_module
 from nanobot.agent.tools.paper import (
     KBRetrieveTool,
     PaperIngestTool,
@@ -14,6 +16,7 @@ from nanobot.agent.tools.paper import (
     PaperSimilarityTool,
     _ArxivRateLimiter,
     _build_arxiv_query,
+    _build_arxiv_query_group,
     _deduplicate_papers_by_identity,
     _extract_arxiv_ids,
     _parse_arxiv,
@@ -49,7 +52,10 @@ def test_uploaded_front_matter_extracts_deterministic_identifiers(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_paper_search_returns_ranked_results(tmp_path: Path, monkeypatch):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, embedding_model="", rerank_model=""),
+    )
     tool = PaperSearchTool(workspace=tmp_path, kb=kb)
 
     async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20, **kwargs):
@@ -156,6 +162,22 @@ def test_arxiv_query_builder_uses_fields_exact_id_and_date_range():
     assert _build_arxiv_query("arxiv:2401.12345v2") == "id:2401.12345v2"
 
 
+def test_arxiv_query_group_combines_variants_and_applies_date_once():
+    query = _build_arxiv_query_group(
+        [
+            ("EEG image reconstruction", ["guided diffusion"]),
+            ("brain signal decoding", ["visual generation"]),
+        ],
+        from_year=2024,
+        to_year=2026,
+    )
+
+    assert 'ti:"EEG image reconstruction"' in query
+    assert 'ti:"brain signal decoding"' in query
+    assert ") OR (" in query
+    assert query.count("submittedDate:") == 1
+
+
 def test_arxiv_ids_are_extracted_from_wrapped_queries_and_urls():
     assert _extract_arxiv_ids(
         "去外部搜索2511.14460v2这篇论文：https://arxiv.org/abs/2401.12345"
@@ -238,6 +260,65 @@ def test_arxiv_parser_uses_id_list_for_exact_lookup():
     assert "submittedDate" not in client.url
 
 
+@pytest.mark.asyncio
+async def test_arxiv_rate_limiter_serializes_complete_requests():
+    limiter = _ArxivRateLimiter(0)
+    active_requests = 0
+    max_active_requests = 0
+
+    async def _request():
+        nonlocal active_requests, max_active_requests
+        active_requests += 1
+        max_active_requests = max(max_active_requests, active_requests)
+        await asyncio.sleep(0.01)
+        active_requests -= 1
+        return type("Response", (), {"status_code": 200})()
+
+    await asyncio.gather(
+        limiter.request(_request),
+        limiter.request(_request),
+        limiter.request(_request),
+    )
+
+    assert max_active_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_arxiv_429_starts_shared_cooldown_without_immediate_retries():
+    limiter = _ArxivRateLimiter(0, default_cooldown_seconds=7)
+
+    class _Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, url):
+            self.calls += 1
+            request = httpx.Request("GET", url)
+            return httpx.Response(
+                429,
+                request=request,
+                headers={"Retry-After": "1"},
+            )
+
+    client = _Client()
+    first = await _parse_arxiv(
+        "EEG reconstruction",
+        client=client,
+        rate_limiter=limiter,
+    )
+    second = await _parse_arxiv(
+        "brain decoding",
+        client=client,
+        rate_limiter=limiter,
+    )
+
+    assert first.status == "rate_limited"
+    assert first.attempts == 1
+    assert first.retry_after_seconds >= 6.0
+    assert second.status == "rate_limited"
+    assert client.calls == 1
+
+
 def test_exact_id_search_bypasses_exclusion_and_semantic_rerank(
     tmp_path: Path,
     monkeypatch,
@@ -256,7 +337,10 @@ def test_exact_id_search_bypasses_exclusion_and_semantic_rerank(
         }]
 
     monkeypatch.setattr("nanobot.agent.tools.paper._parse_arxiv", _fake_parse_arxiv)
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, embedding_model="", rerank_model=""),
+    )
     tool = PaperSearchTool(workspace=tmp_path, kb=kb)
     payload = json.loads(asyncio.run(tool.execute(
         query="去外部搜索2511.14460v2这篇论文",
@@ -275,6 +359,40 @@ def test_exact_id_search_bypasses_exclusion_and_semantic_rerank(
     assert payload["results"][0]["identity_match"] is True
     assert calls[0][1]["paper_ids"] == ["2511.14460v2"]
     assert calls[0][1]["from_year"] is None
+
+
+def test_exact_id_search_batches_multiple_ids_in_one_request(
+    tmp_path: Path,
+    monkeypatch,
+):
+    calls = []
+
+    async def _fake_parse_arxiv(query, keywords=None, max_results=20, **kwargs):
+        calls.append(kwargs)
+        return [
+            {
+                "paper_id": paper_id,
+                "title": f"Paper {paper_id}",
+                "abstract": "Abstract",
+                "year": 2025,
+            }
+            for paper_id in kwargs["paper_ids"]
+        ]
+
+    monkeypatch.setattr("nanobot.agent.tools.paper._parse_arxiv", _fake_parse_arxiv)
+    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    tool = PaperSearchTool(workspace=tmp_path, kb=kb)
+    payload = json.loads(asyncio.run(tool.execute(
+        query="compare 2511.14460v2 and 2401.12345",
+        rerank_top_k=5,
+    )))
+
+    assert len(calls) == 1
+    assert calls[0]["paper_ids"] == ["2511.14460v2", "2401.12345"]
+    assert [paper["paper_id"] for paper in payload["results"]] == [
+        "2511.14460v2",
+        "2401.12345",
+    ]
 
 
 def test_external_search_filters_before_ranking_and_uses_balanced_routes(
@@ -296,11 +414,17 @@ def test_external_search_filters_before_ranking_and_uses_balanced_routes(
         ]
 
     monkeypatch.setattr("nanobot.agent.tools.paper._parse_arxiv", _fake_parse_arxiv)
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, embedding_model="", rerank_model=""),
+    )
     tool = PaperSearchTool(workspace=tmp_path, kb=kb)
     payload = json.loads(asyncio.run(tool.execute(
         query="latest RAG",
-        candidate_queries=["retrieval augmented generation"],
+        candidate_queries=[
+            "retrieval augmented generation",
+            "scientific question answering",
+        ],
         exclude_paper_ids=["2401.00001v3"],
         from_year=2024,
         to_year=2025,
@@ -310,13 +434,94 @@ def test_external_search_filters_before_ranking_and_uses_balanced_routes(
         rerank_top_k=10,
     )))
 
+    assert len(calls) == 2
     assert {call["sort_by"] for call in calls} == {"relevance", "submittedDate"}
+    assert all(len(call["query_variants"]) == 2 for call in calls)
     assert {paper["paper_id"] for paper in payload["results"]} == {
         "2402.00001v1",
         "2501.00001v1",
     }
     assert payload["excluded_total"] == 1
     assert payload["sort_mode"] == "balanced"
+
+
+def test_external_search_cache_is_shared_between_tool_instances(
+    tmp_path: Path,
+    monkeypatch,
+):
+    calls = 0
+
+    async def _fake_parse_arxiv(query, keywords=None, max_results=20, **kwargs):
+        nonlocal calls
+        calls += 1
+        return [{
+            "paper_id": "2401.12345",
+            "title": "Cached paper",
+            "abstract": "Shared arXiv cache result.",
+            "year": 2024,
+        }]
+
+    monkeypatch.setattr("nanobot.agent.tools.paper._parse_arxiv", _fake_parse_arxiv)
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, embedding_model="", rerank_model=""),
+    )
+    first = PaperSearchTool(workspace=tmp_path, kb=kb)
+
+    first_payload = json.loads(asyncio.run(first.execute(
+        query="cached retrieval",
+        candidate_queries=["cached retrieval"],
+    )))
+    cache_path = (tmp_path / "kb" / "arxiv_search_cache.json").resolve()
+    paper_module._ARXIV_SEARCH_CACHES.pop(str(cache_path), None)
+    second = PaperSearchTool(workspace=tmp_path, kb=kb)
+    second_payload = json.loads(asyncio.run(second.execute(
+        query="cached retrieval",
+        candidate_queries=["cached retrieval"],
+    )))
+
+    assert calls == 1
+    assert first_payload["results"]
+    assert second_payload["route_diagnostics"][0]["cached"] is True
+    assert cache_path.exists()
+
+
+def test_external_search_stops_remaining_routes_during_shared_cooldown(
+    tmp_path: Path,
+    monkeypatch,
+):
+    calls = 0
+
+    async def _fake_parse_arxiv(query, keywords=None, max_results=20, **kwargs):
+        nonlocal calls
+        calls += 1
+        return paper_module._ArxivSearchResult(
+            papers=[],
+            status="rate_limited",
+            query=query,
+            sort_by=kwargs["sort_by"],
+            error="429 Too Many Requests",
+            retry_after_seconds=300,
+        )
+
+    monkeypatch.setattr("nanobot.agent.tools.paper._parse_arxiv", _fake_parse_arxiv)
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, embedding_model="", rerank_model=""),
+    )
+    tool = PaperSearchTool(workspace=tmp_path, kb=kb)
+    payload = json.loads(asyncio.run(tool.execute(
+        query="latest EEG reconstruction",
+        candidate_queries=["EEG reconstruction"],
+        sort_mode="balanced",
+    )))
+
+    assert calls == 1
+    assert payload["search_status"] == "rate_limited"
+    assert payload["reason"] == "rate_limited"
+    assert payload["retry_after_seconds"] == 300
+    assert len(payload["route_diagnostics"]) == 2
+    assert payload["route_diagnostics"][1]["attempts"] == 0
 
 
 def test_multi_query_similarity_uses_translated_variant(tmp_path: Path):
@@ -442,7 +647,10 @@ def test_kb_retrieve_default_is_hybrid_and_omits_internal_embeddings(tmp_path: P
 
 @pytest.mark.asyncio
 async def test_similarity_and_rerank_accept_stateless_candidates(tmp_path: Path, monkeypatch):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, embedding_model="", rerank_model=""),
+    )
     search_tool = PaperSearchTool(workspace=tmp_path, kb=kb)
     sim_tool = PaperSimilarityTool(workspace=tmp_path, kb=kb)
     rerank_tool = PaperRerankTool(workspace=tmp_path, kb=kb)
@@ -489,7 +697,10 @@ async def test_similarity_and_rerank_accept_stateless_candidates(tmp_path: Path,
 
 @pytest.mark.asyncio
 async def test_paper_search_pipeline_mode(tmp_path: Path, monkeypatch):
-    kb = PaperKnowledgeBase(tmp_path, PaperKbConfig(enabled=True))
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, embedding_model="", rerank_model=""),
+    )
     tool = PaperSearchTool(workspace=tmp_path, kb=kb)
 
     async def _fake_parse_arxiv(query: str, keywords=None, max_results: int = 20, **kwargs):

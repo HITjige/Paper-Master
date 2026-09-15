@@ -12,7 +12,8 @@ import { useKnowledgeBase } from "@/hooks/useKnowledgeBase";
 import { useSessions } from "@/hooks/useSessions";
 import { useTheme } from "@/hooks/useTheme";
 import { cn } from "@/lib/utils";
-import { deriveWsUrl, fetchBootstrap } from "@/lib/bootstrap";
+import { refreshRuntimeAuth } from "@/lib/auth";
+import { deriveWsUrl } from "@/lib/bootstrap";
 import { NanobotClient } from "@/lib/nanobot-client";
 import { ClientProvider } from "@/providers/ClientProvider";
 import type { ChatSummary } from "@/lib/types";
@@ -49,25 +50,15 @@ export default function App() {
     let cancelled = false;
     (async () => {
       try {
-        const boot = await fetchBootstrap();
+        const boot = await refreshRuntimeAuth();
         if (cancelled) return;
-
-        // Expose the authenticated KB endpoint discovered during bootstrap.
-        if (boot.api_url) {
-          (window as unknown as Record<string, unknown>).__NANOBOT_API_URL__ = boot.api_url;
-        }
-        (window as unknown as Record<string, unknown>).__NANOBOT_API_TOKEN__ = boot.token;
 
         const url = deriveWsUrl(boot.ws_path, boot.token);
         const client = new NanobotClient({
           url,
           onReauth: async () => {
             try {
-              const refreshed = await fetchBootstrap();
-              if (refreshed.api_url) {
-                (window as unknown as Record<string, unknown>).__NANOBOT_API_URL__ = refreshed.api_url;
-              }
-              (window as unknown as Record<string, unknown>).__NANOBOT_API_TOKEN__ = refreshed.token;
+              const refreshed = await refreshRuntimeAuth();
               return deriveWsUrl(refreshed.ws_path, refreshed.token);
             } catch {
               return null;
