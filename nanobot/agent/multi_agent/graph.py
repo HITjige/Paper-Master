@@ -30,7 +30,12 @@ from nanobot.agent.multi_agent.conditions import (
     router_conditional,
 )
 from nanobot.agent.multi_agent.nodes import AgentNodes, create_nodes
-from nanobot.agent.multi_agent.state import MultiAgentState, create_initial_state
+from nanobot.agent.multi_agent.state import AgentConfig, MultiAgentState, create_initial_state
+from nanobot.utils.runtime import (
+    external_search_confirmation_prompt,
+    is_explicit_external_paper_search_request,
+    parse_external_search_confirmation,
+)
 
 if TYPE_CHECKING:
     from nanobot.agent.paper_kb import PaperKnowledgeBase
@@ -72,6 +77,12 @@ class MultiAgentGraph:
         self.kb = kb
         self.tools = tools
         self.config = config
+        self.agent_config = AgentConfig(
+            max_iterations=int(config.get("max_iterations", 3)),
+            retrieval_top_k=int(config.get("top_k", 5)),
+            retrieval_similarity_threshold=float(config.get("similarity_threshold", 0.2)),
+            external_ingest_limit=int(config.get("ingest_limit", 3)),
+        )
         self._progress_callback = progress_callback
         
         # Create nodes (pass progress_callback)
@@ -146,6 +157,7 @@ class MultiAgentGraph:
             NODE_RESEARCH,
             research_phase_conditional,
             {
+                "wait_for_search_confirmation": END,
                 "wait_for_selection": NODE_SYNTHESIS,   # Go to synthesis to show selection UI
                 "continue_ingest": NODE_RESEARCH,       # Self-loop to execute ingest phase
                 "to_retrieval": NODE_RETRIEVAL,
@@ -193,14 +205,14 @@ class MultiAgentGraph:
         """
         # Extract progress_callback from kwargs so it doesn't pollute state
         progress_callback = kwargs.pop("progress_callback", None)
-        if progress_callback is not None:
-            self.nodes._progress_callback = progress_callback
+        progress_token = self.nodes.bind_progress_callback(progress_callback)
         
         # Create initial state
         initial_state = create_initial_state(
             user_query=user_query,
             session_id=session_id,
-            kwargs=kwargs,
+            config=self.agent_config,
+            **kwargs,
         )
         
         # Apply any overrides (progress_callback already popped)
@@ -232,13 +244,17 @@ class MultiAgentGraph:
                 "final_answer": f"Error: {e}",
                 "is_complete": False,
             }
+        finally:
+            self.nodes.reset_progress_callback(progress_token)
 
     async def resume(
         self,
         saved_state: Dict[str, Any],
         user_input: str,
+        *,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> Dict[str, Any]:
-        """Resume a paused workflow with user's paper selection response.
+        """Resume a workflow paused for search consent or paper selection.
 
         Called when the workflow was paused at the "select" phase (waiting for
         user to choose papers for ingestion).  Parses the user's response,
@@ -264,46 +280,73 @@ class MultiAgentGraph:
             return await self.run(
                 user_query=saved_state.get("user_query", ""),
                 session_id=saved_state.get("session_id", ""),
+                progress_callback=progress_callback,
             )
 
-        logger.info(
-            "Resume: parsing user selection input='{}...' ({} papers available)",
-            user_input[:80],
-            len(saved_state.get("papers_for_selection", [])),
-        )
-
-        # 1. Parse user selection
-        parsed = await self.nodes._parse_selection_response(
-            user_input,
-            saved_state.get("papers_for_selection", []),
-        )
-
-        # 2. Build continuation state: carry forward all context needed
-        #    for the downstream nodes (synthesis, critic, retrieval)
         continuation = dict(saved_state)
+        if saved_state.get("research_phase") == "confirm_search":
+            decision = (
+                True
+                if is_explicit_external_paper_search_request(user_input)
+                else parse_external_search_confirmation(user_input)
+            )
+            if decision is None:
+                prompt = external_search_confirmation_prompt(
+                    str(saved_state.get("user_query") or "")
+                )
+                return {
+                    **continuation,
+                    "draft_answer": prompt,
+                    "final_answer": prompt,
+                    "awaiting_external_search_confirmation": True,
+                    "is_complete": False,
+                }
 
-        # Set resume mode flags so Router / Research skip ahead
-        continuation["resume_mode"] = True
-        continuation["resume_phase"] = "ingest"
-        # Set the research phase to ingest so research_node picks it up
-        continuation["research_phase"] = "ingest"
-
-        # Inject parsed user selection
-        continuation["user_selected_papers"] = parsed.get("user_selected_papers", [])
-        continuation["user_skip_ingest"] = parsed.get("user_skip_ingest", False)
-
-        # Ensure search_completed is set (needed by some conditional checks)
-        continuation["search_completed"] = True
-
-        logger.info(
-            "Resume: user_selected_papers={}, user_skip_ingest={}",
-            continuation["user_selected_papers"][:5],
-            continuation["user_skip_ingest"],
-        )
+            continuation["resume_mode"] = True
+            continuation["awaiting_external_search_confirmation"] = False
+            continuation["external_search_authorized"] = decision
+            if decision:
+                continuation["resume_phase"] = "search"
+                continuation["research_phase"] = "search"
+                continuation["search_completed"] = False
+                logger.info("Resume: user authorized external paper search")
+            else:
+                continuation["resume_phase"] = "decline_external_search"
+                continuation["research_phase"] = "complete"
+                continuation["external_search_completed"] = True
+                continuation["research_outcome"] = "skipped"
+                continuation["post_research_retrieval"] = False
+                logger.info("Resume: user declined external paper search")
+        else:
+            logger.info(
+                "Resume: parsing user selection input='{}...' ({} papers available)",
+                user_input[:80],
+                len(saved_state.get("papers_for_selection", [])),
+            )
+            parsed = await self.nodes._parse_selection_response(
+                user_input,
+                saved_state.get("papers_for_selection", []),
+            )
+            continuation["resume_mode"] = True
+            continuation["resume_phase"] = "ingest"
+            continuation["research_phase"] = "ingest"
+            continuation["user_selected_papers"] = parsed.get(
+                "user_selected_papers", []
+            )
+            continuation["user_skip_ingest"] = parsed.get(
+                "user_skip_ingest", False
+            )
+            continuation["search_completed"] = True
+            logger.info(
+                "Resume: user_selected_papers={}, user_skip_ingest={}",
+                continuation["user_selected_papers"][:5],
+                continuation["user_skip_ingest"],
+            )
 
         # 3. Run the graph with pre-filled state.
         #    The graph will flow: Router (skips via resume_mode) → Research
         #    (ingest phase) → Retrieval (post-research) → Synthesis → Critic.
+        progress_token = self.nodes.bind_progress_callback(progress_callback)
         try:
             final_state = await self.graph.ainvoke(continuation)
 
@@ -326,6 +369,8 @@ class MultiAgentGraph:
                 ),
                 "is_complete": False,
             }
+        finally:
+            self.nodes.reset_progress_callback(progress_token)
 
     @staticmethod
     def _validate_saved_state(state: Dict[str, Any]) -> bool:
@@ -337,11 +382,13 @@ class MultiAgentGraph:
         Returns:
             True if the state has all required keys for resume.
         """
-        required = {"papers_for_selection", "user_query", "research_phase"}
+        required = {"user_query", "research_phase"}
         if not required.issubset(state.keys()):
             missing = required - state.keys()
             logger.warning("Resume validation: missing keys: {}", missing)
             return False
+        if state.get("research_phase") == "confirm_search":
+            return True
         papers = state.get("papers_for_selection", [])
         if not isinstance(papers, list) or not papers:
             logger.warning("Resume validation: papers_for_selection is empty or not a list")
@@ -432,6 +479,12 @@ class SimpleMultiAgentRunner:
         self.kb = kb
         self.tools = tools
         self.config = config
+        self.agent_config = AgentConfig(
+            max_iterations=int(config.get("max_iterations", 3)),
+            retrieval_top_k=int(config.get("top_k", 5)),
+            retrieval_similarity_threshold=float(config.get("similarity_threshold", 0.2)),
+            external_ingest_limit=int(config.get("ingest_limit", 3)),
+        )
         self.nodes = create_nodes(provider, kb, tools, **config)
     
     async def run(
@@ -441,7 +494,7 @@ class SimpleMultiAgentRunner:
         **kwargs,
     ) -> Dict[str, Any]:
         """Run simple sequential workflow."""
-        state = create_initial_state(user_query, session_id)
+        state = create_initial_state(user_query, session_id, config=self.agent_config)
         state.update(kwargs)
         
         try:

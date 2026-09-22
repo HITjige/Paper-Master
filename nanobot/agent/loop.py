@@ -36,8 +36,8 @@ from nanobot.agent.tools.paper import (
 )
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
-from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -49,7 +49,10 @@ from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
-from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+from nanobot.utils.runtime import (
+    EMPTY_FINAL_RESPONSE_MESSAGE,
+    external_search_confirmation_prompt,
+)
 
 # Multi-agent system imports
 try:
@@ -71,8 +74,6 @@ _PAPER_TOOL_NAMES = frozenset({
     "paper_ingest",
     "kb_retrieve",
 })
-
-
 class _LoopHook(AgentHook):
     """Core hook for the main loop."""
 
@@ -112,7 +113,11 @@ class _LoopHook(AgentHook):
         # stream until the model has produced non-whitespace content.  Once a
         # stream has started, whitespace-only deltas are still forwarded so
         # normal word spacing is preserved.
-        if incremental and new_clean.strip() and self._on_stream:
+        if (
+            incremental
+            and new_clean.strip()
+            and self._on_stream
+        ):
             await self._on_stream(incremental)
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
@@ -141,10 +146,14 @@ class _LoopHook(AgentHook):
     async def after_iteration(self, context: AgentHookContext) -> None:
         u = context.usage or {}
         logger.debug(
-            "LLM usage: prompt={} completion={} cached={}",
+            "LLM usage: prompt={} completion={} cached={} finish_reason={} "
+            "reasoning_chars={} tool_calls={}",
             u.get("prompt_tokens", 0),
             u.get("completion_tokens", 0),
             u.get("cached_tokens", 0),
+            context.response.finish_reason if context.response else "unknown",
+            len(context.response.reasoning_content or "") if context.response else 0,
+            len(context.tool_calls),
         )
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
@@ -375,9 +384,13 @@ class AgentLoop:
                         provider=self.provider,
                         kb=self.kb,
                         tools=paper_tools,
+                        model=self.model,
+                        provider_retry_mode=self.provider_retry_mode,
+                        context_window_tokens=self.context_window_tokens,
+                        max_completion_tokens=self.provider.generation.max_tokens,
                         max_iterations=3,
                         similarity_threshold=paper_cfg.retrieval_min_relevance_score,
-                        top_k=self.tools_config.paper.auto_context_top_k or 5,
+                        top_k=paper_cfg.retrieval_top_k,
                         ingest_limit=3,
                         memory_store=self.context.memory,
                     )
@@ -425,7 +438,14 @@ class AgentLoop:
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
         if self.tools_config.paper.enable:
-            self.tools.register(PaperSearchTool(workspace=self.workspace, kb=self.kb))
+            self.tools.register(
+                PaperSearchTool(
+                    workspace=self.workspace,
+                    kb=self.kb,
+                    provider=self.provider,
+                    model=self.model,
+                )
+            )
             self.tools.register(PaperSimilarityTool(workspace=self.workspace, kb=self.kb))
             self.tools.register(PaperRerankTool(workspace=self.workspace, kb=self.kb))
             self.tools.register(
@@ -442,7 +462,14 @@ class AgentLoop:
                     max_pdf_text_chars=self.tools_config.paper.max_pdf_text_chars,
                 )
             )
-            self.tools.register(KBRetrieveTool(workspace=self.workspace, kb=self.kb))
+            self.tools.register(
+                KBRetrieveTool(
+                    workspace=self.workspace,
+                    kb=self.kb,
+                    provider=self.provider,
+                    model=self.model,
+                )
+            )
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -893,14 +920,9 @@ class AgentLoop:
 
         session, pending = self.auto_compact.prepare_session(session, key)
 
-        # Slash commands
-        raw = msg.content.strip()
-        ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
-        if result := await self.commands.dispatch(ctx):
-            return result
-
-        # --- Define _bus_progress BEFORE the multi-agent check so
-        # process_with_multi_agent can relay progress to the bus. ---
+        # Define the bus-backed progress callback before slash-command
+        # dispatch so command handlers such as /multi-agent can relay the same
+        # progress events as automatically routed requests.
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
@@ -913,6 +935,22 @@ class AgentLoop:
                     metadata=meta,
                 )
             )
+
+        # Slash commands
+        raw = msg.content.strip()
+        ctx = CommandContext(
+            msg=msg,
+            session=session,
+            key=key,
+            raw=raw,
+            loop=self,
+            on_progress=on_progress or _bus_progress,
+            on_stream=on_stream,
+            on_stream_end=on_stream_end,
+            session_summary=pending,
+        )
+        if result := await self.commands.dispatch(ctx):
+            return result
 
         # Choose the execution path using both the current query and recent
         # paper-session context. A lexical check alone cannot recognize
@@ -932,7 +970,10 @@ class AgentLoop:
                 session_key=key,
                 channel=msg.channel,
                 chat_id=msg.chat_id,
+                media=msg.media if msg.media else None,
                 on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
                 session_summary=pending,
                 orchestrator_context=orchestrator_context,
             )
@@ -957,6 +998,47 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
+        if self._has_paper_novelty_signal(msg.content):
+            presented_ids = list(session.metadata.get(
+                self._MULTI_AGENT_PRESENTED_PAPER_IDS_KEY,
+                [],
+            ) or [])
+            if not presented_ids:
+                for history_message in reversed(history):
+                    if history_message.get("role") != "assistant":
+                        continue
+                    presented_ids.extend(re.findall(
+                        r"\[([A-Za-z0-9][A-Za-z0-9._:/-]{1,127})\](?!\()",
+                        str(history_message.get("content") or ""),
+                    ))
+                    if len(presented_ids) >= 50:
+                        break
+            presented_ids = list(dict.fromkeys(
+                str(paper_id).strip()
+                for paper_id in presented_ids
+                if str(paper_id).strip()
+            ))[-50:]
+            if presented_ids:
+                novelty_context = (
+                    "<paper_novelty_context>\n"
+                    "The user asked for other/additional papers. Previously presented "
+                    f"paper IDs: {json.dumps(presented_ids, ensure_ascii=False)}.\n"
+                    "When calling kb_retrieve or paper_search, pass these IDs via "
+                    "exclude_paper_ids unless the user explicitly requested one of them.\n"
+                    "</paper_novelty_context>"
+                )
+                for message in reversed(initial_messages):
+                    if message.get("role") != "user":
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        message["content"] = f"{content}\n\n{novelty_context}"
+                    elif isinstance(content, list):
+                        message["content"] = [
+                            *content,
+                            {"type": "text", "text": novelty_context},
+                        ]
+                    break
 
         async def _on_retry_wait(content: str) -> None:
             meta = dict(msg.metadata or {})
@@ -1002,7 +1084,7 @@ class AgentLoop:
         # Skip the already-persisted user message when saving the turn
         save_skip = 1 + len(history) + (1 if user_persisted_early else 0)
         self._save_turn(session, all_msgs, save_skip)
-        paper_tools_used = [name for name in tools_used if name in _PAPER_TOOL_NAMES]
+        paper_tools_used = [name for name in (tools_used or []) if name in _PAPER_TOOL_NAMES]
         if paper_tools_used:
             paper_refs = self._paper_references_from_tool_messages(all_msgs)
             self._remember_multi_agent_context(
@@ -1010,6 +1092,10 @@ class AgentLoop:
                 {
                     "routing_decision": "single_agent_paper_tools",
                     "retrieval_results": paper_refs,
+                    "citations": [],
+                    "final_answer": final_content,
+                    "resolved_topic": msg.content,
+                    "discovery_request": self._has_explicit_paper_signal(msg.content),
                 },
                 paper_tools_used,
             )
@@ -1037,7 +1123,10 @@ class AgentLoop:
         # ``empty_final_response`` is synthesized after the model stream has
         # ended, so it was not delivered as deltas.  Leave it unmarked and let
         # ChannelManager send the fallback as a regular message.
-        if on_stream is not None and stop_reason not in {"error", "empty_final_response"}:
+        if (
+            on_stream is not None
+            and stop_reason not in {"error", "empty_final_response"}
+        ):
             meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel,
@@ -1299,9 +1388,11 @@ class AgentLoop:
             "sub_queries_detail", "extracted_entities",
             "referenced_papers", "requires_clarification",
             "explicit_paper_ids", "external_search_requested",
+            "external_search_authorized", "awaiting_external_search_confirmation",
             "novelty_required", "discovery_request",
             "presented_paper_ids", "last_search_topic", "resolved_topic",
             "external_search_completed", "post_research_retrieval",
+            "critic_triggered_research",
             "research_outcome", "novelty_excluded_count",
             "iteration_count", "max_iterations",
             "user_query", "session_id",
@@ -1315,13 +1406,209 @@ class AgentLoop:
         }
         return {k: v for k, v in state.items() if k in SAVABLE_KEYS and v is not None}
 
+    async def _pause_multi_agent_result(
+        self,
+        *,
+        session: Session,
+        result: dict[str, Any],
+        channel: str,
+        chat_id: str,
+        on_progress: Callable[[str], Awaitable[None]] | None,
+        on_stream: Callable[[str], Awaitable[None]] | None,
+        on_stream_end: Callable[..., Awaitable[None]] | None,
+    ) -> OutboundMessage | None:
+        """Persist and deliver either external-search consent or paper selection UI."""
+        phase = str(result.get("research_phase") or "")
+        if phase == "confirm_search":
+            response = str(
+                result.get("final_answer")
+                or result.get("draft_answer")
+                or external_search_confirmation_prompt(
+                    str(result.get("user_query") or "")
+                )
+            ).strip()
+            progress_text = "⏸️ 工作流暂停，等待用户确认是否进行外部搜索"
+            metadata: dict[str, Any] = {
+                "multi_agent": True,
+                "awaiting_external_search_confirmation": True,
+                "routing_decision": result.get("routing_decision", "unknown"),
+            }
+            sources = ["internal_kb"] if result.get("retrieval_results") else []
+        elif phase == "select" and result.get("papers_for_selection"):
+            response = str(
+                result.get("final_answer") or result.get("draft_answer") or ""
+            ).strip()
+            if not response:
+                response = (
+                    "📚 Paper search completed. Please choose which papers "
+                    "to ingest (reply with paper IDs, `skip`, or `all`)."
+                )
+            progress_text = "⏸️ 工作流暂停，等待用户选择论文"
+            metadata = {
+                "multi_agent": True,
+                "awaiting_selection": True,
+                "routing_decision": result.get("routing_decision", "unknown"),
+            }
+            sources = ["external_search"]
+        else:
+            return None
+
+        session.metadata["multi_agent_paused_state"] = self._extract_savable_state(result)
+        if response:
+            session.add_message("assistant", response)
+        self._clear_pending_user_turn(session)
+        self._remember_multi_agent_context(session, result, sources)
+        self.sessions.save(session)
+
+        logger.info(
+            "process_with_multi_agent: paused at {} phase",
+            phase,
+        )
+        if on_progress:
+            await on_progress(progress_text)
+        if await self._deliver_multi_agent_stream(response, on_stream, on_stream_end):
+            metadata["_streamed"] = True
+        return OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=response,
+            metadata=metadata,
+        )
+
+    def _build_multi_agent_context_snapshot(
+        self,
+        *,
+        content: str,
+        history: list[dict[str, Any]],
+        channel: str,
+        chat_id: str,
+        session_summary: str | None,
+        media: list[str] | None,
+    ) -> dict[str, Any]:
+        """Build one bounded context snapshot shared by all graph nodes.
+
+        The snapshot is taken before the current user message is persisted, so
+        ``recent_dialog_context`` never repeats ``user_query``. Legacy memory
+        slots carry inclusion markers to avoid duplicating the common system
+        context; direct graph callers can still populate those slots normally.
+        """
+        node_history_chars = int(
+            self.tools_config.paper.multi_agent_node_history_chars or 0
+        )
+        recent_dialog = self._truncate_context(
+            self._format_recent_dialog(history, max_turns=500),
+            node_history_chars,
+        )
+        recent_dialog = self.context.context_budget.truncate_text(
+            recent_dialog,
+            max(256, int(self.context.context_budget.budget.prompt_tokens * 0.12)),
+            keep_tail=True,
+        )
+        router_short = self._truncate_context(
+            self._format_recent_dialog(
+                history,
+                max_turns=self.tools_config.paper.router_short_history_turns,
+            ),
+            self.tools_config.paper.router_short_memory_chars,
+        )
+
+        long_term_memory = self._truncate_context(
+            self.context.memory.read_memory(), node_history_chars
+        )
+        user_profile = self._truncate_context(
+            self.context.memory.read_user(), node_history_chars
+        )
+        soul_context = self._truncate_context(
+            self.context.memory.read_soul(), node_history_chars
+        )
+        session_summary_context = self._truncate_context(
+            session_summary or "", node_history_chars
+        )
+        session_summary_context = self.context.context_budget.truncate_text(
+            session_summary_context,
+            max(256, int(self.context.context_budget.budget.prompt_tokens * 0.10)),
+            keep_tail=True,
+        )
+        memory_scope = f"{channel}:{chat_id}" if channel and chat_id else None
+        shared_system_context = self.context.build_system_prompt(
+            channel=channel,
+            memory_query=content,
+            memory_scope=memory_scope,
+        )
+        runtime_context = self.context._build_runtime_context(
+            channel,
+            chat_id,
+            self.context.timezone,
+            session_summary=session_summary_context,
+        )
+
+        media_context: list[dict[str, Any]] = []
+        if media:
+            built_media = self.context._build_user_content("", media)
+            if isinstance(built_media, list):
+                media_context = [
+                    block
+                    for block in built_media
+                    if isinstance(block, dict) and block.get("type") != "text"
+                ]
+
+        return {
+            "shared_system_context": shared_system_context,
+            "runtime_context": runtime_context,
+            "media_context": media_context,
+            "router_memory_short": router_short or "(empty)",
+            "router_memory_long": self._truncate_context(
+                session_summary_context or long_term_memory,
+                self.tools_config.paper.router_long_memory_chars,
+            ) or "(empty)",
+            "recent_dialog_context": recent_dialog or "(empty)",
+            "long_term_memory_context": (
+                "(included in shared system context)" if long_term_memory else "(empty)"
+            ),
+            "user_profile_context": (
+                "(included in shared system context)" if user_profile else "(empty)"
+            ),
+            "soul_context": (
+                "(included in shared system context)" if soul_context else "(empty)"
+            ),
+            "session_summary_context": (
+                "(included in runtime context)" if session_summary_context else "(empty)"
+            ),
+        }
+
+    @staticmethod
+    async def _deliver_multi_agent_stream(
+        content: str,
+        on_stream: Callable[[str], Awaitable[None]] | None,
+        on_stream_end: Callable[..., Awaitable[None]] | None,
+    ) -> bool:
+        """Deliver the reviewed graph result through the normal stream channel.
+
+        Multi-agent synthesis must finish critic review before anything is
+        user-visible, so the reviewed response is emitted as one final delta.
+        """
+        if on_stream is None or not content:
+            return False
+        delivered = False
+        try:
+            await on_stream(content)
+            delivered = True
+            if on_stream_end is not None:
+                await on_stream_end(resuming=False)
+        except Exception as exc:
+            logger.debug("Multi-agent stream delivery failed: {}", exc)
+        return delivered
+
     async def process_with_multi_agent(
         self,
         content: str,
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        media: list[str] | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
         session_summary: str | None = None,
         orchestrator_context: dict[str, Any] | None = None,
     ) -> OutboundMessage | None:
@@ -1352,10 +1639,18 @@ class AgentLoop:
                 session_key=session_key,
                 channel=channel,
                 chat_id=chat_id,
+                media=media,
                 on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
             )
 
         session = self.sessions.get_or_create(session_key)
+        await self.consolidator.maybe_consolidate_by_tokens(
+            session,
+            session_summary=session_summary,
+        )
+        history = session.get_history(max_messages=0)
 
         # ------------------------------------------------------------------
         # Check for paused state — resume mode
@@ -1380,6 +1675,20 @@ class AgentLoop:
             if on_progress:
                 await on_progress("🔄 收到选择，继续处理论文...")
 
+            resume_query = "\n".join(filter(None, [
+                str(paused_state.get("user_query") or "").strip(),
+                content.strip(),
+            ]))
+            context_snapshot = self._build_multi_agent_context_snapshot(
+                content=resume_query,
+                history=history,
+                channel=channel,
+                chat_id=chat_id,
+                session_summary=session_summary,
+                media=media,
+            )
+            paused_state = {**paused_state, **context_snapshot}
+
             # Persist the user's selection message so the conversation
             # history stays coherent across turns.
             if content.strip():
@@ -1392,9 +1701,24 @@ class AgentLoop:
             result = await self._multi_agent_graph.resume(
                 saved_state=paused_state,
                 user_input=content,
+                progress_callback=on_progress,
             )
 
-            final_answer = result.get("final_answer", "")
+            paused_response = await self._pause_multi_agent_result(
+                session=session,
+                result=result,
+                channel=channel,
+                chat_id=chat_id,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            )
+            if paused_response is not None:
+                return paused_response
+
+            final_answer = str(result.get("final_answer") or "").strip()
+            if not final_answer:
+                final_answer = EMPTY_FINAL_RESPONSE_MESSAGE
             routing_decision = result.get("routing_decision", "unknown")
             iteration_count = result.get("iteration_count", 0)
 
@@ -1428,23 +1752,26 @@ class AgentLoop:
             full_response = "".join(response_parts)
 
             # Persist assistant response into session history
-            if final_answer.strip():
-                persisted_answer = self._multi_agent_persisted_answer(
-                    final_answer=final_answer,
-                    citations=citations,
-                    full_response=full_response,
-                )
-                session.add_message("assistant", persisted_answer)
-                self._clear_pending_user_turn(session)
-                self._remember_multi_agent_context(session, result, metadata["sources_used"])
-                self.sessions.save(session)
-                self._schedule_background(
-                    self.consolidator.maybe_consolidate_by_tokens(session)
-                )
-                self._schedule_skill_extraction(
-                    result,
-                    str(result.get("user_query") or paused_state.get("user_query", "")),
-                )
+            persisted_answer = self._multi_agent_persisted_answer(
+                final_answer=final_answer,
+                citations=citations,
+                full_response=full_response,
+            )
+            session.add_message("assistant", persisted_answer)
+            self._clear_pending_user_turn(session)
+            self._remember_multi_agent_context(session, result, metadata["sources_used"])
+            self.sessions.save(session)
+            self._schedule_background(
+                self.consolidator.maybe_consolidate_by_tokens(session)
+            )
+            self._schedule_skill_extraction(
+                result,
+                str(result.get("user_query") or paused_state.get("user_query", "")),
+            )
+            if await self._deliver_multi_agent_stream(
+                full_response, on_stream, on_stream_end
+            ):
+                metadata["_streamed"] = True
 
             return OutboundMessage(
                 channel=channel,
@@ -1468,36 +1795,17 @@ class AgentLoop:
                 self._mark_pending_user_turn(session)
                 self.sessions.save(session)
 
-            history = session.get_history(max_messages=0)
-
-            recent_dialog = self._format_recent_dialog(history, max_turns=500)
-            node_history_chars = int(self.tools_config.paper.multi_agent_node_history_chars or 0)
-            recent_dialog = self._truncate_context(recent_dialog, node_history_chars)
-
-            router_short = self._format_recent_dialog(
-                history,
-                max_turns=self.tools_config.paper.router_short_history_turns,
+            context_snapshot = self._build_multi_agent_context_snapshot(
+                content=content,
+                history=history,
+                channel=channel,
+                chat_id=chat_id,
+                session_summary=session_summary,
+                media=media,
             )
-            router_short = self._truncate_context(
-                router_short,
-                self.tools_config.paper.router_short_memory_chars,
-            )
-
-            long_term_memory = self.context.memory.read_memory()
-            user_profile = self.context.memory.read_user()
-            soul_context = self.context.memory.read_soul()
-            session_summary_context = session_summary or ""
-            long_term_memory = self._truncate_context(long_term_memory, node_history_chars)
-            user_profile = self._truncate_context(user_profile, node_history_chars)
-            soul_context = self._truncate_context(soul_context, node_history_chars)
-            session_summary_context = self._truncate_context(session_summary_context, node_history_chars)
 
             last_routing_decision = str(
                 session.metadata.get(self._MULTI_AGENT_LAST_ROUTING_KEY) or "none"
-            )
-            router_long = self._truncate_context(
-                session_summary_context or long_term_memory,
-                self.tools_config.paper.router_long_memory_chars,
             )
             gate_context = dict(orchestrator_context or {})
             active_papers = session.metadata.get(
@@ -1514,8 +1822,7 @@ class AgentLoop:
                 user_query=content,
                 session_id=session_key,
                 progress_callback=on_progress,
-                router_memory_short=router_short or "(empty)",
-                router_memory_long=router_long or "(empty)",
+                **context_snapshot,
                 last_routing_decision=last_routing_decision,
                 routing_context={
                     "active_papers": active_papers,
@@ -1530,71 +1837,26 @@ class AgentLoop:
                     gate_context.get("orchestrator_confidence", 0.0) or 0.0
                 ),
                 retrieval_judge_margin=self.tools_config.paper.multi_agent_retrieval_judge_margin,
-                recent_dialog_context=recent_dialog or "(empty)",
-                long_term_memory_context=long_term_memory or "(empty)",
-                user_profile_context=user_profile or "(empty)",
-                soul_context=soul_context or "(empty)",
-                session_summary_context=session_summary_context or "(empty)",
             )
 
-            # ------------------------------------------------------------------
-            # Pause check: if workflow stopped at "select" phase for user input
-            # ------------------------------------------------------------------
-            if (
-                result.get("research_phase") == "select"
-                and result.get("papers_for_selection")
-            ):
-                # Save minimal state so the next turn can resume
-                savable = self._extract_savable_state(result)
-                session.metadata["multi_agent_paused_state"] = savable
-                self.sessions.save(session)
-
-                logger.info(
-                    "process_with_multi_agent: paused at select phase, "
-                    "saved state with {} papers for selection",
-                    len(result["papers_for_selection"]),
-                )
-
-                if on_progress:
-                    await on_progress("⏸️ 工作流暂停，等待用户选择论文")
-
-                # The draft_answer from the workflow IS the selection UI
-                selection_ui = result.get("final_answer", "") or result.get("draft_answer", "")
-                if not selection_ui:
-                    selection_ui = (
-                        "📚 Paper search completed. Please choose which papers "
-                        "to ingest (reply with paper IDs, `skip`, or `all`)."
-                    )
-
-                # Persist the selection UI as an assistant message so the
-                # conversation history stays coherent and the pending user
-                # turn is properly closed — avoids the "Task interrupted
-                # before a response was generated" error on the next turn.
-                if selection_ui.strip():
-                    session.add_message("assistant", selection_ui)
-                    self._clear_pending_user_turn(session)
-                    self._remember_multi_agent_context(
-                        session,
-                        result,
-                        ["external_search"] if result.get("external_papers") else [],
-                    )
-                    self.sessions.save(session)
-
-                return OutboundMessage(
-                    channel=channel,
-                    chat_id=chat_id,
-                    content=selection_ui,
-                    metadata={
-                        "multi_agent": True,
-                        "awaiting_selection": True,
-                        "routing_decision": result.get("routing_decision", "unknown"),
-                    },
-                )
+            paused_response = await self._pause_multi_agent_result(
+                session=session,
+                result=result,
+                channel=channel,
+                chat_id=chat_id,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            )
+            if paused_response is not None:
+                return paused_response
 
             # ------------------------------------------------------------------
             # Normal completion — format and return final answer
             # ------------------------------------------------------------------
-            final_answer = result.get("final_answer", "")
+            final_answer = str(result.get("final_answer") or "").strip()
+            if not final_answer:
+                final_answer = EMPTY_FINAL_RESPONSE_MESSAGE
             routing_decision = result.get("routing_decision", "unknown")
             iteration_count = result.get("iteration_count", 0)
 
@@ -1629,20 +1891,23 @@ class AgentLoop:
             full_response = "".join(response_parts)
 
             # Persist assistant response into session history
-            if final_answer.strip():
-                persisted_answer = self._multi_agent_persisted_answer(
-                    final_answer=final_answer,
-                    citations=citations,
-                    full_response=full_response,
-                )
-                session.add_message("assistant", persisted_answer)
-                self._clear_pending_user_turn(session)
-                self._remember_multi_agent_context(session, result, metadata["sources_used"])
-                self.sessions.save(session)
-                self._schedule_background(
-                    self.consolidator.maybe_consolidate_by_tokens(session)
-                )
-                self._schedule_skill_extraction(result, content)
+            persisted_answer = self._multi_agent_persisted_answer(
+                final_answer=final_answer,
+                citations=citations,
+                full_response=full_response,
+            )
+            session.add_message("assistant", persisted_answer)
+            self._clear_pending_user_turn(session)
+            self._remember_multi_agent_context(session, result, metadata["sources_used"])
+            self.sessions.save(session)
+            self._schedule_background(
+                self.consolidator.maybe_consolidate_by_tokens(session)
+            )
+            self._schedule_skill_extraction(result, content)
+            if await self._deliver_multi_agent_stream(
+                full_response, on_stream, on_stream_end
+            ):
+                metadata["_streamed"] = True
 
             return OutboundMessage(
                 channel=channel,
@@ -1653,13 +1918,25 @@ class AgentLoop:
 
         except Exception as e:
             logger.error("Multi-agent workflow failed: {}", e)
-            # Fallback to standard processing
-            return await self.process_direct(
-                content=content,
-                session_key=session_key,
+            error_response = (
+                "The multi-agent workflow failed before it could produce an answer. "
+                "Please try again."
+            )
+            if not session.messages or session.messages[-1].get("role") != "user":
+                session.add_message("user", content)
+            session.add_message("assistant", error_response)
+            self._clear_pending_user_turn(session)
+            self.sessions.save(session)
+            metadata = {"multi_agent": True, "error": True}
+            if await self._deliver_multi_agent_stream(
+                error_response, on_stream, on_stream_end
+            ):
+                metadata["_streamed"] = True
+            return OutboundMessage(
                 channel=channel,
                 chat_id=chat_id,
-                on_progress=on_progress,
+                content=error_response,
+                metadata=metadata,
             )
     
     async def kb_ingest_local(
@@ -1712,7 +1989,15 @@ class AgentLoop:
         try:
             from nanobot.agent.skill_extractor import SkillExtractor
 
-            result_snapshot = dict(result)
+            result_snapshot = {
+                key: value
+                for key, value in result.items()
+                if key not in {
+                    "shared_system_context",
+                    "runtime_context",
+                    "media_context",
+                }
+            }
             result_snapshot["user_query"] = user_query
             extractor = SkillExtractor(
                 store=self.context.memory,
@@ -1905,6 +2190,7 @@ class AgentLoop:
                 temperature=0.0,
                 max_tokens=256,
                 disable_thinking=True,
+                retry_mode=self.provider_retry_mode,
             )
             if response.finish_reason == "error":
                 raise RuntimeError(response.content or "route classifier failed")

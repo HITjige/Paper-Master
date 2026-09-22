@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,6 +17,17 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
+
+
+def test_post_kb_empty_response_retry_prefers_sufficient_internal_evidence() -> None:
+    from nanobot.utils.runtime import build_post_tool_continuation_message
+
+    message = build_post_tool_continuation_message(["kb_retrieve"])
+
+    assert "quality and next_action" in message["content"]
+    assert "do not call paper_search" in message["content"]
+    assert "explicitly requested latest" in message["content"]
+    assert "ask the user for permission and wait" in message["content"]
 
 
 def _make_injection_callback(queue: asyncio.Queue):
@@ -289,6 +301,199 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
     assert streamed == ["he", "llo"]
     assert endings == [False]
     provider.chat_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runner_repairs_contaminated_tool_call_before_logging_or_execution():
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    requests: list[dict] = []
+    malformed = ToolCallRequest(
+        id="bad-1",
+        name="kb_retrieve",
+        arguments={
+            "entities": (
+                '[{"paper_id": "a1836846a2a6", "query":\n'
+                "</think>\n\n<tool_call>\n<function=kb_retrieve>"
+            ),
+        },
+    )
+    repaired = ToolCallRequest(
+        id="fixed-1",
+        name="kb_retrieve",
+        arguments={
+            "query": "Detailed interpretation of the target paper",
+            "entities": [{"paper_id": "a1836846a2a6"}],
+            "retrieval_mode": "hybrid",
+        },
+    )
+
+    async def chat_with_retry(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return LLMResponse(
+                content=None,
+                tool_calls=[malformed],
+                finish_reason="stop",
+                usage={"prompt_tokens": 21_327, "completion_tokens": 8192},
+                reasoning_content="x" * 100,
+            )
+        if len(requests) == 2:
+            return LLMResponse(
+                content=None,
+                tool_calls=[repaired],
+                finish_reason="tool_calls",
+                usage={"completion_tokens": 24},
+            )
+        return LLMResponse(
+            content="grounded answer",
+            usage={"completion_tokens": 10},
+        )
+
+    provider.chat_with_retry = chat_with_retry
+    tool = MagicMock()
+    tool.execute = AsyncMock(return_value='{"results": [{"paper_id": "a1836846a2a6"}]}')
+    tools = MagicMock()
+    tools.get_definitions.return_value = [{
+        "type": "function",
+        "function": {
+            "name": "kb_retrieve",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "entities": {"type": "array"},
+                },
+                "required": ["query"],
+            },
+        },
+    }]
+
+    def prepare_call(name, arguments):
+        if (
+            name == "kb_retrieve"
+            and isinstance(arguments.get("query"), str)
+            and isinstance(arguments.get("entities"), list)
+        ):
+            return tool, arguments, None
+        return tool, arguments, (
+            "Error: Invalid parameters for tool 'kb_retrieve': "
+            "missing required query; entities should be array"
+        )
+
+    tools.prepare_call.side_effect = prepare_call
+    validated_calls: list[ToolCallRequest] = []
+
+    class RecordingHook(AgentHook):
+        async def before_execute_tools(self, context: AgentHookContext) -> None:
+            validated_calls.extend(context.tool_calls)
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[
+            {"role": "user", "content": "详细解读第二篇论文"},
+        ],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        hook=RecordingHook(),
+    ))
+
+    assert result.final_content == "grounded answer"
+    assert result.tools_used == ["kb_retrieve"]
+    assert validated_calls == [repaired]
+    tool.execute.assert_awaited_once()
+    assert result.usage["completion_tokens"] == 8226
+    assert len(requests) == 3
+    repair_request = requests[1]
+    assert repair_request["max_tokens"] == 1024
+    assert repair_request["temperature"] == 0.0
+    assert repair_request["reasoning_effort"] is None
+    assert repair_request["disable_thinking"] is True
+    assert repair_request["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "kb_retrieve"},
+    }
+    assert len(repair_request["tools"]) == 1
+    assert "a1836846a2a6" in repair_request["messages"][-1]["content"]
+    assert not any(
+        message.get("role") == "assistant"
+        and "</think>" in json.dumps(message, ensure_ascii=False)
+        for message in result.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_recovers_after_silent_stream_timeout_without_long_reasoning():
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    stream_cancelled = asyncio.Event()
+
+    async def chat_stream_with_retry(**kwargs):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            stream_cancelled.set()
+            raise
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="recovered answer",
+        finish_reason="stop",
+        usage={"completion_tokens": 8},
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    streamed: list[str] = []
+    endings: list[bool] = []
+    progress: list[str] = []
+
+    async def on_progress(message: str) -> None:
+        progress.append(message)
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+        async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+            streamed.append(delta)
+
+        async def on_stream_end(
+            self,
+            context: AgentHookContext,
+            *,
+            resuming: bool,
+        ) -> None:
+            endings.append(resuming)
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "question"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        hook=StreamingHook(),
+        silent_response_timeout_s=0.01,
+        progress_callback=on_progress,
+    ))
+
+    assert result.final_content == "recovered answer"
+    assert stream_cancelled.is_set()
+    assert streamed == ["recovered answer"]
+    assert endings == [False]
+    assert progress == [
+        "The model produced no visible output for too long; retrying in fast mode."
+    ]
+    recovery_request = provider.chat_with_retry.await_args.kwargs
+    assert recovery_request["max_tokens"] == 1024
+    assert recovery_request["temperature"] == 0.0
+    assert recovery_request["reasoning_effort"] is None
+    assert recovery_request["disable_thinking"] is True
+    assert "no user-visible output" in recovery_request["messages"][-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -886,6 +1091,133 @@ async def test_runner_does_not_batch_exclusive_read_only_tools():
 
 
 @pytest.mark.asyncio
+async def test_runner_requires_kb_retrieve_before_managed_paper_read() -> None:
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    tool = MagicMock()
+    tool.execute = AsyncMock(return_value="paper source")
+    tools = MagicMock()
+    params = {"path": "/workspace/kb/uploads/paper.md"}
+    tools.prepare_call.return_value = (tool, params, None)
+    spec = AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    runner = AgentRunner(MagicMock())
+    call = ToolCallRequest(id="read-1", name="read_file", arguments=params)
+
+    blocked, event, error = await runner._run_tool(spec, call, {}, [], set())
+
+    assert json.loads(blocked)["status"] == "kb_retrieve_required"
+    assert event["status"] == "blocked"
+    assert error is None
+    tool.execute.assert_not_awaited()
+
+    allowed, event, error = await runner._run_tool(
+        spec,
+        call,
+        {},
+        [],
+        {"kb_retrieve"},
+    )
+
+    assert allowed == "paper source"
+    assert event["status"] == "ok"
+    assert error is None
+    tool.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_runner_requires_confirmation_before_external_paper_search() -> None:
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    tool = MagicMock()
+    tool.execute = AsyncMock(return_value='{"results": []}')
+    tools = MagicMock()
+    params = {"query": "EEG-to-image papers"}
+    tools.prepare_call.return_value = (tool, params, None)
+    spec = AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    runner = AgentRunner(MagicMock())
+    call = ToolCallRequest(id="search-1", name="paper_search", arguments=params)
+
+    blocked, event, error = await runner._run_tool(
+        spec,
+        call,
+        {},
+        [{"role": "user", "content": "有没有 EEG-to-image 相关论文"}],
+        set(),
+    )
+
+    assert json.loads(blocked)["status"] == "confirmation_required"
+    assert event["status"] == "blocked"
+    assert error is None
+    tool.execute.assert_not_awaited()
+
+    confirmed_messages = [
+        {"role": "user", "content": "有没有 EEG-to-image 相关论文"},
+        {
+            "role": "tool",
+            "name": "paper_search",
+            "content": json.dumps({"status": "confirmation_required"}),
+        },
+        {"role": "assistant", "content": "是否允许我搜索外部 arXiv 论文？"},
+        {"role": "user", "content": "可以"},
+    ]
+    allowed, event, error = await runner._run_tool(
+        spec,
+        call,
+        {},
+        confirmed_messages,
+        set(),
+    )
+
+    assert allowed == '{"results": []}'
+    assert event["status"] == "ok"
+    assert error is None
+    tool.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_runner_allows_explicit_latest_paper_search() -> None:
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    tool = MagicMock()
+    tool.execute = AsyncMock(return_value='{"results": []}')
+    tools = MagicMock()
+    params = {"query": "latest EEG papers"}
+    tools.prepare_call.return_value = (tool, params, None)
+    spec = AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+
+    result, event, error = await AgentRunner(MagicMock())._run_tool(
+        spec,
+        ToolCallRequest(id="search-1", name="paper_search", arguments=params),
+        {},
+        [{"role": "user", "content": "搜索最新的 EEG 论文"}],
+        set(),
+    )
+
+    assert result == '{"results": []}'
+    assert event["status"] == "ok"
+    assert error is None
+    tool.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_runner_blocks_repeated_external_fetches():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
@@ -932,7 +1264,11 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
     loop = _make_loop(tmp_path)
     loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
         content="working",
-        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
+        tool_calls=[ToolCallRequest(
+            id="call_1",
+            name="list_dir",
+            arguments={"path": "."},
+        )],
     ))
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop.tools.execute = AsyncMock(return_value="ok")
@@ -1021,6 +1357,8 @@ async def test_loop_stream_filter_suppresses_whitespace_only_tool_segment(tmp_pa
     )
 
     assert final_content == "Final answer"
+    # The whitespace-only tool-call segment stays hidden, while the final
+    # paper answer is forwarded immediately through the normal stream.
     assert deltas == ["Final answer"]
     assert endings == [True, False]
 

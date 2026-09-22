@@ -63,6 +63,18 @@ def test_system_prompt_reflects_current_dream_memory_contract(tmp_path) -> None:
     assert "write important facts here" not in prompt
 
 
+def test_system_prompt_keeps_internal_reasoning_brief_without_limiting_answer(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt()
+
+    assert "Keep internal reasoning brief" in prompt
+    assert "issue the native tool call directly" in prompt
+    assert "not a limit on the final answer" in prompt
+    assert "perform necessary retrieval" in prompt
+
+
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     """Runtime metadata should be merged with the user message."""
     workspace = _make_workspace(tmp_path)

@@ -69,6 +69,8 @@ class MultiAgentState(TypedDict, total=False):
     requires_clarification: bool  # True if query references are too ambiguous to resolve
     explicit_paper_ids: List[str]  # Version-preserving arXiv IDs extracted from the raw query
     external_search_requested: bool  # Explicit external/arXiv/network-search request
+    external_search_authorized: bool  # User explicitly requested or approved external search
+    awaiting_external_search_confirmation: bool
     novelty_required: bool  # User asks for other/additional papers
     discovery_request: bool  # Query is asking for a paper list rather than paper details
     presented_paper_ids: List[str]  # Papers already shown in this session
@@ -83,6 +85,9 @@ class MultiAgentState(TypedDict, total=False):
     user_profile_context: str
     soul_context: str
     session_summary_context: str
+    shared_system_context: str
+    runtime_context: str
+    media_context: List[Dict[str, Any]]
     
     # === Router Decision ===
     routing_decision: str          # "internal" | "external" | "hybrid" | "direct"
@@ -100,6 +105,7 @@ class MultiAgentState(TypedDict, total=False):
     novelty_excluded_count: int
     external_search_top_k: int
     external_rerank_top_k: int
+    external_retry_after_seconds: float
     
     # === Research Phase Control (decoupled search & ingest) ===
     research_phase: str            # "search" | "select" | "ingest" | "complete"
@@ -207,6 +213,8 @@ def create_initial_state(
         "requires_clarification": False,
         "explicit_paper_ids": [],
         "external_search_requested": False,
+        "external_search_authorized": False,
+        "awaiting_external_search_confirmation": False,
         "novelty_required": False,
         "discovery_request": False,
         "presented_paper_ids": kwargs.get("presented_paper_ids", []),
@@ -220,6 +228,9 @@ def create_initial_state(
         "user_profile_context": kwargs.get("user_profile_context", ""),
         "soul_context": kwargs.get("soul_context", ""),
         "session_summary_context": kwargs.get("session_summary_context", ""),
+        "shared_system_context": kwargs.get("shared_system_context", ""),
+        "runtime_context": kwargs.get("runtime_context", ""),
+        "media_context": kwargs.get("media_context", []),
         "routing_decision": "",
         "routing_reasoning": "",
         "retrieval_results": [],
@@ -231,6 +242,7 @@ def create_initial_state(
         "novelty_excluded_count": 0,
         "external_search_top_k": cfg.external_search_top_k,
         "external_rerank_top_k": cfg.external_rerank_top_k,
+        "external_retry_after_seconds": 0.0,
         
         # Research Phase Control (decoupled search & ingest)
         "research_phase": "search",  # "search" | "select" | "ingest" | "complete"

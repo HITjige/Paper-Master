@@ -1920,6 +1920,19 @@ class PaperKnowledgeBase:
         return max(requested, int(self.config.retrieval_rerank_candidate_count))
 
     @staticmethod
+    def entity_candidate_per_paper_limit(
+        candidate_top_k: int,
+        final_per_paper_limit: int,
+        entity_count: int,
+    ) -> int:
+        """Keep enough entity candidates for reranking before the final cap."""
+        return max(
+            1,
+            int(final_per_paper_limit),
+            math.ceil(max(1, int(candidate_top_k)) / max(1, int(entity_count))),
+        )
+
+    @staticmethod
     def _is_paper_discovery_query(query: str) -> bool:
         """Recognize broad requests whose output is a list of relevant papers."""
         normalized = re.sub(r"\s+", " ", str(query or "")).strip().lower()
@@ -2870,7 +2883,7 @@ class PaperKnowledgeBase:
         *,
         query: str,
         queries: list[str] | None,
-        entities: list[dict[str, str]] | None,
+        entities: list[dict[str, Any]] | None,
         top_k: int,
         per_paper_limit: int,
     ) -> list[dict[str, Any]]:
@@ -2886,6 +2899,7 @@ class PaperKnowledgeBase:
                 max(top_k * 2, top_k),
                 prefer_distilled=True,
                 per_paper_limit=max(per_paper_limit, top_k),
+                entities=entities,
             )
             for item in results:
                 chunk_id = str(item.get("chunk_id", ""))
@@ -2918,7 +2932,7 @@ class PaperKnowledgeBase:
         top_k: int | None = None,
         *,
         queries: list[str] | None = None,
-        entities: list[dict[str, str]] | None = None,
+        entities: list[dict[str, Any]] | None = None,
         per_paper_limit: int = 3,
         search_mode: str = "hybrid",
         where_filter: dict[str, Any] | None = None,
@@ -2942,7 +2956,7 @@ class PaperKnowledgeBase:
             query: User's query text (single-query mode, backward-compatible)
             top_k: Number of results to return
             queries: List of query strings (multi-query mode)
-            entities: List of entity dicts with keys paper_id/title/query.
+            entities: List of entity dicts with keys paper_id/title/query/queries.
                      When provided, each entity is searched with its own
                      metadata filter and query, then results are merged.
             per_paper_limit: Max chunks per paper to avoid over-concentration
@@ -2962,6 +2976,11 @@ class PaperKnowledgeBase:
 
         k = max(1, top_k or self.config.retrieval_top_k)
         candidate_k = self.retrieval_candidate_count(k)
+        entity_candidate_limit = self.entity_candidate_per_paper_limit(
+            candidate_k,
+            per_paper_limit,
+            len(entities or []),
+        )
         relevance_queries = [
             item for item in [query, *(queries or [])] if str(item or "").strip()
         ]
@@ -2980,7 +2999,9 @@ class PaperKnowledgeBase:
                 queries=queries,
                 entities=entities,
                 top_k=candidate_k,
-                per_paper_limit=per_paper_limit,
+                per_paper_limit=(
+                    entity_candidate_limit if entities else per_paper_limit
+                ),
             )
             filtered_results = await self.rerank_and_filter_retrieval_results(
                 fallback_results,
@@ -3010,7 +3031,7 @@ class PaperKnowledgeBase:
                     queries=queries,
                     entities=entities,
                     top_k=candidate_k,
-                    per_paper_limit=per_paper_limit,
+                    per_paper_limit=entity_candidate_limit,
                 )
             filtered_results = await self.rerank_and_filter_retrieval_results(
                 entity_results,
@@ -3049,7 +3070,7 @@ class PaperKnowledgeBase:
     async def _retrieve_by_entities(
         self,
         *,
-        entities: list[dict[str, str]],
+        entities: list[dict[str, Any]],
         query: str,
         queries: list[str] | None = None,
         top_k: int,
@@ -3064,16 +3085,20 @@ class PaperKnowledgeBase:
         with the entity-specific query from the entity dict).
         """
         all_entity_results: list[dict[str, Any]] = []
+        documents = self._read_jsonl(self.docs_file)
         for ent in entities:
-            ent_filter: dict[str, Any] = {}
-            pid = (ent.get("paper_id") or "").strip()
-            title = (ent.get("title") or "").strip()
+            pid = str(ent.get("paper_id") or "").strip()
+            title = str(ent.get("title") or "").strip()
             entity_query_list: list[str] = []
             seen_entity_queries: set[str] = set()
+            raw_entity_queries = ent.get("queries") or []
+            if not isinstance(raw_entity_queries, list):
+                raw_entity_queries = [raw_entity_queries]
             for entity_query in [
                 query,
                 *(queries or []),
-                *(ent.get("queries") or []),
+                ent.get("query"),
+                *raw_entity_queries,
             ]:
                 normalized_query = re.sub(r"\s+", " ", str(entity_query or "")).strip()
                 query_key = normalized_query.casefold()
@@ -3081,31 +3106,58 @@ class PaperKnowledgeBase:
                     seen_entity_queries.add(query_key)
                     entity_query_list.append(normalized_query)
             
+            entity_paper_ids: list[str] = []
             if pid:
-                # arXiv IDs may have version suffixes; match exact paper_id
-                ent_filter["paper_id"] = pid
+                # arXiv IDs may have version suffixes; match exact paper_id.
+                entity_paper_ids = [pid]
             elif title:
-                ent_filter["paper_title"] = {"$contains": title}
-            else:
+                # Chroma's metadata $contains operator is array membership,
+                # not substring matching for scalar titles. Resolve title
+                # entities against canonical document metadata first, then
+                # use exact paper_id filters for both dense and sparse paths.
+                title_key = re.sub(r"\s+", " ", title).strip().casefold()
+                exact_matches: list[str] = []
+                partial_matches: list[str] = []
+                for document in documents:
+                    document_id = str(document.get("paper_id") or "").strip()
+                    document_title = re.sub(
+                        r"\s+", " ", str(document.get("title") or "")
+                    ).strip().casefold()
+                    if not document_id or not document_title:
+                        continue
+                    if document_title == title_key:
+                        exact_matches.append(document_id)
+                    elif title_key in document_title:
+                        partial_matches.append(document_id)
+                entity_paper_ids = exact_matches or partial_matches
+
+            if not entity_paper_ids:
+                logger.info(
+                    "Entity retrieval: no indexed paper matched paper_id={!r} title={!r}",
+                    pid,
+                    title,
+                )
                 continue
-            
-            logger.info(
-                "Entity retrieval: filter={} queries={}",
-                ent_filter,
-                entity_query_list,
-            )
-            
-            ent_results = await self._retrieve_dense_hybrid(
-                query=query,
-                queries=entity_query_list,
-                top_k=top_k,
-                per_paper_limit=per_paper_limit,
-                search_mode=search_mode,
-                where_filter=ent_filter,
-                use_hybrid=use_hybrid,
-                apply_diversity=False,
-            )
-            all_entity_results.extend(ent_results)
+
+            for entity_paper_id in dict.fromkeys(entity_paper_ids):
+                ent_filter = {"paper_id": entity_paper_id}
+                logger.info(
+                    "Entity retrieval: filter={} queries={}",
+                    ent_filter,
+                    entity_query_list,
+                )
+
+                ent_results = await self._retrieve_dense_hybrid(
+                    query=query,
+                    queries=entity_query_list,
+                    top_k=top_k,
+                    per_paper_limit=per_paper_limit,
+                    search_mode=search_mode,
+                    where_filter=ent_filter,
+                    use_hybrid=use_hybrid,
+                    apply_diversity=False,
+                )
+                all_entity_results.extend(ent_results)
         
         # Merge: keep best score per chunk_id
         merged: dict[str, dict[str, Any]] = {}
@@ -3115,15 +3167,22 @@ class PaperKnowledgeBase:
                 merged[cid] = r
         
         final_entity = sorted(merged.values(), key=lambda x: x.get("score", 0), reverse=True)
+        candidate_per_paper_limit = self.entity_candidate_per_paper_limit(
+            top_k,
+            per_paper_limit,
+            len(entities),
+        )
         final_entity = _select_diverse(
             final_entity,
             k=min(max(top_k, len(entities)), len(final_entity)),
-            per_paper_limit=max(1, per_paper_limit),
+            per_paper_limit=candidate_per_paper_limit,
             mmr_lambda=self.config.mmr_lambda,
         )
         logger.info(
-            "Entity retrieval: {} entities → {} merged → {} final",
+            "Entity retrieval: {} entities → {} merged → {} candidates "
+            "(candidate_per_paper_limit={})",
             len(entities), len(merged), len(final_entity),
+            candidate_per_paper_limit,
         )
         return final_entity
 
@@ -3475,15 +3534,44 @@ class PaperKnowledgeBase:
         *,
         prefer_distilled: bool = True,
         per_paper_limit: int = 3,
+        entities: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         k = max(1, top_k or self.config.retrieval_top_k)
         chunks = self._read_jsonl(self.chunks_file)
         if not chunks:
             return []
+        docs = {d.get("paper_id"): d for d in self._read_jsonl(self.docs_file)}
+        if entities:
+            entity_ids = {
+                str(entity.get("paper_id") or "").strip()
+                for entity in entities
+                if isinstance(entity, dict) and entity.get("paper_id")
+            }
+            entity_titles = {
+                str(entity.get("title") or "").strip().casefold()
+                for entity in entities
+                if isinstance(entity, dict) and entity.get("title")
+            }
+            if entity_ids or entity_titles:
+                chunks = [
+                    chunk
+                    for chunk in chunks
+                    if str(chunk.get("paper_id") or "").strip() in entity_ids
+                    or any(
+                        title in str(
+                            docs.get(chunk.get("paper_id"), {}).get("title")
+                            or chunk.get("paper_title")
+                            or chunk.get("title")
+                            or ""
+                        ).casefold()
+                        for title in entity_titles
+                    )
+                ]
+                if not chunks:
+                    return []
         q_emb = await self.embed_text(query)
         q_tokens = _tokenize(query)
         intent = _parse_query_intent(query)
-        docs = {d.get("paper_id"): d for d in self._read_jsonl(self.docs_file)}
         scored: list[dict[str, Any]] = []
         for chunk in chunks:
             emb_score, lexical, metadata, recency, distilled_boost = _compute_chunk_signals(

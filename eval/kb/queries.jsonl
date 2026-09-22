@@ -1,0 +1,12 @@
+{"id":"kb001","query":"BReAD 如何把检索到的图像信息用于后续扩散重建？","seed_chunk_ids":["2038c6a08557:8","2038c6a08557:9"],"tags":["method","zh"]}
+{"id":"kb002","query":"不确定性感知的模糊先验如何缩小视觉刺激与脑感知之间的系统差异？","seed_chunk_ids":["0e5315955f0a:6"],"tags":["method","paraphrase","zh"]}
+{"id":"kb003","query":"UBP 如何估计脑信号和图像刺激之间的随机不匹配？","seed_chunk_ids":["0e5315955f0a:7"],"tags":["method","zh"]}
+{"id":"kb004","query":"JMVR 的多尺度 EEG 编码器怎样同时捕捉局部细节和整体语义？","seed_chunk_ids":["2603.19667v1:3"],"tags":["method","zh"]}
+{"id":"kb005","query":"JMVR 为什么在扩散采样过程中引入 step gating？","seed_chunk_ids":["2603.19667v1:6"],"tags":["method","zh"]}
+{"id":"kb006","query":"SATTC 中 subject-adaptive whitening 用于解决什么问题？","seed_chunk_ids":["2603.20738v2:5"],"tags":["method","zh"]}
+{"id":"kb007","query":"SATTC 如何利用 adaptive CSLS 缓解跨被试图像检索中的 hubness？","seed_chunk_ids":["2603.20738v2:6"],"tags":["method","zh"]}
+{"id":"kb008","query":"MB2L 如何通过自适应模糊模拟视觉先验？","seed_chunk_ids":["2605.04680v1:5"],"tags":["method","zh"]}
+{"id":"kb009","query":"CognitionCapturer 如何将多模态关联后的 EEG 表征映射到 CLIP 图像空间？","seed_chunk_ids":["3e907949e4ba:6"],"tags":["method","zh"]}
+{"id":"kb010","query":"ATM 编码器如何处理 EEG 信号的空间电极位置和时间信息？","seed_chunk_ids":["a1836846a2a6:2"],"tags":["method","zh"]}
+{"id":"kb011","query":"基于 MEG 的视觉重建系统如何通过生成模块将脑活动表示转化为图像？","seed_chunk_ids":["a4924bcce25e:5"],"tags":["method","zh"]}
+{"id":"kb012","query":"Brain2Image 的方法怎样把视觉诱发 EEG 信号转成图像？","seed_chunk_ids":["upload:c0bc2568a66a53688ccf37a5de5e5b6366129e576958bc58c78e94657ca2db03:4"],"tags":["method","zh"]}

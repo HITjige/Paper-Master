@@ -1,0 +1,32 @@
+{"id": "auto_kb_001", "query": "Uncertainty-aware Blur Prior 如何通过处理图像模态来缓解 System GAP？", "seed_chunk_ids": ["0e5315955f0a:6"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_002", "query": "Brain2Image 方法中的编码器（encoder）由什么层组成？", "seed_chunk_ids": ["upload:c0bc2568a66a53688ccf37a5de5e5b6366129e576958bc58c78e94657ca2db03:4"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_003", "query": "BReAD 框架如何利用检索数据库中的多样性来生成准确的细粒度类别重建图像？", "seed_chunk_ids": ["2038c6a08557:14"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_004", "query": "SATTC 如何利用结构先验来校准 EEG 与图像的检索分数？", "seed_chunk_ids": ["2603.20738v2:3"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_005", "query": "JMVR 框架如何处理 EEG 信号的时间维度与扩散过程时间步之间的歧义？", "seed_chunk_ids": ["2603.19667v1:2"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_006", "query": "MBCL 在训练阶段如何对齐模态间的匹配对？", "seed_chunk_ids": ["2605.04680v1:4"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_007", "query": "Fovea Blur 方法在性能上与其他破坏性变换相比有何优势？", "seed_chunk_ids": ["0e5315955f0a:10"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_008", "query": "Brain2Image 方法在图像生成任务中比较了哪两种深度学习框架？", "seed_chunk_ids": ["upload:c0bc2568a66a53688ccf37a5de5e5b6366129e576958bc58c78e94657ca2db03:7"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_009", "query": "ATM 方法如何处理原始 EEG 信号以避免分段？", "seed_chunk_ids": ["a1836846a2a6:2"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_010", "query": "CognitionCapturer 中的深度专家编码器（depth expert encoder）主要关注哪些脑区？", "seed_chunk_ids": ["3e907949e4ba:12"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_011", "query": "SATTC 如何提升不同 EEG 编码器（如 ATM 或 EEGNetV4）在跨受试者图像检索中的性能？", "seed_chunk_ids": ["2603.20738v2:13"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_012", "query": "Diffusion Step Gating 策略如何利用正弦调度来协调文本和 EEG 模态在不同去噪阶段的信息贡献？", "seed_chunk_ids": ["2603.19667v1:6"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_013", "query": "Multi-Level Bidirectional Biomimetic Learning 框架在 EEG 编码器选择上表现出怎样的鲁棒性？", "seed_chunk_ids": ["2605.04680v1:15"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_014", "query": "UBP 在多少种脑编码器和图像编码器架构上进行了实验以证明其非架构特定性？", "seed_chunk_ids": ["0e5315955f0a:13"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_015", "query": "在将脑信号转换为图像的生成任务中，GAN 相比 VAE 表现更好的原因是什么？", "seed_chunk_ids": ["upload:c0bc2568a66a53688ccf37a5de5e5b6366129e576958bc58c78e94657ca2db03:6"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_016", "query": "ATM 包含哪些具体组件？", "seed_chunk_ids": ["a1836846a2a6:7"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_017", "query": "CognitionCapturer 如何处理 EEG 信号以分离不同模态的有效信息？", "seed_chunk_ids": ["3e907949e4ba:3"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_018", "query": "BReAD 框架中的 Brain Image Retrieval 模块在生成过程中起什么作用？", "seed_chunk_ids": ["2038c6a08557:5"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_019", "query": "SAW 如何处理不同受试者 EEG 嵌入在均值、方差和协方差结构上的差异？", "seed_chunk_ids": ["2603.20738v2:5"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_020", "query": "dual-stream EEG encoder 的右分支通过什么模块来捕捉全局信息？", "seed_chunk_ids": ["2603.19667v1:3"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_021", "query": "MBCL 方法通过什么机制来缓解 EEG 与图像模态之间的异质表示问题？", "seed_chunk_ids": ["2605.04680v1:7"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_022", "query": "UBP 在 THINGS-EEG 数据集的零样本脑到图像检索任务中取得了多少 top-1 准确率？", "seed_chunk_ids": ["0e5315955f0a:9"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_023", "query": "Brain2Image 在第二阶段训练 VAE 时，如何处理 EEG 特征编码器？", "seed_chunk_ids": ["upload:c0bc2568a66a53688ccf37a5de5e5b6366129e576958bc58c78e94657ca2db03:5"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_024", "query": "guided diffusion 生成的图像如何体现低层视觉特征的多样性？", "seed_chunk_ids": ["a1836846a2a6:8"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_025", "query": "DINOv2 在图像偏移后（after image offset）的检索表现如何？", "seed_chunk_ids": ["a4924bcce25e:9"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_026", "query": "CognitionCapturer 在对比学习阶段如何处理图像模态转换后的信息以更好地表征 EEG 信号？", "seed_chunk_ids": ["3e907949e4ba:2"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_027", "query": "SATTC 在测试时校准阶段对 EEG 和图像编码器采取了什么策略？", "seed_chunk_ids": ["2603.20738v2:2"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_028", "query": "Joint-Modal Attention 机制如何处理不同模态（图像、文本、EEG）的特征以保留其固有结构？", "seed_chunk_ids": ["2603.19667v1:5"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_029", "query": "ABVP 中的自适应模糊模块为何选择 logistic 函数作为视觉先验？", "seed_chunk_ids": ["2605.04680v1:11"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_030", "query": "EEGProject 编码器由哪几部分组成？", "seed_chunk_ids": ["0e5315955f0a:8"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_031", "query": "CognitionCapturer 如何解决同一图像多次观看导致的 EEG 数据与模态数据在对比学习损失函数中既拉近又推远的矛盾现象？", "seed_chunk_ids": ["3e907949e4ba:5"], "tags": ["auto", "zh"]}
+{"id": "auto_kb_032", "query": "Brain-RAM 框架是如何整合大规模数据库先验的？", "seed_chunk_ids": ["2038c6a08557:3"], "tags": ["auto", "zh"]}

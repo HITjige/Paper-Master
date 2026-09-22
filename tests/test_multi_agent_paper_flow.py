@@ -2,8 +2,10 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 from nanobot.agent.multi_agent.agents import (
+    SYNTHESIS_SYSTEM_PROMPT,
     collect_answer_citations,
     format_sources_section,
 )
@@ -11,6 +13,7 @@ from nanobot.agent.multi_agent.conditions import (
     research_phase_conditional,
     retrieval_conditional,
 )
+from nanobot.agent.multi_agent.graph import MultiAgentGraph
 from nanobot.agent.multi_agent.nodes import AgentNodes
 
 
@@ -44,6 +47,13 @@ def test_external_abstracts_are_included_and_labelled():
     )
     assert 'id="2401.12345" evidence_level="abstract_only"' in sources
     assert "Only the abstract is available." in sources
+
+
+def test_synthesis_prompt_requires_web_safe_math_and_architecture_formatting():
+    assert "$...$" in SYNTHESIS_SYSTEM_PROMPT
+    assert "$$...$$" in SYNTHESIS_SYSTEM_PROMPT
+    assert "ASCII-art diagrams" in SYNTHESIS_SYSTEM_PROMPT
+    assert "nested lists" in SYNTHESIS_SYSTEM_PROMPT
 
 
 def test_synthesis_orders_chunks_by_source_position_within_each_paper():
@@ -198,11 +208,63 @@ def test_explicit_external_id_is_a_deterministic_route():
 
     assert result["routing_decision"] == "external"
     assert result["external_search_requested"] is True
+    assert result["external_search_authorized"] is True
     assert result["explicit_paper_ids"] == ["2511.14460v2"]
 
     prepared = asyncio.run(nodes._prepare_queries(state["user_query"], result))
     assert "2511.14460v2" in prepared
     assert result["rewrite_reasoning"] == "deterministic exact arXiv ID lookup"
+
+
+def test_research_pauses_before_unrequested_external_search():
+    class _Provider:
+        def get_default_model(self):
+            return "test-model"
+
+    class _SearchTool:
+        async def execute(self, **kwargs):
+            raise AssertionError("external search must not run before confirmation")
+
+    nodes = AgentNodes(
+        provider=_Provider(),
+        kb=SimpleNamespace(),
+        tools={"paper_search": _SearchTool()},
+    )
+    result = asyncio.run(nodes._research_search_phase({
+        "user_query": "详细解读这篇论文",
+        "external_search_requested": False,
+        "external_search_authorized": False,
+    }))
+
+    assert result["research_phase"] == "confirm_search"
+    assert result["awaiting_external_search_confirmation"] is True
+    assert "是否允许" in result["final_answer"]
+
+
+def test_resume_external_search_confirmation_controls_research_phase():
+    graph = object.__new__(MultiAgentGraph)
+    graph.nodes = MagicMock()
+    graph.nodes.bind_progress_callback.return_value = None
+    graph.graph = MagicMock()
+    graph.graph.ainvoke = AsyncMock(side_effect=lambda state: state)
+    saved = {
+        "user_query": "详细解读这篇论文",
+        "session_id": "test",
+        "research_phase": "confirm_search",
+        "retrieval_results": [],
+    }
+
+    authorized = asyncio.run(graph.resume(saved, "可以"))
+
+    assert authorized["external_search_authorized"] is True
+    assert authorized["research_phase"] == "search"
+    assert authorized["resume_phase"] == "search"
+
+    declined = asyncio.run(graph.resume(saved, "只使用知识库"))
+
+    assert declined["external_search_authorized"] is False
+    assert declined["research_phase"] == "complete"
+    assert declined["external_search_completed"] is True
 
 
 def test_novelty_retrieval_excludes_previously_presented_papers():
@@ -325,6 +387,7 @@ def test_research_excludes_presented_not_every_paper_already_in_kb():
         "sub_queries_detail": [],
         "external_search_top_k": 20,
         "external_rerank_top_k": 5,
+        "external_search_authorized": True,
     }
 
     result = asyncio.run(nodes._research_search_phase(state))
@@ -335,7 +398,131 @@ def test_research_excludes_presented_not_every_paper_already_in_kb():
     assert result["research_phase"] == "select"
 
 
+def test_research_preserves_rate_limit_as_provider_error():
+    class _Provider:
+        def get_default_model(self):
+            return "test-model"
+
+    class _KB:
+        def load_docs_meta(self):
+            return {}
+
+    class _SearchTool:
+        async def execute(self, **kwargs):
+            return (
+                '{"search_status":"rate_limited","retry_after_seconds":17,'
+                '"results":[]}'
+            )
+
+    progress = []
+    nodes = AgentNodes(
+        provider=_Provider(),
+        kb=_KB(),
+        tools={"paper_search": _SearchTool()},
+        progress_callback=progress.append,
+    )
+    state = {
+        "user_query": "latest EEG papers",
+        "rewritten_queries": ["EEG image reconstruction"],
+        "sub_queries_detail": [],
+        "external_search_top_k": 20,
+        "external_rerank_top_k": 5,
+    }
+
+    result = asyncio.run(nodes._research_search_phase(state))
+
+    assert result["research_outcome"] == "provider_error"
+    assert result["external_retry_after_seconds"] == 17
+    assert "not evidence" in result["error_message"]
+    assert any("17" in message and "限流" in message for message in progress)
+
+
+def test_synthesis_uses_configured_model_and_recovers_length_limit():
+    class _Provider:
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                SimpleNamespace(content="first ", finish_reason="length"),
+                SimpleNamespace(content="second", finish_reason="stop"),
+            ]
+
+        def get_default_model(self):
+            return "provider-default"
+
+        async def chat_with_retry(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.responses.pop(0)
+
+    class _KB:
+        def load_docs_meta(self):
+            return {}
+
+    provider = _Provider()
+    nodes = AgentNodes(
+        provider=provider,
+        kb=_KB(),
+        tools={},
+        model="configured-model",
+        provider_retry_mode="persistent",
+        context_window_tokens=4096,
+        max_completion_tokens=512,
+    )
+    state = {
+        "user_query": "Explain this method",
+        "routing_decision": "direct",
+        "retrieval_results": [],
+        "external_papers": [],
+    }
+
+    result = asyncio.run(nodes.synthesis_node(state))
+
+    assert result["draft_answer"] == "first second"
+    assert len(provider.calls) == 2
+    assert all(call["model"] == "configured-model" for call in provider.calls)
+    assert all(call["retry_mode"] == "persistent" for call in provider.calls)
+    assert all(call["max_tokens"] == 512 for call in provider.calls)
+    assert "Output limit reached" in provider.calls[1]["messages"][-1]["content"]
+
+
+def test_synthesis_retries_empty_visible_response_without_thinking():
+    class _Provider:
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                SimpleNamespace(content="", finish_reason="stop"),
+                SimpleNamespace(content="recovered answer", finish_reason="stop"),
+            ]
+
+        def get_default_model(self):
+            return "test-model"
+
+        async def chat_with_retry(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.responses.pop(0)
+
+    class _KB:
+        def load_docs_meta(self):
+            return {}
+
+    provider = _Provider()
+    nodes = AgentNodes(provider=provider, kb=_KB(), tools={})
+
+    result = asyncio.run(nodes.synthesis_node({
+        "user_query": "Explain this method",
+        "routing_decision": "direct",
+        "retrieval_results": [],
+        "external_papers": [],
+    }))
+
+    assert result["draft_answer"] == "recovered answer"
+    assert provider.calls[1]["disable_thinking"] is True
+    assert "Provide the final response" in str(provider.calls[1]["messages"][-1]["content"])
+
+
 def test_research_only_returns_to_retrieval_after_successful_ingest():
+    assert research_phase_conditional({
+        "research_phase": "confirm_search",
+    }) == "wait_for_search_confirmation"
     assert research_phase_conditional({
         "research_phase": "complete",
         "research_outcome": "no_new_results",

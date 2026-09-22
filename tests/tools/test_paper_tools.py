@@ -606,6 +606,438 @@ def test_kb_retrieve_modes_map_to_distinct_multi_view_searches(tmp_path: Path):
     assert kb.retrieve.await_count == 0
 
 
+def test_kb_retrieve_top_level_queries_enable_unfiltered_multi_query(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=True)
+
+        def __init__(self):
+            self.retrieve_by_hypothetical_questions = AsyncMock(return_value=[{
+                "chunk_id": "p1:0",
+                "paper_id": "p1",
+                "text": "The method improves retrieval quality.",
+                "score": 0.9,
+            }])
+
+        def load_docs_meta(self):
+            return {
+                "p1": {
+                    "title": "Multi-query Retrieval",
+                    "authors": ["Ada Researcher"],
+                    "abstract": "A paper about multi-query retrieval.",
+                    "year": 2025,
+                }
+            }
+
+        def get_embedding_status(self):
+            return {"backend": "test", "degraded": False}
+
+        def get_lexical_status(self):
+            return {"backend": "test"}
+
+    kb = _FakeKB()
+    tool = KBRetrieveTool(workspace=tmp_path, kb=kb)
+
+    payload = json.loads(asyncio.run(tool.execute(
+        query="retrieval quality",
+        queries=["multi query retrieval", " Retrieval   Quality "],
+    )))
+
+    assert tool.parameters["properties"]["queries"]["type"] == "array"
+    assert kb.retrieve_by_hypothetical_questions.await_args.kwargs["queries"] == [
+        "multi query retrieval",
+    ]
+    assert kb.retrieve_by_hypothetical_questions.await_args.kwargs["entities"] is None
+    assert payload["queries"] == ["retrieval quality", "multi query retrieval"]
+    assert payload["quality"] == "sufficient"
+    assert payload["next_action"] == "answer_from_kb"
+    assert payload["allowed_citation_ids"] == ["p1"]
+    assert payload["papers"][0]["authors"] == ["Ada Researcher"]
+    assert payload["papers"][0]["abstract"].startswith("A paper about")
+    assert payload["papers"][0]["evidence_level"] == "full_text"
+    assert payload["papers"][0]["chunks"][0]["chunk_id"] == "p1:0"
+
+
+def test_traditional_kb_retrieve_merges_top_level_query_results(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=False)
+
+        def __init__(self):
+            self.retrieve = AsyncMock(side_effect=[
+                [{"chunk_id": "p1:0", "paper_id": "p1", "text": "one", "score": 0.9}],
+                [{"chunk_id": "p2:0", "paper_id": "p2", "text": "two", "score": 0.8}],
+            ])
+            self.rerank_and_filter_retrieval_results = AsyncMock(
+                side_effect=lambda results, **kwargs: results
+            )
+
+        def retrieval_candidate_count(self, top_k):
+            return top_k
+
+        def get_embedding_status(self):
+            return {"backend": "test", "degraded": False}
+
+        def get_lexical_status(self):
+            return {"backend": "test"}
+
+    kb = _FakeKB()
+    tool = KBRetrieveTool(workspace=tmp_path, kb=kb)
+    payload = json.loads(asyncio.run(tool.execute(
+        query="first formulation",
+        queries=["second formulation"],
+        retrieval_mode="traditional",
+    )))
+
+    assert [call.args[0] for call in kb.retrieve.await_args_list] == [
+        "first formulation",
+        "second formulation",
+    ]
+    assert kb.rerank_and_filter_retrieval_results.await_args.kwargs["queries"] == [
+        "first formulation",
+        "second formulation",
+    ]
+    assert {paper["paper_id"] for paper in payload["papers"]} == {"p1", "p2"}
+
+
+def test_kb_retrieve_quality_gate_suppresses_weak_evidence(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=True)
+
+        def __init__(self):
+            self.retrieve_by_hypothetical_questions = AsyncMock(return_value=[{
+                "chunk_id": "p1:0",
+                "paper_id": "p1",
+                "text": "Unrelated evidence.",
+                "score": 0.1,
+            }])
+
+        def get_embedding_status(self):
+            return {"backend": "test", "degraded": False}
+
+        def get_lexical_status(self):
+            return {"backend": "test"}
+
+    payload = json.loads(asyncio.run(KBRetrieveTool(
+        workspace=tmp_path,
+        kb=_FakeKB(),
+    ).execute(query="a precise unrelated question")))
+
+    assert payload["quality"] == "insufficient"
+    assert payload["next_action"] == "external_search_allowed"
+    assert payload["papers"] == []
+    assert payload["allowed_citation_ids"] == []
+
+
+def test_kb_retrieve_exposes_and_forwards_entity_filters(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=True)
+
+        def __init__(self):
+            self.retrieve_by_hypothetical_questions = AsyncMock(return_value=[])
+
+        def get_embedding_status(self):
+            return {"backend": "test"}
+
+        def get_lexical_status(self):
+            return {"backend": "test"}
+
+    kb = _FakeKB()
+    tool = KBRetrieveTool(workspace=tmp_path, kb=kb)
+    entity_schema = tool.parameters["properties"]["entities"]
+
+    assert entity_schema["type"] == "array"
+    assert set(entity_schema["items"]["properties"]) == {
+        "paper_id", "title", "query", "queries",
+    }
+
+    asyncio.run(tool.execute(
+        query="compare optimization methods",
+        entities=[
+            {
+                "paper_id": " 2401.12345v2 ",
+                "query": " optimization method ",
+                "queries": ["Optimization   Method", "ablation study"],
+            },
+            {"title": " Attention Is All You Need "},
+            {"query": "ignored without a paper identity"},
+        ],
+    ))
+
+    assert kb.retrieve_by_hypothetical_questions.await_args.kwargs["entities"] == [
+        {
+            "paper_id": "2401.12345v2",
+            "title": "",
+            "queries": ["optimization method", "ablation study"],
+        },
+        {"paper_id": "", "title": "Attention Is All You Need"},
+    ]
+
+
+def test_kb_retrieve_excludes_previously_presented_papers(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=True)
+
+        def __init__(self):
+            self.retrieve_by_hypothetical_questions = AsyncMock(return_value=[
+                {
+                    "chunk_id": "2401.00001v2:0",
+                    "paper_id": "2401.00001v2",
+                    "text": "Previously shown paper.",
+                    "score": 0.95,
+                },
+                {
+                    "chunk_id": "2501.00002v1:0",
+                    "paper_id": "2501.00002v1",
+                    "text": "A different relevant paper.",
+                    "score": 0.9,
+                },
+            ])
+
+        def get_embedding_status(self):
+            return {"backend": "test", "degraded": False}
+
+        def get_lexical_status(self):
+            return {"backend": "test"}
+
+    kb = _FakeKB()
+    tool = KBRetrieveTool(workspace=tmp_path, kb=kb)
+    payload = json.loads(asyncio.run(tool.execute(
+        query="other EEG papers",
+        top_k=5,
+        exclude_paper_ids=["arXiv:2401.00001v1", "2401.00001v3"],
+    )))
+
+    assert tool.parameters["properties"]["exclude_paper_ids"]["type"] == "array"
+    assert kb.retrieve_by_hypothetical_questions.await_args.kwargs["top_k"] > 5
+    assert payload["excluded_paper_ids"] == ["2401.00001"]
+    assert payload["excluded_hits"] == 1
+    assert payload["allowed_citation_ids"] == ["2501.00002v1"]
+
+
+def test_kb_retrieve_explicit_entities_override_novelty_exclusions(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=True)
+
+        def __init__(self):
+            self.retrieve_by_hypothetical_questions = AsyncMock(return_value=[{
+                "chunk_id": "2401.00001v2:0",
+                "paper_id": "2401.00001v2",
+                "text": "Explicitly requested paper.",
+                "score": 0.95,
+            }])
+
+        def get_embedding_status(self):
+            return {"backend": "test", "degraded": False}
+
+        def get_lexical_status(self):
+            return {"backend": "test"}
+
+    payload = json.loads(asyncio.run(KBRetrieveTool(
+        workspace=tmp_path,
+        kb=_FakeKB(),
+    ).execute(
+        query="explain this exact paper",
+        entities=[{"paper_id": "2401.00001v2"}],
+        exclude_paper_ids=["2401.00001v1"],
+    )))
+
+    assert payload["excluded_hits"] == 0
+    assert payload["allowed_citation_ids"] == ["2401.00001v2"]
+
+
+def test_kb_retrieve_forwards_entities_to_traditional_backend(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=False)
+
+        def __init__(self):
+            self.retrieve = AsyncMock(return_value=[])
+            self.rerank_and_filter_retrieval_results = AsyncMock(return_value=[])
+
+        def retrieval_candidate_count(self, top_k):
+            return top_k * 2
+
+        def get_embedding_status(self):
+            return {"backend": "test"}
+
+        def get_lexical_status(self):
+            return {"backend": "test"}
+
+    kb = _FakeKB()
+    tool = KBRetrieveTool(workspace=tmp_path, kb=kb)
+
+    asyncio.run(tool.execute(
+        query="architecture",
+        retrieval_mode="traditional",
+        entities=[{"paper_id": "p2"}],
+    ))
+
+    assert kb.retrieve.await_args.kwargs["entities"] == [
+        {"paper_id": "p2", "title": ""},
+    ]
+
+
+def test_kb_retrieve_rejects_entity_filters_without_a_paper_identity(tmp_path: Path):
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=True)
+
+        def __init__(self):
+            self.retrieve_by_hypothetical_questions = AsyncMock(return_value=[])
+
+    kb = _FakeKB()
+    tool = KBRetrieveTool(workspace=tmp_path, kb=kb)
+
+    payload = json.loads(asyncio.run(tool.execute(
+        query="architecture",
+        entities=[{"query": "missing paper identity"}],
+    )))
+
+    assert "paper_id or title" in payload["error"]
+    kb.retrieve_by_hypothetical_questions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_traditional_kb_retrieve_filters_chunks_by_entity_before_scoring(
+    tmp_path: Path,
+):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            embedding_model="",
+            enable_hypothetical_retrieval=False,
+        ),
+    )
+    kb.base_dir.mkdir(parents=True, exist_ok=True)
+    kb._write_jsonl(kb.docs_file, [
+        {"paper_id": "p1", "title": "Distractor Paper"},
+        {"paper_id": "p2", "title": "Target Architecture"},
+    ])
+    kb._write_jsonl(kb.chunks_file, [
+        {
+            "chunk_id": "p1:0",
+            "paper_id": "p1",
+            "text": "architecture method with a very strong lexical match",
+            "embedding": [],
+        },
+        {
+            "chunk_id": "p2:0",
+            "paper_id": "p2",
+            "text": "architecture overview",
+            "embedding": [],
+        },
+    ])
+    kb.embed_text = AsyncMock(return_value=[])
+
+    results = await kb.retrieve(
+        "architecture method",
+        top_k=5,
+        entities=[{"title": "Target Architecture"}],
+    )
+
+    assert [result["paper_id"] for result in results] == ["p2"]
+
+
+@pytest.mark.asyncio
+async def test_entity_retrieval_resolves_title_and_accepts_singular_query(tmp_path: Path):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, enable_hypothetical_retrieval=False),
+    )
+    kb.base_dir.mkdir(parents=True, exist_ok=True)
+    kb._write_jsonl(kb.docs_file, [
+        {"paper_id": "p1", "title": "A Different Paper"},
+        {"paper_id": "p2", "title": "Attention Is All You Need"},
+    ])
+    kb._retrieve_dense_hybrid = AsyncMock(return_value=[
+        {"chunk_id": "p2:0", "paper_id": "p2", "score": 0.9},
+    ])
+
+    results = await kb._retrieve_by_entities(
+        entities=[{
+            "title": "attention is all you need",
+            "query": "computational complexity",
+        }],
+        query="explain this paper",
+        top_k=5,
+        per_paper_limit=3,
+        search_mode="hybrid",
+        use_hybrid=True,
+    )
+
+    kwargs = kb._retrieve_dense_hybrid.await_args.kwargs
+    assert kwargs["where_filter"] == {"paper_id": "p2"}
+    assert kwargs["queries"] == ["explain this paper", "computational complexity"]
+    assert [result["paper_id"] for result in results] == ["p2"]
+
+
+@pytest.mark.asyncio
+async def test_entity_retrieval_keeps_candidates_until_final_rerank(tmp_path: Path):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(enabled=True, enable_hypothetical_retrieval=False),
+    )
+    kb.base_dir.mkdir(parents=True, exist_ok=True)
+    kb._write_jsonl(kb.docs_file, [{"paper_id": "p1", "title": "Target Paper"}])
+    candidates = [
+        {
+            "chunk_id": f"p1:{index}",
+            "paper_id": "p1",
+            "score": 1.0 - index * 0.01,
+        }
+        for index in range(10)
+    ]
+    kb._retrieve_dense_hybrid = AsyncMock(return_value=candidates)
+
+    results = await kb._retrieve_by_entities(
+        entities=[{"paper_id": "p1"}],
+        query="experimental details",
+        top_k=10,
+        per_paper_limit=3,
+        search_mode="hybrid",
+        use_hybrid=True,
+    )
+
+    assert len(results) == 10
+    assert kb.entity_candidate_per_paper_limit(10, 3, 1) == 10
+
+
+@pytest.mark.asyncio
+async def test_entity_retrieval_applies_final_cap_after_candidate_stage(tmp_path: Path):
+    kb = PaperKnowledgeBase(
+        tmp_path,
+        PaperKbConfig(
+            enabled=True,
+            enable_hypothetical_retrieval=True,
+            rerank_model="",
+        ),
+    )
+    kb._chroma_client = object()
+    kb._chunk_collection = object()
+    candidates = [
+        {
+            "chunk_id": f"p1:{index}",
+            "paper_id": "p1",
+            "text": f"evidence {index}",
+            "score": 1.0 - index * 0.01,
+        }
+        for index in range(10)
+    ]
+    kb._retrieve_by_entities = AsyncMock(return_value=candidates)
+    original_rerank = kb.rerank_and_filter_retrieval_results
+    kb.rerank_and_filter_retrieval_results = AsyncMock(wraps=original_rerank)
+
+    results = await kb.retrieve_by_hypothetical_questions(
+        query="experimental details",
+        entities=[{"paper_id": "p1"}],
+        top_k=10,
+        per_paper_limit=3,
+        search_mode="hybrid",
+    )
+
+    rerank_candidates = kb.rerank_and_filter_retrieval_results.await_args.args[0]
+    assert len(rerank_candidates) == 10
+    assert len(results) == 3
+
+
 def test_kb_retrieve_default_is_hybrid_and_omits_internal_embeddings(tmp_path: Path):
     class _FakeKB:
         config = PaperKbConfig(enable_hypothetical_retrieval=True)
@@ -641,8 +1073,96 @@ def test_kb_retrieve_default_is_hybrid_and_omits_internal_embeddings(tmp_path: P
     assert payload["retrieval_mode"] == "hybrid"
     assert kb.retrieve_by_hypothetical_questions.await_args.kwargs["search_mode"] == "hybrid"
     assert len(raw) <= tool._MAX_MODEL_PAYLOAD_CHARS
-    assert all("embedding" not in result for result in payload["results"])
+    assert raw.index('"quality"') < raw.index('"papers"')
+    assert all(
+        "embedding" not in chunk
+        for paper in payload["papers"]
+        for chunk in paper["chunks"]
+    )
     assert payload["returned_hits"] <= payload["total_hits"]
+
+
+@pytest.mark.parametrize(
+    ("entities", "requested_limit", "expected_limit"),
+    [
+        ([], None, 3),
+        ([{"paper_id": "p1"}], None, 8),
+        ([{"paper_id": "p1"}, {"paper_id": "p2"}], None, 5),
+        ([{"paper_id": "p1"}], 4, 4),
+    ],
+)
+def test_kb_retrieve_adapts_per_paper_limit(
+    tmp_path: Path,
+    entities: list[dict[str, str]],
+    requested_limit: int | None,
+    expected_limit: int,
+) -> None:
+    class _FakeKB:
+        config = PaperKbConfig(enable_hypothetical_retrieval=True)
+
+        def __init__(self):
+            self.retrieve_by_hypothetical_questions = AsyncMock(return_value=[])
+
+        def get_embedding_status(self):
+            return {"backend": "test", "degraded": False}
+
+        def get_lexical_status(self):
+            return {"backend": "test", "degraded": False}
+
+    kb = _FakeKB()
+    tool = KBRetrieveTool(workspace=tmp_path, kb=kb)
+    kwargs: dict[str, object] = {
+        "query": "experimental details",
+        "top_k": 15,
+        "entities": entities or None,
+    }
+    if requested_limit is not None:
+        kwargs["per_paper_limit"] = requested_limit
+
+    asyncio.run(tool.execute(**kwargs))
+
+    call_kwargs = kb.retrieve_by_hypothetical_questions.await_args.kwargs
+    assert call_kwargs["per_paper_limit"] == expected_limit
+    description = tool.parameters["properties"]["per_paper_limit"]["description"]
+    assert "entity-focused" in description
+
+
+def test_kb_retrieve_payload_limit_is_a_hard_valid_json_boundary() -> None:
+    oversized = "evidence " * 5000
+    results = [
+        {
+            "chunk_id": f"p{index}:0",
+            "paper_id": f"p{index}",
+            "text": oversized,
+            "score": 0.99 - index * 0.01,
+        }
+        for index in range(10)
+    ]
+    docs_meta = {
+        f"p{index}": {
+            "title": oversized,
+            "authors": [oversized] * 20,
+            "abstract": oversized,
+        }
+        for index in range(10)
+    }
+
+    payload = KBRetrieveTool._build_model_payload(
+        query=oversized,
+        queries=[oversized],
+        retrieval_mode="hybrid",
+        results=results,
+        docs_meta=docs_meta,
+        quality="sufficient",
+        quality_reason=oversized,
+        embedding_status={"reason": oversized},
+        lexical_status={"reason": oversized},
+    )
+    raw = json.dumps(payload, ensure_ascii=False)
+
+    assert len(raw) <= KBRetrieveTool._MAX_MODEL_PAYLOAD_CHARS
+    assert json.loads(raw) == payload
+    assert list(payload)[:3] == ["quality", "quality_reason", "next_action"]
 
 
 @pytest.mark.asyncio

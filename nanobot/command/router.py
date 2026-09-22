@@ -22,6 +22,10 @@ class CommandContext:
     raw: str
     args: str = ""
     loop: Any = None
+    on_progress: Callable[..., Awaitable[None]] | None = None
+    on_stream: Callable[[str], Awaitable[None]] | None = None
+    on_stream_end: Callable[..., Awaitable[None]] | None = None
+    session_summary: str | None = None
 
 
 class CommandRouter:

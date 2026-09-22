@@ -86,7 +86,8 @@ def retrieval_conditional(state: MultiAgentState) -> Literal["synthesis", "resea
 
 
 def research_phase_conditional(state: MultiAgentState) -> Literal[
-    "wait_for_selection", "continue_ingest", "to_retrieval", "to_synthesis"
+    "wait_for_search_confirmation", "wait_for_selection", "continue_ingest",
+    "to_retrieval", "to_synthesis"
 ]:
     """Route from Research node based on current phase.
     
@@ -114,6 +115,9 @@ def research_phase_conditional(state: MultiAgentState) -> Literal[
         "Research phase conditional: phase={}, search_completed={}, resume_mode={}, user_made_selection={}",
         phase, search_completed, resume_mode, user_made_selection,
     )
+
+    if phase == "confirm_search":
+        return "wait_for_search_confirmation"
     
     # Resume mode: skip search/select, go directly to ingest.
     # Only return "continue_ingest" when ingest is still in progress;

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
+import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,13 +16,14 @@ from loguru import logger
 from nanobot.agent.context_budget import ContextBudget, ContextBudgetManager
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.providers.base import LLMProvider, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.helpers import (
     build_assistant_message,
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
     find_legal_message_start,
     maybe_persist_tool_result,
+    strip_think,
     truncate_text,
 )
 from nanobot.utils.prompt_templates import render_template
@@ -29,7 +33,11 @@ from nanobot.utils.runtime import (
     build_length_recovery_message,
     build_post_tool_continuation_message,
     ensure_nonempty_tool_result,
+    external_search_confirmation_prompt,
     is_blank_text,
+    is_managed_paper_source_path,
+    latest_user_message_text,
+    paper_search_is_authorized,
     repeated_external_lookup_error,
 )
 
@@ -48,6 +56,16 @@ _COMPACTABLE_TOOLS = frozenset({
     "web_search", "web_fetch", "list_dir",
 })
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
+_DEFAULT_SILENT_RESPONSE_TIMEOUT_S = 60.0
+_TOOL_RECOVERY_MAX_TOKENS = 1024
+_TOOL_PROTOCOL_TAG_RE = re.compile(
+    r"</?(?:think|thought|tool_call)\b|<function\s*=",
+    re.IGNORECASE,
+)
+_PAPER_ID_IN_TEXT_RE = re.compile(
+    r'''["']?paper_id["']?\s*:\s*["']([^"'\\\s,}\]]+)''',
+    re.IGNORECASE,
+)
 
 
 
@@ -74,6 +92,7 @@ class AgentRunSpec:
     context_window_tokens: int | None = None
     context_block_limit: int | None = None
     provider_retry_mode: str = "standard"
+    silent_response_timeout_s: float | None = _DEFAULT_SILENT_RESPONSE_TIMEOUT_S
     progress_callback: Any | None = None
     retry_wait_callback: Any | None = None
     checkpoint_callback: Any | None = None
@@ -239,6 +258,7 @@ class AgentRunner:
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
+        completed_tool_names: set[str] = set()
         empty_content_retries = 0
         length_recovery_count = 0
         length_recovery_parts: list[str] = []
@@ -289,9 +309,108 @@ class AgentRunner:
             context.usage = dict(raw_usage)
             context.tool_calls = list(response.tool_calls)
             self._accumulate_usage(usage, raw_usage)
+            stream_closed_for_repair = False
+
+            logger.debug(
+                "Model response on turn {} for {}: finish_reason={} "
+                "prompt_tokens={} completion_tokens={} reasoning_chars={} tool_calls={}",
+                iteration,
+                spec.session_key or "default",
+                response.finish_reason,
+                raw_usage.get("prompt_tokens", 0),
+                raw_usage.get("completion_tokens", 0),
+                len(response.reasoning_content or ""),
+                len(response.tool_calls),
+            )
+
+            if response.has_tool_calls and response.finish_reason in {
+                "stop", "tool_calls", "length",
+            }:
+                preflight_errors = self._preflight_tool_calls(spec, response.tool_calls)
+                if response.finish_reason == "length":
+                    preflight_errors.append(
+                        "tool-call generation ended because the output limit was reached"
+                    )
+                if preflight_errors:
+                    failed_call = response.tool_calls[0]
+                    logger.warning(
+                        "Rejecting invalid tool call on turn {} for {} "
+                        "(tool={}, finish_reason={}, reasoning_chars={}, "
+                        "completion_tokens={}): {}",
+                        iteration,
+                        spec.session_key or "default",
+                        failed_call.name or "(missing)",
+                        response.finish_reason,
+                        len(response.reasoning_content or ""),
+                        raw_usage.get("completion_tokens", 0),
+                        "; ".join(preflight_errors),
+                    )
+                    # Close any hidden/partial stream before issuing the direct,
+                    # non-streaming repair request. The malformed assistant/tool
+                    # pair is deliberately not appended to canonical history.
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=True)
+                        stream_closed_for_repair = True
+                    repaired = await self._request_tool_call_repair(
+                        spec,
+                        messages_for_model,
+                        failed_call,
+                        preflight_errors,
+                    )
+                    repair_usage = self._usage_dict(repaired.usage)
+                    self._accumulate_usage(usage, repair_usage)
+                    raw_usage = self._merge_usage(raw_usage, repair_usage)
+                    response = repaired
+                    context.response = response
+                    context.usage = dict(raw_usage)
+                    context.tool_calls = list(response.tool_calls)
+                    logger.debug(
+                        "Tool-call repair on turn {} for {}: finish_reason={} "
+                        "completion_tokens={} reasoning_chars={} tool_calls={}",
+                        iteration,
+                        spec.session_key or "default",
+                        response.finish_reason,
+                        repair_usage.get("completion_tokens", 0),
+                        len(response.reasoning_content or ""),
+                        len(response.tool_calls),
+                    )
+
+                    repair_errors = self._preflight_tool_calls(
+                        spec, response.tool_calls
+                    ) if response.has_tool_calls else []
+                    if response.finish_reason == "length" and response.has_tool_calls:
+                        repair_errors.append(
+                            "repaired tool call also reached the output limit"
+                        )
+                    if repair_errors:
+                        logger.error(
+                            "Tool-call repair remained invalid for {}: {}",
+                            spec.session_key or "default",
+                            "; ".join(repair_errors),
+                        )
+                        response = LLMResponse(
+                            content=(
+                                "The model could not produce valid tool arguments. "
+                                "Please retry the request."
+                            ),
+                            finish_reason="error",
+                            usage=repair_usage,
+                            error_kind="invalid_tool_arguments",
+                        )
+                        context.response = response
+                        context.tool_calls = []
+                    elif (
+                        hook.wants_streaming()
+                        and not response.has_tool_calls
+                        and not is_blank_text(response.content)
+                    ):
+                        # Repair calls are deliberately non-streaming. Forward a
+                        # direct answer so web clients do not suppress the final
+                        # outbound message as if it had already been streamed.
+                        await hook.on_stream(context, response.content or "")
 
             if response.should_execute_tools:
-                if hook.wants_streaming():
+                if hook.wants_streaming() and not stream_closed_for_repair:
                     await hook.on_stream_end(context, resuming=True)
 
                 assistant_message = build_assistant_message(
@@ -320,6 +439,8 @@ class AgentRunner:
                     spec,
                     response.tool_calls,
                     external_lookup_counts,
+                    messages,
+                    completed_tool_names,
                 )
                 tool_events.extend(new_events)
                 context.tool_results = list(results)
@@ -641,15 +762,305 @@ class AgentRunner:
             tools=spec.tools.get_definitions(),
         )
         if hook.wants_streaming():
-            async def _stream(delta: str) -> None:
-                await hook.on_stream(context, delta)
+            buffered_content = ""
+            visible_content_started = asyncio.Event()
+            forwarding_content = False
 
-            return await self.provider.chat_stream_with_retry(
-                **kwargs,
-                on_content_delta=_stream,
+            async def _stream(delta: str) -> None:
+                nonlocal buffered_content, forwarding_content
+                if forwarding_content:
+                    await hook.on_stream(context, delta)
+                    return
+                buffered_content += delta
+                if not strip_think(buffered_content).strip():
+                    return
+                forwarding_content = True
+                visible_content_started.set()
+                await hook.on_stream(context, buffered_content)
+
+            request_task = asyncio.create_task(
+                self.provider.chat_stream_with_retry(
+                    **kwargs,
+                    on_content_delta=_stream,
+                )
             )
+            timeout_s = spec.silent_response_timeout_s
+            if timeout_s is None or timeout_s <= 0:
+                return await request_task
+
+            visible_task = asyncio.create_task(visible_content_started.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    {request_task, visible_task},
+                    timeout=timeout_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                request_task.cancel()
+                visible_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await request_task
+                with contextlib.suppress(asyncio.CancelledError):
+                    await visible_task
+                raise
+            if request_task in done:
+                visible_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await visible_task
+                return await request_task
+            if visible_task in done:
+                return await request_task
+
+            request_task.cancel()
+            visible_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await request_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await visible_task
+            logger.warning(
+                "No user-visible model output for {:.1f}s on turn {} for {}; "
+                "retrying directly with thinking disabled",
+                timeout_s,
+                context.iteration,
+                spec.session_key or "default",
+            )
+            await self._emit_progress(
+                spec,
+                "The model produced no visible output for too long; retrying in fast mode.",
+            )
+            recovered = await self._request_silent_response_recovery(
+                spec, messages
+            )
+            if not is_blank_text(recovered.content):
+                await hook.on_stream(context, recovered.content or "")
+            return recovered
         if spec.disable_thinking:
             kwargs["disable_thinking"] = True
+        return await self.provider.chat_with_retry(**kwargs)
+
+    @staticmethod
+    def _tool_definition_name(definition: dict[str, Any]) -> str:
+        function = definition.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "")
+        return str(definition.get("name") or "")
+
+    def _short_request_max_tokens(self, spec: AgentRunSpec) -> int:
+        configured = spec.max_tokens
+        if not isinstance(configured, int):
+            configured = getattr(
+                getattr(self.provider, "generation", None),
+                "max_tokens",
+                None,
+            )
+        if not isinstance(configured, int) or configured <= 0:
+            configured = _TOOL_RECOVERY_MAX_TOKENS
+        return min(configured, _TOOL_RECOVERY_MAX_TOKENS)
+
+    async def _request_silent_response_recovery(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ):
+        recovery_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "The previous generation produced no user-visible output before "
+                    "the timeout. Respond now without hidden reasoning. If a tool is "
+                    "needed, issue the native tool call immediately with valid JSON; "
+                    "otherwise give a concise direct answer. Resolve references such "
+                    "as first/second/that paper from the conversation and preserve the "
+                    "exact paper ID in the tool arguments."
+                ),
+                _TRANSIENT_MESSAGE_KEY: "silent_response_recovery",
+            },
+        ]
+        kwargs = self._build_request_kwargs(
+            spec,
+            recovery_messages,
+            tools=spec.tools.get_definitions(),
+        )
+        kwargs.update({
+            "max_tokens": self._short_request_max_tokens(spec),
+            "temperature": 0.0,
+            "reasoning_effort": None,
+            "disable_thinking": True,
+        })
+        return await self.provider.chat_with_retry(**kwargs)
+
+    @staticmethod
+    async def _emit_progress(spec: AgentRunSpec, message: str) -> None:
+        callback = spec.progress_callback
+        if not callable(callback):
+            return
+        try:
+            result = callback(message)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("Agent progress callback failed")
+
+    @classmethod
+    def _protocol_contamination_path(
+        cls,
+        value: Any,
+        path: str = "arguments",
+    ) -> str | None:
+        if isinstance(value, str):
+            return path if _TOOL_PROTOCOL_TAG_RE.search(value) else None
+        if isinstance(value, dict):
+            for key, child in value.items():
+                found = cls._protocol_contamination_path(
+                    child,
+                    f"{path}.{key}",
+                )
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                found = cls._protocol_contamination_path(
+                    child,
+                    f"{path}[{index}]",
+                )
+                if found:
+                    return found
+        return None
+
+    @classmethod
+    def _preflight_tool_calls(
+        cls,
+        spec: AgentRunSpec,
+        tool_calls: list[ToolCallRequest],
+    ) -> list[str]:
+        errors: list[str] = []
+        prepare_call = getattr(spec.tools, "prepare_call", None)
+        for index, tool_call in enumerate(tool_calls):
+            label = tool_call.name or f"call[{index}]"
+            contaminated_path = cls._protocol_contamination_path(
+                tool_call.arguments
+            )
+            if contaminated_path:
+                errors.append(
+                    f"{label}: protocol control tag found in {contaminated_path}"
+                )
+            if not callable(prepare_call):
+                continue
+            try:
+                prepared = prepare_call(tool_call.name, tool_call.arguments)
+            except Exception as exc:
+                errors.append(f"{label}: validation raised {type(exc).__name__}")
+                continue
+            if isinstance(prepared, tuple) and len(prepared) == 3 and prepared[2]:
+                errors.append(str(prepared[2]))
+        return errors
+
+    @staticmethod
+    def _safe_repair_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+        def _clean(value: Any) -> Any:
+            if isinstance(value, str):
+                if _TOOL_PROTOCOL_TAG_RE.search(value):
+                    return None
+                return value[:1000]
+            if isinstance(value, list):
+                return [cleaned for item in value if (cleaned := _clean(item)) is not None]
+            if isinstance(value, dict):
+                return {
+                    str(key): cleaned
+                    for key, item in value.items()
+                    if (cleaned := _clean(item)) is not None
+                }
+            if value is None or isinstance(value, (bool, int, float)):
+                return value
+            return None
+
+        cleaned = _clean(arguments)
+        return cleaned if isinstance(cleaned, dict) else {}
+
+    @staticmethod
+    def _recover_paper_ids(arguments: dict[str, Any]) -> list[str]:
+        ids: list[str] = []
+
+        def _walk(value: Any, key: str = "") -> None:
+            if isinstance(value, dict):
+                for child_key, child in value.items():
+                    _walk(child, str(child_key))
+                return
+            if isinstance(value, list):
+                for child in value:
+                    _walk(child, key)
+                return
+            if not isinstance(value, str):
+                return
+            if key == "paper_id":
+                candidates = [value]
+            else:
+                normalized = value.replace('\\"', '"').replace("\\'", "'")
+                candidates = _PAPER_ID_IN_TEXT_RE.findall(normalized)
+            for candidate in candidates:
+                paper_id = candidate.strip()
+                if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{1,127}", paper_id):
+                    ids.append(paper_id)
+
+        _walk(arguments)
+        return list(dict.fromkeys(ids))[:20]
+
+    async def _request_tool_call_repair(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+        failed_call: ToolCallRequest,
+        errors: list[str],
+    ):
+        definitions = spec.tools.get_definitions()
+        target_definitions = [
+            definition
+            for definition in definitions
+            if self._tool_definition_name(definition) == failed_call.name
+        ]
+        safe_arguments = self._safe_repair_arguments(failed_call.arguments)
+        paper_ids = self._recover_paper_ids(failed_call.arguments)
+        details = [
+            f"The previous native call to `{failed_call.name}` was rejected before execution.",
+            "Return exactly one native tool call with valid JSON matching its schema.",
+            "Do not emit prose, hidden reasoning, XML tags, or textual tool-call markup.",
+            f"Validation errors: {'; '.join(errors)[:1500]}",
+        ]
+        if safe_arguments:
+            details.append(
+                "Preserve these valid arguments when relevant: "
+                + json.dumps(safe_arguments, ensure_ascii=False)[:2000]
+            )
+        if paper_ids:
+            details.append(
+                "Preserve these recovered target paper IDs: "
+                + json.dumps(paper_ids, ensure_ascii=False)
+            )
+        repair_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": "\n".join(details),
+                _TRANSIENT_MESSAGE_KEY: "tool_call_repair",
+            },
+        ]
+        kwargs = self._build_request_kwargs(
+            spec,
+            repair_messages,
+            tools=target_definitions or definitions,
+        )
+        kwargs.update({
+            "max_tokens": self._short_request_max_tokens(spec),
+            "temperature": 0.0,
+            "reasoning_effort": None,
+            "disable_thinking": True,
+        })
+        if target_definitions:
+            kwargs["tool_choice"] = {
+                "type": "function",
+                "function": {"name": failed_call.name},
+            }
         return await self.provider.chat_with_retry(**kwargs)
 
     async def _request_finalization_retry(
@@ -708,18 +1119,50 @@ class AgentRunner:
         spec: AgentRunSpec,
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
+        messages: list[dict[str, Any]] | None = None,
+        completed_tool_names: set[str] | None = None,
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+        messages = messages or []
+        if completed_tool_names is None:
+            completed_tool_names = set()
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
                 tool_results.extend(await asyncio.gather(*(
-                    self._run_tool(spec, tool_call, external_lookup_counts)
+                    self._run_tool(
+                        spec,
+                        tool_call,
+                        external_lookup_counts,
+                        messages,
+                        completed_tool_names,
+                    )
                     for tool_call in batch
                 )))
             else:
                 for tool_call in batch:
-                    tool_results.append(await self._run_tool(spec, tool_call, external_lookup_counts))
+                    tool_results.append(await self._run_tool(
+                        spec,
+                        tool_call,
+                        external_lookup_counts,
+                        messages,
+                        completed_tool_names,
+                    ))
+
+            for tool_call, (result, event, _) in zip(
+                batch,
+                tool_results[-len(batch):],
+            ):
+                if event.get("status") != "ok":
+                    continue
+                if tool_call.name == "kb_retrieve" and isinstance(result, str):
+                    try:
+                        kb_payload = json.loads(result)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        kb_payload = None
+                    if isinstance(kb_payload, dict) and kb_payload.get("error"):
+                        continue
+                completed_tool_names.add(tool_call.name)
 
         results: list[Any] = []
         events: list[dict[str, str]] = []
@@ -736,7 +1179,11 @@ class AgentRunner:
         spec: AgentRunSpec,
         tool_call: ToolCallRequest,
         external_lookup_counts: dict[str, int],
+        messages: list[dict[str, Any]] | None = None,
+        completed_tool_names: set[str] | None = None,
     ) -> tuple[Any, dict[str, str], BaseException | None]:
+        messages = messages or []
+        completed_tool_names = completed_tool_names or set()
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
@@ -768,6 +1215,46 @@ class AgentRunner:
                 "detail": prep_error.split(": ", 1)[-1][:120],
             }
             return prep_error + _HINT, event, RuntimeError(prep_error) if spec.fail_on_tool_error else None
+        if (
+            tool_call.name == "read_file"
+            and isinstance(params, dict)
+            and is_managed_paper_source_path(params.get("path"))
+            and "kb_retrieve" not in completed_tool_names
+        ):
+            result = json.dumps(
+                {
+                    "status": "kb_retrieve_required",
+                    "next_action": "call_kb_retrieve_first",
+                    "message": (
+                        "This is a managed paper source file. Call kb_retrieve with "
+                        "the target paper entity and retrieval_mode='hybrid' first. "
+                        "Use read_file only afterward if the retrieved chunks do not "
+                        "contain the requested details."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+            return result, {
+                "name": tool_call.name,
+                "status": "blocked",
+                "detail": "kb_retrieve required before reading a managed paper source",
+            }, None
+        if tool_call.name == "paper_search" and not paper_search_is_authorized(messages):
+            result = json.dumps(
+                {
+                    "status": "confirmation_required",
+                    "next_action": "ask_user_before_external_search",
+                    "message": external_search_confirmation_prompt(
+                        latest_user_message_text(messages)
+                    ),
+                },
+                ensure_ascii=False,
+            )
+            return result, {
+                "name": tool_call.name,
+                "status": "blocked",
+                "detail": "external paper search requires user confirmation",
+            }, None
         try:
             if tool is not None:
                 result = await tool.execute(**params)

@@ -330,13 +330,13 @@ async def cmd_multi_agent(ctx: CommandContext) -> OutboundMessage | None:
     
     Usage:
         /multi-agent <query> — Run query through multi-agent system
-        /multi-agent — Toggle multi-agent mode for next message
+        /multi-agent — Show multi-agent system status
     """
     loop = ctx.loop
     msg = ctx.msg
     args = ctx.args.strip()
     
-    # If no args, just toggle mode or show status
+    # If no args, show status.
     if not args:
         has_graph = loop._multi_agent_graph is not None
         if has_graph:
@@ -374,9 +374,14 @@ async def cmd_multi_agent(ctx: CommandContext) -> OutboundMessage | None:
     # Run multi-agent workflow
     result = await loop.process_with_multi_agent(
         content=args,
-        session_key=msg.session_key,
+        session_key=ctx.key,
         channel=msg.channel,
         chat_id=msg.chat_id,
+        media=msg.media if msg.media else None,
+        on_progress=ctx.on_progress,
+        on_stream=ctx.on_stream,
+        on_stream_end=ctx.on_stream_end,
+        session_summary=ctx.session_summary,
     )
     
     return result

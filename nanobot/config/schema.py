@@ -101,7 +101,7 @@ class AgentDefaults(Base):
     context_block_limit: int | None = None
     temperature: float = 0.1
     max_tool_iterations: int = 200
-    max_tool_result_chars: int = 16_000
+    max_tool_result_chars: int = 40_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     reasoning_effort: str | None = None  # low / medium / high / adaptive - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
@@ -252,8 +252,6 @@ class PaperToolsConfig(Base):
     router_short_history_turns: int = Field(default=4, ge=1, le=12)
     router_short_memory_chars: int = Field(default=2000, ge=256, le=16000)
     router_long_memory_chars: int = Field(default=2000, ge=256, le=16000)
-    auto_context_retrieve: bool = False  # Auto-inject retrieved papers into runtime context for each user turn
-    auto_context_top_k: int = Field(default=5, ge=1, le=10)
     retrieval_top_k: int = Field(default=5, ge=1, le=30)
     embedding_model: str = "/data1/project/models/bge-m3/snapshots/model"
     embedding_api_key: str = ""

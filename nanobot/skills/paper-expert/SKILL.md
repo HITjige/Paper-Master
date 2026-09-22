@@ -21,6 +21,12 @@ Use this skill when the user asks for:
 2. Retrieve candidate papers:
 - Prefer `kb_retrieve` first for paper/technical questions.
 - Only trigger `paper_search` when KB evidence is insufficient (e.g., no hits or low-confidence top hits).
+- `paper_search` accesses external arXiv data. Unless the user explicitly asks
+  for latest/recent/arXiv/external/online results, ask whether external search
+  is allowed and wait for confirmation before calling it.
+- When the user asks for other/more/additional papers, reuse the prior topic and pass
+  paper IDs cited or shown earlier as `exclude_paper_ids` to both `kb_retrieve` and
+  `paper_search`. Do not exclude an ID the user explicitly requests in the current turn.
 - Do not include irrelevant words, such as "recent", in your query.
 - Use direct web search fallback only when `paper_search` is unavailable/fails.
 - `paper_search` includes complete retrieval process including `paper_similarity` and `paper_rerank`.
@@ -39,6 +45,10 @@ Use this skill when the user asks for:
 5. Retrieve from KB and answer with evidence:
 - **ALWAYS call `kb_retrieve` after `paper_ingest` to get grounded evidence.**
 - Call `kb_retrieve` when answering domain questions that need citations.
+- For "详细解读" or another deep question about a known paper, call
+  `kb_retrieve` first with that paper in `entities` and
+  `retrieval_mode="hybrid"`. Only use `read_file` on a managed paper source
+  after targeted retrieval was attempted and still lacks the requested detail.
 - Use `retrieval_mode="hybrid"` for detailed explanations, performance metrics,
   experiments, ablations, or comparisons; reserve `hypothetical` for broad
   natural-language discovery questions.
@@ -76,6 +86,14 @@ When answering a technical question, include:
 - Evidence bullets with citations
 - If evidence is insufficient, explicitly say so
 
+## Mathematical and Architecture Formatting
+
+- Use `$...$` for inline mathematics and `$$...$$` for display equations so
+  the web UI renders formulas with KaTeX. Never put equations in code fences.
+- Do not produce box-character or ASCII-art diagrams (`┌`, `─`, `│`, `└`, etc.).
+- Use `A → B → C` only for a short linear pipeline. For larger or branched
+  architectures, use headings with nested bullet lists or a compact Markdown table.
+
 ## Failure and Fallback
 
 - If no high-confidence papers found:
@@ -84,7 +102,8 @@ When answering a technical question, include:
   - explain retrieval limits
 - If tool fails:
   - retry with smaller batch
-  - fallback to web-based path
+  - ask for permission before falling back to an external/web-based path unless
+    the user already requested external search
 - If `paper_search` or rerank returns non-empty results, do NOT claim "no research exists".
   Instead report uncertainty as "insufficient confidence" and list the closest candidates with caveats.
   Of course, do not generate papers that do not appear in the search results.

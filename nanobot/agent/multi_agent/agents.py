@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from nanobot.agent.paper_evidence import (
+    build_evidence_bundle,
+    render_evidence_bundle_xml,
+)
+from nanobot.agent.paper_evidence import collect_answer_citations as _collect_bundle_citations
 
 
 @dataclass
 class AgentPrompts:
     """Collection of prompts for all agents."""
-    
+
     router: str
     retrieval: str
     research: str
@@ -244,6 +249,8 @@ Write high-quality, evidence-based answers using retrieved information.
   <rule>Use bullet points for key findings or features.</rule>
   <rule>Begin with a short summary of 2-3 sentences before details.</rule>
   <rule>Use bold for paper titles and key technical terms.</rule>
+  <rule>Write inline mathematics as $...$ and display mathematics as $$...$$ for KaTeX rendering. Do not put equations in code fences.</rule>
+  <rule>Never output box-character or ASCII-art diagrams. Use A → B → C only for short linear flows; represent larger or branched architectures with nested lists or compact Markdown tables.</rule>
 </language_and_tone>
 
 <input_sources>
@@ -841,17 +848,17 @@ UNIFIED_QUERY_USER_TEMPLATE = """<global_context>
 
 <conversation_history>
   <session_summary> {session_summary_context} </session_summary>
-  <recent_dialog> 
-    {recent_dialog_context} 
+  <recent_dialog>
+    {recent_dialog_context}
   </recent_dialog>
 </conversation_history>
 
 <system_state>
   <recent_research> {research_history_context} </recent_research>
   <recent_retrieval_topics> {retrieval_history_context} </recent_retrieval_topics>
-  <last_action> 
+  <last_action>
     Routing: {last_routing_decision}
-    Quality: {last_retrieval_quality} 
+    Quality: {last_retrieval_quality}
   </last_action>
 </system_state>
 
@@ -897,154 +904,12 @@ def format_sources_section(
             load_docs_meta()), keyed by paper_id.
         external_papers: Raw arXiv search results (fallback).
     """
-    import xml.sax.saxutils as saxutils
-
-    def _esc(text: str) -> str:
-        return saxutils.escape(str(text))
-
-    def _as_int(value: Any) -> int | None:
-        try:
-            return int(value) if value not in (None, "") else None
-        except (TypeError, ValueError):
-            return None
-
-    def _chunk_source_order(chunk: dict[str, Any]) -> tuple[int, int, int, str]:
-        chunk_id = str(chunk.get("chunk_id", ""))
-        chunk_index = _as_int(chunk.get("chunk_index"))
-        if chunk_index is None:
-            chunk_index = _as_int(chunk_id.rsplit(":", 1)[-1])
-        page_start = _as_int(chunk.get("page_start"))
-        if chunk_index is not None:
-            return (0, chunk_index, page_start if page_start is not None else 10**9, chunk_id)
-        return (1, page_start if page_start is not None else 10**9, 10**9, chunk_id)
-
-    parts: list[str] = []
-    full_text_ids: set[str] = set()
-
-    if retrieval_results:
-        grouped: dict[str, dict[str, Any]] = {}
-        for r in retrieval_results:
-            pid = str(r.get("paper_id", "unknown"))
-            full_text_ids.add(pid)
-            if pid not in grouped:
-                grouped[pid] = {"paper_id": pid, "chunks": []}
-            grouped[pid]["chunks"].append(r)
-
-        for pid, group in sorted(
-            grouped.items(),
-            key=lambda kv: max((c.get("score", 0) for c in kv[1]["chunks"]), default=0),
-            reverse=True,
-        ):
-            meta = (docs_meta or {}).get(pid, {})
-            title = meta.get("title") or group["chunks"][0].get("paper_title", pid)
-            authors_raw = meta.get("authors", [])
-            if isinstance(authors_raw, list):
-                a_str = ", ".join(str(a) for a in authors_raw[:5])
-                if len(authors_raw) > 5:
-                    a_str += " et al."
-            else:
-                a_str = str(authors_raw)
-            year = meta.get("year") or group["chunks"][0].get("paper_year", "")
-            abstract = meta.get("abstract", "")
-
-            # Retrieval relevance decides which chunks enter the context. Once
-            # selected, chunks from the same paper follow source order so the
-            # model sees the paper's argument rather than a relevance-shuffled
-            # sequence.
-            chunks = sorted(group["chunks"], key=_chunk_source_order)
-
-            parts.append(f'  <paper id="{_esc(pid)}" evidence_level="full_text">')
-            parts.append('    <metadata>')
-            parts.append(f'      <title>{_esc(title)}</title>')
-            if a_str:
-                parts.append(f'      <authors>{_esc(a_str)}</authors>')
-            if year:
-                parts.append(f'      <year>{_esc(str(year))}</year>')
-            parts.append('    </metadata>')
-
-            if abstract:
-                parts.append('    <global_abstract>')
-                parts.append(f'      {_esc(abstract)}')
-                parts.append('    </global_abstract>')
-
-            parts.append('    <retrieved_chunks>')
-            for chunk in chunks:
-                section = chunk.get("heading_path", chunk.get("section", ""))
-                text = str(chunk.get("text", ""))
-                score = float(chunk.get("score", 0) or 0)
-                chunk_index = _as_int(chunk.get("chunk_index"))
-                if chunk_index is None:
-                    chunk_index = _as_int(str(chunk.get("chunk_id", "")).rsplit(":", 1)[-1])
-                page_start = _as_int(chunk.get("page_start"))
-                order_attributes = ""
-                if chunk_index is not None:
-                    order_attributes += f' chunk_index="{chunk_index}"'
-                if page_start is not None:
-                    order_attributes += f' page_start="{page_start}"'
-                parts.append(
-                    f'      <chunk section="{_esc(section)}" score="{score:.3f}"'
-                    f'{order_attributes}>'
-                )
-                parts.append(f'        {_esc(text)}')
-                parts.append('      </chunk>')
-            parts.append('    </retrieved_chunks>')
-
-            # ---- Collect linked_assets from all chunks (dedup by key) ----
-            seen_asset_keys: set[str] = set()
-            all_assets: list[dict[str, Any]] = []
-            for chunk in chunks:
-                for asset in chunk.get("linked_assets", []):
-                    ak = asset.get("key", "")
-                    if ak and ak not in seen_asset_keys:
-                        seen_asset_keys.add(ak)
-                        all_assets.append(asset)
-
-            if all_assets:
-                parts.append('    <referenced_figures_tables>')
-                for asset in all_assets:
-                    ak = _esc(str(asset.get("key", "")))
-                    cap = _esc(str(asset.get("caption", "")))
-                    atype = asset.get("type", "figure")
-                    content = asset.get("content", "")
-                    ref_line = f'      <asset key="{ak}" type="{_esc(atype)}" caption="{cap}"'
-                    if content and atype == "table":
-                        ref_line += '>\n'
-                        ref_line += f'        {_esc(str(content))}\n'
-                        ref_line += '      </asset>'
-                    else:
-                        ref_line += ' />'
-                    parts.append(ref_line)
-                parts.append('    </referenced_figures_tables>')
-            # ---- End asset section ----
-
-            parts.append('  </paper>')
-
-    for paper in external_papers or []:
-        pid = str(paper.get("paper_id", "")).strip()
-        if not pid or pid in full_text_ids:
-            continue
-        title = str(paper.get("title", ""))
-        authors = paper.get("authors", [])
-        authors_text = ", ".join(str(item) for item in authors[:5]) if isinstance(authors, list) else str(authors)
-        abstract = str(paper.get("abstract", ""))[:3000]
-        parts.append(f'  <paper id="{_esc(pid)}" evidence_level="abstract_only">')
-        parts.append(f'    <title>{_esc(title)}</title>')
-        if authors_text:
-            parts.append(f'    <authors>{_esc(authors_text)}</authors>')
-        if paper.get("year"):
-            parts.append(f'    <year>{_esc(str(paper.get("year")))}</year>')
-        if paper.get("url"):
-            parts.append(f'    <url>{_esc(str(paper.get("url")))}</url>')
-        if abstract:
-            parts.append(f'    <abstract>{_esc(abstract)}</abstract>')
-        parts.append('    <usage_constraint>Abstract-only evidence; do not infer unreported method details or experiment values.</usage_constraint>')
-        parts.append('  </paper>')
-
-    if not parts:
-        return ('<sources>No external sources provided. '
-                'Answer based on your knowledge.</sources>')
-
-    return '<sources>\n' + '\n'.join(parts) + '\n</sources>'
+    bundle = build_evidence_bundle(
+        retrieval_results,
+        docs_meta,
+        external_papers,
+    )
+    return render_evidence_bundle_xml(bundle)
 
 
 def collect_answer_citations(
@@ -1055,40 +920,12 @@ def collect_answer_citations(
     external_papers: Optional[list] = None,
 ) -> tuple[list[str], list[str]]:
     """Resolve inline ``[paper_id]`` markers and report fabricated IDs."""
-    available: dict[str, dict[str, Any]] = {}
-    full_text_ids = {str(item.get("paper_id", "")) for item in retrieval_results or []}
-    for pid in full_text_ids:
-        if pid:
-            available[pid] = {**(docs_meta or {}).get(pid, {}), "evidence_level": "full_text"}
-    for paper in external_papers or []:
-        pid = str(paper.get("paper_id", ""))
-        if pid and pid not in available:
-            available[pid] = {**paper, "evidence_level": "abstract_only"}
-
-    # Exclude ordinary Markdown links (``[label](url)``). Unknown bracketed
-    # text is considered a fabricated citation only when it resembles a paper
-    # identifier; this avoids treating prose such as ``[optional]`` as a source.
-    marker_ids = list(dict.fromkeys(re.findall(
-        r"\[([A-Za-z0-9][A-Za-z0-9._:/-]{1,127})\](?!\()",
-        answer or "",
-    )))
-    cited_ids = [pid for pid in marker_ids if pid in available]
-    invalid = [
-        pid for pid in marker_ids
-        if pid not in available
-        and any(char.isdigit() for char in pid)
-        and any(separator in pid for separator in (".", ":", "-"))
-    ]
-    citations: list[str] = []
-    for pid in cited_ids:
-        meta = available.get(pid)
-        if not meta:
-            continue
-        title = str(meta.get("title", "") or pid)
-        url = str(meta.get("url", ""))
-        evidence = str(meta.get("evidence_level", "unknown"))
-        citations.append(f"[{pid}] {title}" + (f" — {url}" if url else "") + f" ({evidence})")
-    return citations, invalid
+    return _collect_bundle_citations(
+        answer,
+        retrieval_results=retrieval_results,
+        docs_meta=docs_meta,
+        external_papers=external_papers,
+    )
 
 
 def get_agent_prompts(
@@ -1097,12 +934,12 @@ def get_agent_prompts(
     ingest_limit: int = 3,
 ) -> AgentPrompts:
     """Get configured agent prompts.
-    
+
     Args:
         similarity_threshold: Threshold for retrieval quality
         top_k: Number of retrieval results
         ingest_limit: Max papers to ingest
-        
+
     Returns:
         Configured AgentPrompts
     """

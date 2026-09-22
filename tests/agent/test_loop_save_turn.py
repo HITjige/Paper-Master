@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -606,6 +607,7 @@ def test_subagent_followup_skips_empty_content() -> None:
 
 def test_recent_paper_session_routes_referential_performance_followup(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
+    loop.tools_config.paper.multi_agent_orchestrator_enabled = True
     loop._multi_agent_graph = MagicMock()
     session = Session(key="websocket:paper-followup")
     session.add_message("user", "详细解读第一篇论文")
@@ -641,6 +643,7 @@ def test_recent_paper_route_fails_open_when_structured_classifier_is_empty(
     tmp_path: Path,
 ) -> None:
     loop = _make_full_loop(tmp_path)
+    loop.tools_config.paper.multi_agent_orchestrator_enabled = True
     loop._multi_agent_graph = MagicMock()
     loop.provider.chat_structured_with_retry = AsyncMock(return_value=LLMResponse(
         content=None,
@@ -757,9 +760,184 @@ def test_single_agent_paper_tool_refreshes_multi_agent_context(tmp_path: Path) -
     asyncio.run(scenario())
 
 
+@pytest.mark.asyncio
+async def test_loop_hook_streams_paper_answer_immediately() -> None:
+    from nanobot.agent.hook import AgentHookContext
+    from nanobot.agent.loop import _LoopHook
+
+    streamed: list[str] = []
+    stream_ends: list[bool] = []
+
+    async def on_stream(delta: str) -> None:
+        streamed.append(delta)
+
+    async def on_stream_end(*, resuming: bool = False) -> None:
+        stream_ends.append(resuming)
+
+    hook = _LoopHook(
+        _mk_loop(),
+        on_stream=on_stream,
+        on_stream_end=on_stream_end,
+    )
+    context = AgentHookContext(
+        iteration=1,
+        messages=[{
+            "role": "tool",
+            "name": "kb_retrieve",
+            "tool_call_id": "kb-1",
+            "content": '{"quality":"sufficient"}',
+        }],
+    )
+
+    await hook.on_stream(context, "streamed draft")
+    await hook.on_stream_end(context, resuming=False)
+
+    assert streamed == ["streamed draft"]
+    assert stream_ends == [False]
+
+
+@pytest.mark.asyncio
+async def test_single_agent_streams_paper_answer_without_post_generation_repair(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop.provider.chat_with_retry = AsyncMock()
+    tool_payload = json.dumps({
+        "quality": "sufficient",
+        "quality_reason": "strong match",
+        "query": "EEG papers",
+        "queries": ["EEG papers"],
+        "papers": [{
+            "paper_id": "p1",
+            "title": "Grounded EEG Paper",
+            "authors": ["Ada Researcher"],
+            "abstract": "Evidence about EEG.",
+            "evidence_level": "full_text",
+            "chunks": [{
+                "chunk_id": "p1:0",
+                "text": "Grounded answer.",
+                "score": 0.9,
+            }],
+        }],
+    })
+    streamed: list[str] = []
+    stream_ends: list[bool] = []
+
+    async def run_agent_loop(*args: object, **kwargs: object):
+        on_stream = kwargs["on_stream"]
+        on_stream_end = kwargs["on_stream_end"]
+        assert callable(on_stream)
+        assert callable(on_stream_end)
+        await on_stream("Grounded ")
+        await on_stream("answer [p1].")
+        await on_stream_end(resuming=False)
+        return (
+            "Grounded answer [p1].",
+            ["kb_retrieve"],
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "有没有 EEG 论文"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "kb-1",
+                        "type": "function",
+                        "function": {"name": "kb_retrieve", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "name": "kb_retrieve",
+                    "tool_call_id": "kb-1",
+                    "content": tool_payload,
+                },
+                {"role": "assistant", "content": "Grounded answer [p1]."},
+            ],
+            "completed",
+            False,
+        )
+
+    loop._run_agent_loop = run_agent_loop  # type: ignore[method-assign]
+
+    async def on_stream(delta: str) -> None:
+        streamed.append(delta)
+
+    async def on_stream_end(*, resuming: bool = False) -> None:
+        stream_ends.append(resuming)
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="websocket",
+            sender_id="u1",
+            chat_id="paper-stream-once",
+            content="有没有 EEG 论文",
+        ),
+        on_stream=on_stream,
+        on_stream_end=on_stream_end,
+    )
+
+    assert result is not None
+    assert result.content == "Grounded answer [p1]."
+    assert result.metadata["_streamed"] is True
+    assert "paper_evidence" not in result.metadata
+    assert streamed == ["Grounded ", "answer [p1]."]
+    assert stream_ends == [False]
+    loop.provider.chat_with_retry.assert_not_awaited()
+    session = loop.sessions.get_or_create("websocket:paper-stream-once")
+    assert session.metadata[AgentLoop._MULTI_AGENT_PRESENTED_PAPER_IDS_KEY] == ["p1"]
+    assert session.metadata[AgentLoop._MULTI_AGENT_LAST_SEARCH_TOPIC_KEY] == (
+        "有没有 EEG 论文"
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_agent_novelty_prompt_includes_presented_paper_ids(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    session = loop.sessions.get_or_create("websocket:paper-novelty-context")
+    session.add_message("user", "有没有 EEG 论文")
+    session.add_message("assistant", "Found one [2401.00001v2].")
+    session.metadata[AgentLoop._MULTI_AGENT_PRESENTED_PAPER_IDS_KEY] = [
+        "2401.00001v2"
+    ]
+    loop.sessions.save(session)
+    loop._run_agent_loop = AsyncMock(return_value=(
+        "No additional papers found.",
+        [],
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "有没有其他论文"},
+            {"role": "assistant", "content": "No additional papers found."},
+        ],
+        "completed",
+        False,
+    ))  # type: ignore[method-assign]
+
+    await loop._process_message(InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="paper-novelty-context",
+        content="有没有其他论文",
+    ))
+
+    initial_messages = loop._run_agent_loop.await_args.args[0]
+    current_user = next(
+        message for message in reversed(initial_messages)
+        if message.get("role") == "user"
+    )
+    assert "paper_novelty_context" in str(current_user["content"])
+    assert "2401.00001v2" in str(current_user["content"])
+    assert "exclude_paper_ids" in str(current_user["content"])
+
+
 def test_three_turn_paper_followup_stays_on_multi_agent_path(tmp_path: Path) -> None:
     async def scenario() -> None:
         loop = _make_full_loop(tmp_path)
+        loop.tools_config.paper.multi_agent_orchestrator_enabled = True
         loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
         graph = MagicMock()
         graph.run = AsyncMock(side_effect=[
@@ -865,8 +1043,65 @@ def test_novelty_query_abandons_paused_selection_and_starts_fresh(
 
 
 @pytest.mark.asyncio
+async def test_multi_agent_pauses_and_resumes_external_search_confirmation(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    graph = MagicMock()
+    graph.run = AsyncMock(return_value={
+        "final_answer": "当前知识库证据不足，是否允许我搜索外部 arXiv 论文？",
+        "draft_answer": "当前知识库证据不足，是否允许我搜索外部 arXiv 论文？",
+        "routing_decision": "internal",
+        "research_phase": "confirm_search",
+        "awaiting_external_search_confirmation": True,
+        "retrieval_results": [],
+        "papers_for_selection": [],
+        "user_query": "详细解读这篇论文",
+        "session_id": "websocket:external-confirm",
+    })
+    graph.resume = AsyncMock(return_value={
+        "final_answer": "外部搜索后的回答。",
+        "routing_decision": "external",
+        "research_phase": "complete",
+        "iteration_count": 1,
+        "retrieval_results": [],
+        "external_papers": [{"paper_id": "2501.00001"}],
+        "citations": [],
+    })
+    loop._multi_agent_graph = graph
+
+    paused = await loop.process_with_multi_agent(
+        "详细解读这篇论文",
+        session_key="websocket:external-confirm",
+        channel="websocket",
+        chat_id="external-confirm",
+    )
+
+    assert paused is not None
+    assert paused.metadata["awaiting_external_search_confirmation"] is True
+    session = loop.sessions.get_or_create("websocket:external-confirm")
+    assert session.metadata["multi_agent_paused_state"]["research_phase"] == (
+        "confirm_search"
+    )
+
+    resumed = await loop.process_with_multi_agent(
+        "可以",
+        session_key="websocket:external-confirm",
+        channel="websocket",
+        chat_id="external-confirm",
+    )
+
+    assert resumed is not None
+    assert "外部搜索后的回答" in resumed.content
+    graph.resume.assert_awaited_once()
+    assert "multi_agent_paused_state" not in session.metadata
+
+
+@pytest.mark.asyncio
 async def test_multi_agent_persists_only_user_and_final_answer_in_strict_mode(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
+    loop.tools_config.paper.multi_agent_orchestrator_enabled = True
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
 
     graph = MagicMock()
@@ -907,6 +1142,7 @@ async def test_multi_agent_persists_only_user_and_final_answer_in_strict_mode(tm
 @pytest.mark.asyncio
 async def test_multi_agent_router_receives_last_routing_and_memory_context(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
+    loop.tools_config.paper.multi_agent_orchestrator_enabled = True
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
     loop.tools_config.paper.multi_agent_memory_mode = "strict_with_citations"
 
@@ -951,6 +1187,64 @@ async def test_multi_agent_router_receives_last_routing_and_memory_context(tmp_p
     session = loop.sessions.get_or_create("feishu:ma2")
     assert "References:" in session.messages[1]["content"]
     assert "arxiv:2001.00001" in session.messages[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_uses_shared_context_without_repeating_current_query(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    (tmp_path / "AGENTS.md").write_text("shared bootstrap marker", encoding="utf-8")
+    image_path = tmp_path / "pixel.png"
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+    )
+    graph = MagicMock()
+    graph.run = AsyncMock(return_value={
+        "final_answer": "reviewed answer",
+        "routing_decision": "internal",
+        "iteration_count": 1,
+        "citations": [],
+        "retrieval_results": [],
+        "external_papers": [],
+    })
+    loop._multi_agent_graph = graph
+    streamed = []
+    stream_ends = []
+
+    async def on_stream(delta: str) -> None:
+        streamed.append(delta)
+
+    async def on_stream_end(*, resuming: bool) -> None:
+        stream_ends.append(resuming)
+
+    result = await loop.process_with_multi_agent(
+        "current query must not repeat",
+        session_key="websocket:shared-context",
+        channel="websocket",
+        chat_id="shared-context",
+        media=[str(image_path)],
+        on_stream=on_stream,
+        on_stream_end=on_stream_end,
+        session_summary="compacted session marker",
+    )
+
+    kwargs = graph.run.await_args.kwargs
+    assert kwargs["recent_dialog_context"] == "(empty)"
+    assert "current query must not repeat" not in kwargs["recent_dialog_context"]
+    assert "shared bootstrap marker" in kwargs["shared_system_context"]
+    assert "compacted session marker" in kwargs["runtime_context"]
+    assert kwargs["media_context"][0]["type"] == "image_url"
+    assert result is not None
+    assert result.metadata["_streamed"] is True
+    assert streamed == [result.content]
+    assert stream_ends == [False]
+
+    session = loop.sessions.get_or_create("websocket:shared-context")
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
+    assert session.messages[0]["content"] == "current query must not repeat"
 
 
 @pytest.mark.asyncio

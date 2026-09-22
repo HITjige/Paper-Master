@@ -140,6 +140,9 @@ class ReadFileTool(_FsTool):
             "Read a file (text or image). Text output format: LINE_NUM|CONTENT. "
             "Images return visual content for analysis. "
             "Use offset and limit for large files. "
+            "For managed paper sources under kb/uploads or kb/downloads, call "
+            "kb_retrieve first and use read_file only if targeted retrieval does "
+            "not contain the required detail. "
             "Cannot read non-image binary files. "
             "Reads exceeding ~128K chars are truncated."
         )

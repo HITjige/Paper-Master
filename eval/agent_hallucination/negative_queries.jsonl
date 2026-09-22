@@ -1,0 +1,8 @@
+{"id":"negative_kb_001","query":"BReAD 的量子退火模块使用什么哈密顿量来优化检索图像？","seed_chunk_ids":[],"tags":["provisional_unanswerable","false_premise","zh"]}
+{"id":"negative_kb_002","query":"SATTC 在睡眠期 EEG 数据集上的 Top-1 图像检索准确率是多少？","seed_chunk_ids":[],"tags":["provisional_unanswerable","unreported_result","zh"]}
+{"id":"negative_kb_003","query":"JMVR 每次图像重建推理消耗多少焦耳的 GPU 能量？","seed_chunk_ids":[],"tags":["provisional_unanswerable","unreported_resource","zh"]}
+{"id":"negative_kb_004","query":"CognitionCapturer 在临床抑郁症受试者上的图像重建准确率是多少？","seed_chunk_ids":[],"tags":["provisional_unanswerable","unreported_result","zh"]}
+{"id":"negative_kb_005","query":"Brain2Image 官方模型权重文件的 SHA-256 校验值是什么？","seed_chunk_ids":[],"tags":["provisional_unanswerable","unreported_artifact","zh"]}
+{"id":"negative_kb_006","query":"UBP 的随机双盲临床试验纳入了多少名受试者？","seed_chunk_ids":[],"tags":["provisional_unanswerable","false_premise","zh"]}
+{"id":"negative_kb_007","query":"SATTC 与 Brain2Image 的 VAE 解码器组合后，在跨被试检索上的 Top-1 准确率是多少？","seed_chunk_ids":[],"tags":["provisional_unanswerable","cross_paper_conflation","zh"]}
+{"id":"negative_kb_008","query":"ATM 方法的量子纠错层如何提高 EEG 特征的稳定性？","seed_chunk_ids":[],"tags":["provisional_unanswerable","false_premise","zh"]}
